@@ -1,0 +1,61 @@
+name: Release
+
+# Tag-driven: `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
+#
+# No pre-built binaries: overdosecd is Linux-only and `cargo install overdosecd`
+# is the delivery path, so a release is just the crates.io publish plus the
+# GitHub release built from the CHANGELOG section.
+on:
+  push:
+    tags: ["v*"]
+
+# Read-only by default; the publish job widens it as far as it needs.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: publish to crates.io and create the GitHub release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Check that the tag matches Cargo.toml
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Create the GitHub release with the CHANGELOG notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v version="$version" '
+            index($0, "## [" version "]") == 1 { in_section = 1; next }
+            in_section && index($0, "## [") == 1 { exit }
+            in_section { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "no CHANGELOG section for $version" >&2
+            exit 1
+          fi
+          summary="$(awk 'NF { print; exit }' release-notes.md)"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME — $summary" \
+            --notes-file release-notes.md

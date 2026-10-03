@@ -1,0 +1,55 @@
+# cargo-deny configuration: advisories, licenses, bans, and sources.
+# Run locally with `cargo deny check`; CI runs the same command.
+# Every exception carries a reason; re-check them at each release.
+
+[advisories]
+version = 2
+
+# Unmaintained notices are worth reading even when they are transitive: this
+# is how the `directories` crate was found and replaced by the hand-rolled
+# `src/dirs.rs`.
+unmaintained = "all"
+
+ignore = [
+    # bincode 1.x is unmaintained, but it is a *dev-dependency* only: it
+    # builds the byte-exact zoxide fixtures the hand-written parser is
+    # verified against (see AGENTS.md, "bincode is a dev-dependency oracle").
+    # Replacing it means hand-encoding the framing in the tests too.
+    { id = "RUSTSEC-2025-0141", reason = "dev-dependency fixture oracle; never ships in the binary" },
+]
+
+[licenses]
+version = 2
+
+# Permissive licenses only; this list is deliberately explicit so a new
+# copyleft dependency fails CI and gets a conscious decision.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# The allow-list is a permitted set, not a claim about the current graph;
+# entries that no crate happens to use should not warn.
+unused-allowed-license = "allow"
+
+[bans]
+# Duplicate versions are common in a Rust graph (proc-macro stacks); report
+# them without failing the build.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

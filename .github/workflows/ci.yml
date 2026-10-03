@@ -1,0 +1,128 @@
+name: CI
+
+# Quota policy: this project runs on a free account (2,000 Actions minutes per
+# month). So CI is:
+#   - pull_request only: merges come from green PRs, so a push to `main` does
+#     not rerun the same work; tag pushes are handled by release.yml
+#   - filtered to code paths: a docs-only change starts nothing
+#   - ubuntu-only: the crate is Linux-only (a non-Linux build fails with one
+#     compile error; see src/main.rs and README.md)
+# Batch locally and push once. When a push would otherwise start a run it does
+# not need (docs, metadata), put `[skip ci]` in the commit message.
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "benches/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rustfmt.toml"
+      - "deny.toml"
+      - ".github/workflows/ci.yml"
+
+# Read-only by default; nothing in CI needs write access.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Supersede in-flight runs for the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Formatting and lints only need to run once. `ubuntu-latest` migrates to
+  # Ubuntu 26.04 on 2026-10-19, which should be a no-op here (the toolchain
+  # comes from rustup).
+  checks:
+    name: fmt, clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --locked
+
+  # The `rust-version` claim in Cargo.toml, checked against the full target
+  # graph so tests and benches compile on the MSRV too.
+  msrv:
+    name: MSRV 1.99
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The version lives in `toolchain:`, never in the ref: Dependabot
+      # collapses every dtolnay/rust-toolchain pin to one ref's SHA (in #47 it
+      # rewrote the `1.99.0` ref to `stable`'s), and that ref decides the
+      # default toolchain — a "MSRV" job would then test stable and stay green.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Assert the toolchain is the declared MSRV
+        run: |
+          declared="$(grep -m1 '^rust-version = ' Cargo.toml | cut -d'"' -f2)"
+          actual="$(rustc --version | cut -d' ' -f2)"
+          case "$actual" in
+            "$declared"|"$declared".*) ;;
+            *)
+              echo "this job must run the declared MSRV (rust-version = \"$declared\"), got rustc $actual" >&2
+              echo "bumping the MSRV means editing Cargo.toml and the two pins above" >&2
+              exit 1
+              ;;
+          esac
+      - run: cargo check --all-targets --locked
+
+  # Fish is not installed on the development machine, so the shipped wrapper
+  # and its completion only get exercised here.
+  fish:
+    name: fish wrapper smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install fish
+        timeout-minutes: 5
+        run: |
+          if ! command -v fish >/dev/null 2>&1; then
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y fish
+          fi
+      - name: Smoke-test the wrapper and its completion
+        run: |
+          cargo build --locked
+          export PATH="$PWD/target/debug:$PATH"
+          export WITHERCD_DATA_DIR=/tmp/fish-smoke/data
+          mkdir -p /tmp/fish-smoke/project-alpha "/tmp/fish-smoke/project with space"
+          fish -c 'withercd init fish | source; wcd add /tmp/fish-smoke/project-alpha; wcd project-alpha; test "$PWD" = /tmp/fish-smoke/project-alpha'
+          fish -c 'withercd init fish | source; wcd add "/tmp/fish-smoke/project with space"; wcd "project with space"; test "$PWD" = "/tmp/fish-smoke/project with space"'
+          fish -c 'withercd init fish | source; complete -C "wcd project" | grep -q project-alpha'
+          fish -c 'withercd init fish | source; complete -C "wcd project" | grep -q "project with space"'
+
+  # Supply chain: advisories, licenses, bans, and sources over the lockfile.
+  # Exceptions live in deny.toml with a reason; the action ships a prebuilt
+  # binary, so it does not compile cargo-deny on every run.
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check

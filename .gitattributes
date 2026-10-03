@@ -1,0 +1,3 @@
+# Keep the checkout byte-identical everywhere: normalize line endings to LF so
+# no editor or platform rewrites CRLF into fixture files.
+* text=auto eol=lf

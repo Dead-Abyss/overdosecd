@@ -31,7 +31,7 @@ assert_cmd = "2"
 # Pinned deliberately: bincode is unmaintained, and 3.0.0 is a compiled
 # `compile_error!` published only to say so (no further releases will come).
 # 1.3.3 stays as the fixture oracle for the zoxide parser; do not bump.
-bincode = "=1.3.3"
+bincode = "=3.0.0"
 proptest = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 fd-lock = "4"

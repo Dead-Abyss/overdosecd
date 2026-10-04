@@ -130,17 +130,22 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
 - `projects.json` (version 1) is written atomically — tmp file + fsync + rename,
   mode 0600. Corrupt files are quarantined to `projects.json.corrupt-<ts>`, never
   wiped; a newer `version` is refused.
-- `projects.db` (SQLite, `src/store/sqlite.rs`) is the second backend: schema v1
-  with `meta` (`schema_version`), `projects`, and a `usage` jump log capped at
-  `USAGE_KEEP = 500` rows per project (the oldest rows are pruned with each
-  jump).
+- `projects.db` (SQLite, `src/store/sqlite.rs`) is the second backend: schema v2
+  with `meta` (`schema_version`), `projects` (`kind` joins in the v1→v2
+  migration), and a `usage` jump log capped at `USAGE_KEEP = 500` rows per
+  project (the oldest rows are pruned with each jump).
   WAL mode; the file is created mode 0600 and WAL/SHM inherit it. `load` never
   creates the file. `update` runs `BEGIN IMMEDIATE` (busy wait ~500 ms, then
   `Error::LockTimeout`, matching the JSON sidecar lock) and *diffs* the snapshot
   so a tracked jump updates one row instead of rewriting the index; `save`
   upserts and only removed ids cascade their `usage` rows away. `ensure_schema`
   must stay read-only once the schema exists — running DDL on every open would
-  block readers behind another writer.
+  block readers behind another writer. A v1 database migrates only on a
+  writable open: `VACUUM INTO` keeps a consistent `projects.db.v1-<stamp>` copy
+  beside it, then the `ALTER` runs in one `BEGIN IMMEDIATE` transaction that
+  re-reads the version under the lock, so concurrent first opens skip instead
+  of failing on the duplicate column; `load_readonly` reports the old version
+  instead of migrating.
 - `[storage] backend = "json" | "sqlite"` picks the index file (default `json`).
   `doctor` and `complete` are dispatched before the strict config load, so they
   resolve the backend leniently: a broken config falls back to the default
@@ -288,13 +293,27 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
 - Subcommand names are reserved by the `ocd` wrapper, so a project literally named
   `tag` (or `ui`) must be jumped to via `ocd goto tag`.
 - Git metadata: the remote is stored in `Project.git` at add time (`add --force`
-  refreshes), while `info` reads the branch live. Every `.git` read is capped
+  refreshes it live, as does `doctor --refresh`), while `info` reads the branch
+  live. Every `.git` read is capped
   (`HEAD`/`gitdir:`/`commondir` 64 KiB, `config` 16 MiB) and only the first
   line of a `gitdir:`/`commondir` indirection is used, so a hostile repository
-  cannot feed an unbounded read into `add`, `import`, or `doctor --refresh`. `project.git.is_some()` is the
+  cannot feed an unbounded read into `add`, `import`, or `doctor --refresh`. The
+  read stats before opening, so a planted FIFO can never block it. Config reads
+  follow `include.path`/`includeIf` (`gitdir:` and `gitdir/i:`) under fixed
+  budgets (≤8 files, 16 MiB merged, regular files only, cycles cut) and apply
+  `url.<base>.insteadOf` by longest prefix; the `gitdir:` wildmatch subset is
+  `*`/`**`/`?` (no character classes, no `onbranch:`), every failure means
+  "absent", and the merged text is re-parsed once. Bare repositories are
+  detected through `core.bare` or the `HEAD` + `objects/` + `refs/` layout.
+  `project.git.is_some()` is the
   repository signal for ranking — do not reintroduce a per-query stat. `git.rs` is
   a hand-rolled reader (`.git` file indirection + `commondir`); no `git2`, no
   subprocess.
+- `Project.kind` (`rust | node | python | go | unknown`) is detected once from
+  marker files at `add`/`--force` and by `doctor --refresh`, stored (the SQLite
+  `kind` column; JSON carries it with a serde default), and never stat'd on the
+  query path. It is display and filter only (`info`'s `type:`, `list --type`,
+  the picker badge) — never a matcher signal.
 - Index writes go through `Store::update(|projects| …)` (trait in `src/store/mod.rs`),
   which owns lock → load → mutate → save. `JsonStore` serializes with the sidecar
   `projects.lock` (`fd-lock`, ~500 ms retry); `SqliteStore` uses one

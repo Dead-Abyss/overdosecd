@@ -1209,7 +1209,60 @@ fn doctor_reports_the_sqlite_schema() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("storage: sqlite (schema v1)"));
+        .stdout(predicate::str::contains("storage: sqlite (schema v2)"));
+}
+
+#[test]
+fn project_kind_is_detected_and_filtered() {
+    dual!(sandbox, {
+        let rust = sandbox.project("engine");
+        fs::write(rust.join("Cargo.toml"), "[package]").unwrap();
+        let node = sandbox.project("website");
+        fs::write(node.join("package.json"), "{}").unwrap();
+        sandbox.add(&rust);
+        sandbox.add(&node);
+
+        sandbox
+            .cmd()
+            .args(["info", "engine"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("type:      rust"));
+
+        sandbox
+            .cmd()
+            .args(["list", "--type", "rust"])
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("engine").and(predicate::str::contains("website").not()),
+            );
+
+        sandbox
+            .cmd()
+            .args(["list", "--type", "go"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("no go projects indexed"));
+
+        // Re-detection: a marker appearing after `add` needs a refresh.
+        // `rust` outranks the existing `package.json`.
+        fs::write(node.join("Cargo.toml"), "[package]").unwrap();
+        sandbox
+            .cmd()
+            .args(["doctor", "--refresh"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "refreshed metadata: 1 of 2 projects updated",
+            ));
+        sandbox
+            .cmd()
+            .args(["list", "--type", "rust"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("website"));
+    });
 }
 
 #[test]
@@ -2478,6 +2531,62 @@ fn info_shows_branch_and_remote_for_repositories() {
 }
 
 #[test]
+fn included_git_config_is_honored_and_sanitized() {
+    dual!(sandbox, {
+        let project = sandbox.project("included");
+        make_repo(&project, "ref: refs/heads/main\n", None);
+        let git = project.join(".git");
+        fs::write(
+            git.join("extra.inc"),
+            "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n\
+             [remote \"origin\"]\n\turl = https://github.com/Dead-Abyss/overdosecd.git\n",
+        )
+        .unwrap();
+        fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n[include]\n\tpath = extra.inc\n",
+        )
+        .unwrap();
+        sandbox.add(&project);
+
+        sandbox
+            .cmd()
+            .args(["info", "included"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "remote:    origin git@github.com:Dead-Abyss/overdosecd.git",
+            ));
+
+        // A hostile include cannot reach the terminal.
+        let hostile = sandbox.project("hostile");
+        make_repo(&hostile, "ref: refs/heads/main\n", None);
+        let git = hostile.join(".git");
+        fs::write(
+            git.join("evil.inc"),
+            "[remote \"origin\"]\n\turl = https://x.example/\u{1b}]52;c;QQ\n",
+        )
+        .unwrap();
+        fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n[include]\n\tpath = evil.inc\n",
+        )
+        .unwrap();
+        sandbox.add(&hostile);
+
+        sandbox
+            .cmd()
+            .args(["info", "hostile"])
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("remote:    -")
+                    .and(predicate::str::contains("\u{1b}").not()),
+            );
+    });
+}
+
+#[test]
 fn goto_finds_a_project_by_repository_name() {
     dual!(sandbox, {
         let project = sandbox.project("local-name");
@@ -2730,7 +2839,7 @@ fn doctor_refresh_updates_stored_git_remotes() {
             .assert()
             .success()
             .stdout(predicate::str::contains(
-                "refreshed git metadata: 1 of 1 projects updated",
+                "refreshed metadata: 1 of 1 projects updated",
             ));
 
         sandbox
@@ -2745,7 +2854,7 @@ fn doctor_refresh_updates_stored_git_remotes() {
             .args(["doctor", "--refresh"])
             .assert()
             .success()
-            .stdout(predicate::str::contains("git metadata is up to date"));
+            .stdout(predicate::str::contains("metadata is up to date"));
     });
 }
 

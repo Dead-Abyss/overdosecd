@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::ColorMode;
+use crate::project::Kind;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -203,6 +204,11 @@ pub struct ListArgs {
     #[arg(long, value_enum)]
     pub sort: Option<SortBy>,
 
+    /// Only list projects of this type: `rust`, `node`, `python`, `go`, or
+    /// `unknown` (detected from marker files at `add`)
+    #[arg(long = "type", value_enum, value_name = "TYPE")]
+    pub kind: Option<Kind>,
+
     /// Only list projects jumped to since WHEN: a duration (7d, 48h, 2w) or a
     /// date (2026-09-01)
     #[arg(long, value_name = "WHEN")]
@@ -270,7 +276,8 @@ pub struct DoctorArgs {
     #[arg(long)]
     pub fix: bool,
 
-    /// Re-read git metadata for every indexed project
+    /// Re-read the stored metadata (git remote, project kind) for every
+    /// indexed project
     #[arg(long)]
     pub refresh: bool,
 }

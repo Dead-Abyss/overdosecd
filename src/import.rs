@@ -395,6 +395,8 @@ pub fn preview(plan: &Plan) -> Result<Vec<Project>> {
                 use_count: entry.use_count,
                 pinned: false,
                 git: None,
+                // `--dry-run` promises no filesystem work, so no marker scan.
+                kind: project::Kind::Unknown,
             })
         })
         .collect()

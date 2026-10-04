@@ -229,6 +229,9 @@ fn cmd_list(store: &impl Store, args: ListArgs) -> Result<()> {
     if let Some(cutoff) = since {
         projects.retain(|project| project.last_used_at.is_some_and(|when| when >= cutoff));
     }
+    if let Some(kind) = args.kind {
+        projects.retain(|project| project.kind == kind);
+    }
     sort_projects(&mut projects, args.sort);
 
     // One existence check per project per run: the flags decide both the
@@ -248,7 +251,9 @@ fn cmd_list(store: &impl Store, args: ListArgs) -> Result<()> {
         let file = StoreFile::new(visible);
         output::print_line(&serde_json::to_string_pretty(&file)?)
     } else if visible.is_empty() {
-        if let Some(raw) = &args.since {
+        if let Some(kind) = args.kind {
+            output::print_line(&format!("no {} projects indexed", kind.label()))
+        } else if let Some(raw) = &args.since {
             output::print_line(&format!("no projects jumped to since {raw}"))
         } else {
             output::print_line("no projects yet. run `overdosecd add <path>` to get started.")
@@ -422,6 +427,7 @@ fn cmd_info(store: &impl Store, query: &str, matching: &MatcherConfig, debug: bo
         ("path:", sanitize::path(&project.path)),
         ("aliases:", output::join_or_dash(&project.aliases)),
         ("tags:", output::join_or_dash(&project.tags)),
+        ("type:", project.kind.label().to_owned()),
         ("created:", created.to_string()),
         ("last used:", last_used),
         ("uses:", project.use_count.to_string()),
@@ -800,21 +806,23 @@ fn cmd_doctor(
                     continue;
                 }
                 let detected = project::GitInfo::detect(&project.path);
-                if detected != project.git {
+                let kind = project::kind_of(&project.path);
+                if detected != project.git || kind != project.kind {
                     project.git = detected;
+                    project.kind = kind;
                     changed += 1;
                 }
             }
             Ok((projects.len(), changed))
         })?;
         if total == 0 {
-            output::print_line("git metadata: no projects indexed")?;
+            output::print_line("metadata: no projects indexed")?;
         } else if changed == 0 {
             let noun = output::plural(total, "project", "projects");
-            output::print_line(&format!("git metadata is up to date ({total} {noun})"))?;
+            output::print_line(&format!("metadata is up to date ({total} {noun})"))?;
         } else {
             output::print_line(&format!(
-                "refreshed git metadata: {changed} of {total} projects updated"
+                "refreshed metadata: {changed} of {total} projects updated"
             ))?;
         }
     }

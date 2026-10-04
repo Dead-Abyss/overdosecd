@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::matcher;
 use crate::output;
+use crate::project::Kind;
 
 use super::actions::HELP;
 use super::picker::{Mode, Picker, sort_label};
@@ -164,6 +165,12 @@ fn project_row(
     let indices = matcher::highlight_indices(picker.query(), &project.name);
     let mut spans = vec![state, mark];
     spans.extend(highlighted(&project.name, &indices, palette.accent()));
+    if project.kind != Kind::Unknown {
+        spans.push(Span::styled(
+            format!(" [{}]", project.kind.label()),
+            palette.dim(),
+        ));
+    }
 
     let mut detail = format!("  {}", output::shorten_home(&project.path, home));
     if let Some(when) = project.last_used_at {

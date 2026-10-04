@@ -60,8 +60,8 @@ overdosecd completions fish > ~/.config/fish/completions/overdosecd.fish
 
 | Command | What it does |
 | ------- | ------------ |
-| `add [PATH] [--name N] [--alias A] [--tag T] [--force]` | index a directory (defaults to `.`); `--force` refreshes the stored git remote |
-| `list [--sort used\|name\|created] [--since WHEN] [--all] [--json]` | what you have indexed; `--since 7d` or `--since 2026-09-01` filters by last jump |
+| `add [PATH] [--name N] [--alias A] [--tag T] [--force]` | index a directory (defaults to `.`); `--force` refreshes the stored git remote and project kind |
+| `list [--sort used\|name\|created] [--type T] [--since WHEN] [--all] [--json]` | what you have indexed; `--type rust` filters by project kind, `--since 7d` or `--since 2026-09-01` by last jump |
 | `goto <query> [--no-track]` | print the best matching path (stdout only); `--confident` exits `1` instead of acting on a fuzzy-only match |
 | `info <query>` | details for one project |
 | `remove <query> [--yes]` | drop a project from the index |
@@ -249,7 +249,7 @@ branch:    main
 remote:    origin git@github.com:Dead-Abyss/overdosecd.git
 ```
 
-The remote is a snapshot taken at `add`; refresh it with `overdosecd doctor --refresh` (or `overdosecd add --force <path>`) after changing it. Worktrees are understood (branch from the worktree, config from the main repository). The org/owner alone is not searchable, and `.git/config` `include`/`insteadOf` rewrites are not honored.
+The remote is a snapshot taken at `add`; refresh it with `overdosecd doctor --refresh` (or `overdosecd add --force <path>`) after changing it. Worktrees are understood (branch from the worktree, config from the main repository), `include.path`/`includeIf "gitdir:…"` config includes and `url.<base>.insteadOf` rewrites are honored, and bare repositories are detected. The org/owner alone is not searchable.
 
 ## Health check
 
@@ -265,14 +265,14 @@ issues (2):
   - stale: `old-experiment` -> ~/code/old-experiment (directory no longer exists)
   - duplicate name: `app` is used by 2 projects; queries for it are ambiguous (`overdosecd rename`)
 
-hint: `--fix` repairs stale projects interactively; `--refresh` updates stored git remotes
+hint: `--fix` repairs stale projects interactively; `--refresh` updates stored metadata
 ```
 
 It checks for stale paths, duplicate names, quarantined index files, permission problems (index, home cache, data directory), indexed values containing control characters, and an unreadable config file. Quarantined files are reported, never deleted.
 
 On SQLite it also reports the schema version, orphaned `projects.db-wal`/`-shm`/`-journal` files whose database is gone (`stray:`), a JSON and SQLite pair holding different projects (`mismatch:`), and an unreadable inactive index (`unreadable:`). Everything is read-only: the inactive index is inspected, never quarantined, migrated, or rewritten.
 
-`--fix` walks each stale project and lets you skip it, remove it, quit, or type a replacement path; repairs are applied under the lock and the git remote is re-detected. It needs a terminal, so it refuses to prompt in scripts. `--refresh` re-reads the git remote of every indexed project, which is useful after `git remote set-url`.
+`--fix` walks each stale project and lets you skip it, remove it, quit, or type a replacement path; repairs are applied under the lock and the git remote is re-detected. It needs a terminal, so it refuses to prompt in scripts. `--refresh` re-reads the stored metadata (git remote, project kind) of every indexed project, which is useful after `git remote set-url`.
 
 ## Data
 

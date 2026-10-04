@@ -8,11 +8,11 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, ErrorCode, TransactionBehavior};
 
 use crate::error::{Error, Result};
-use crate::project::{GitInfo, Project};
+use crate::project::{GitInfo, Kind, Project};
 
 use super::Store;
 
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 /// How long a writer waits for the database lock before giving up, matching
 /// the JSON backend's `LOCK_TIMEOUT` so both feel alike under contention.
@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS projects (
     pinned          INTEGER NOT NULL DEFAULT 0,
     git             INTEGER NOT NULL DEFAULT 0,
     git_remote_name TEXT,
-    git_remote_url  TEXT
+    git_remote_url  TEXT,
+    kind            TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS usage (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +52,7 @@ CREATE INDEX IF NOT EXISTS usage_project_time ON usage(project_id, used_at);
 
 const SELECT_PROJECTS: &str = "
 SELECT id, name, path, aliases, tags, created_at, last_used_at, use_count,
-       pinned, git, git_remote_name, git_remote_url
+       pinned, git, git_remote_name, git_remote_url, kind
 FROM projects
 ORDER BY rowid
 ";
@@ -63,10 +64,10 @@ ORDER BY rowid
 const UPSERT_PROJECT: &str = "
 INSERT INTO projects (
     id, name, path, aliases, tags, created_at, last_used_at, use_count,
-    pinned, git, git_remote_name, git_remote_url
+    pinned, git, git_remote_name, git_remote_url, kind
 ) VALUES (
     :id, :name, :path, :aliases, :tags, :created_at, :last_used_at,
-    :use_count, :pinned, :git, :git_remote_name, :git_remote_url
+    :use_count, :pinned, :git, :git_remote_name, :git_remote_url, :kind
 )
 ON CONFLICT(id) DO UPDATE SET
     name = excluded.name,
@@ -79,7 +80,8 @@ ON CONFLICT(id) DO UPDATE SET
     pinned = excluded.pinned,
     git = excluded.git,
     git_remote_name = excluded.git_remote_name,
-    git_remote_url = excluded.git_remote_url
+    git_remote_url = excluded.git_remote_url,
+    kind = excluded.kind
 ";
 
 const UPDATE_PROJECT: &str = "
@@ -87,7 +89,8 @@ UPDATE projects SET
     name = :name, path = :path, aliases = :aliases, tags = :tags,
     created_at = :created_at, last_used_at = :last_used_at,
     use_count = :use_count, pinned = :pinned, git = :git,
-    git_remote_name = :git_remote_name, git_remote_url = :git_remote_url
+    git_remote_name = :git_remote_name, git_remote_url = :git_remote_url,
+    kind = :kind
 WHERE id = :id
 ";
 
@@ -122,6 +125,12 @@ impl SqliteStore {
         let conn =
             Connection::open_with_flags(&self.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(|err| self.map_rusqlite(err))?;
+        let version = self.read_schema_version(&conn)?;
+        if version < CURRENT_VERSION {
+            return Err(self.storage_err(format!(
+                "schema version {version} is older than this build ({CURRENT_VERSION}); a write command migrates it"
+            )));
+        }
         self.load_projects(&conn)
     }
 
@@ -201,7 +210,7 @@ impl SqliteStore {
         crate::paths::refuse_symlink(&self.path, "SQLite database")?;
         create_private_file(&self.path)?;
 
-        let conn = Connection::open(&self.path).map_err(|err| self.map_rusqlite(err))?;
+        let mut conn = Connection::open(&self.path).map_err(|err| self.map_rusqlite(err))?;
         conn.busy_timeout(timeout)
             .map_err(|err| self.map_rusqlite(err))?;
         // Foreign keys are per-connection; the cascade from `projects` to
@@ -219,11 +228,11 @@ impl SqliteStore {
                 .map_err(|err| self.map_rusqlite(err))?;
         }
 
-        self.ensure_schema(&conn)?;
+        self.ensure_schema(&mut conn)?;
         Ok(conn)
     }
 
-    fn ensure_schema(&self, conn: &Connection) -> Result<()> {
+    fn ensure_schema(&self, conn: &mut Connection) -> Result<()> {
         // Stay read-only when the schema already exists: running the DDL
         // (or the seed insert) on every open would take the write lock and
         // block readers behind another process's transaction.
@@ -248,7 +257,49 @@ impl SqliteStore {
                 "written by a newer version of overdosecd (schema version {version}, this build supports {CURRENT_VERSION})"
             )));
         }
+        if version < CURRENT_VERSION {
+            self.migrate_schema(conn, version)?;
+        }
         Ok(())
+    }
+
+    /// Migrates an older schema in place, after keeping a copy of the file as
+    /// it was. Only a writable open calls this; `load_readonly` reports an old
+    /// version instead of migrating.
+    fn migrate_schema(&self, conn: &mut Connection, from: u32) -> Result<()> {
+        // `VACUUM INTO` writes a consistent copy, WAL content included.
+        let backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
+        let Some(target) = backup.to_str() else {
+            return Err(
+                self.storage_err("cannot back up the database to a non-UTF-8 path".to_owned())
+            );
+        };
+        conn.execute("VACUUM INTO ?1", [target])
+            .map_err(|err| self.map_rusqlite(err))?;
+
+        match from {
+            1 => {
+                // The write lock serializes concurrent first opens (the `ocd`
+                // wrapper and the cd hook can race after an upgrade); the
+                // version is re-read under it, so the loser of the race skips
+                // the ALTER instead of failing on the duplicate column. Its
+                // backup above may then hold the already-migrated database —
+                // redundant, never wrong.
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|err| self.map_rusqlite(err))?;
+                if self.read_schema_version(&tx)? == from {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE projects ADD COLUMN kind TEXT;\n\
+                         UPDATE meta SET value = '{CURRENT_VERSION}' \
+                         WHERE key = 'schema_version';"
+                    ))
+                    .map_err(|err| self.map_rusqlite(err))?;
+                }
+                tx.commit().map_err(|err| self.map_rusqlite(err))
+            }
+            other => Err(self.storage_err(format!("unsupported schema version {other}"))),
+        }
     }
 
     /// The stored schema version, parsed; an unparsable value is a storage
@@ -445,6 +496,7 @@ fn execute_project(
         ":git": i64::from(project.git.is_some()),
         ":git_remote_name": project.git.as_ref().and_then(|git| git.remote_name.as_deref()),
         ":git_remote_url": project.git.as_ref().and_then(|git| git.remote_url.as_deref()),
+        ":kind": project.kind.label(),
     })
 }
 
@@ -456,6 +508,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     let use_count: i64 = row.get(7)?;
     let pinned: i64 = row.get(8)?;
     let git: i64 = row.get(9)?;
+    let kind: Option<String> = row.get(12)?;
 
     Ok(Project {
         id: row.get(0)?,
@@ -482,6 +535,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         } else {
             None
         },
+        kind: kind.as_deref().map_or(Kind::Unknown, Kind::parse),
     })
 }
 
@@ -576,6 +630,75 @@ mod tests {
         assert!(
             err.to_string().contains("newer version of overdosecd"),
             "error was: {err}"
+        );
+    }
+
+    /// A schema-1 database, as v0.1.0 wrote it: no `kind` column.
+    fn write_v1_database(path: &Path) {
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;\n\
+             CREATE TABLE projects (\n\
+                 id TEXT PRIMARY KEY,\n\
+                 name TEXT NOT NULL,\n\
+                 path TEXT NOT NULL UNIQUE,\n\
+                 aliases TEXT NOT NULL DEFAULT '[]',\n\
+                 tags TEXT NOT NULL DEFAULT '[]',\n\
+                 created_at TEXT NOT NULL,\n\
+                 last_used_at TEXT,\n\
+                 use_count INTEGER NOT NULL DEFAULT 0,\n\
+                 pinned INTEGER NOT NULL DEFAULT 0,\n\
+                 git INTEGER NOT NULL DEFAULT 0,\n\
+                 git_remote_name TEXT,\n\
+                 git_remote_url TEXT\n\
+             ) STRICT;\n\
+             INSERT INTO meta VALUES ('schema_version', '1');\n\
+             INSERT INTO projects (id, name, path, created_at) \
+                 VALUES ('a', 'alpha', '/x/alpha', '2026-01-01T00:00:00Z');",
+        )
+        .expect("v1 schema");
+    }
+
+    #[test]
+    fn a_v1_database_migrates_once_with_a_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        write_v1_database(store.path());
+
+        let projects = store.load().expect("a writable open migrates");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].kind, Kind::Unknown, "old rows read as unknown");
+        assert_eq!(store.schema_version().unwrap(), Some(CURRENT_VERSION));
+
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with("projects.db.v1-"))
+            .expect("a pre-migration copy is kept");
+        assert!(dir.path().join(backup).exists());
+
+        // The migrated database writes and reads the new column.
+        let mut projects = store.load().unwrap();
+        projects[0].kind = Kind::Rust;
+        store.save(&projects).unwrap();
+        assert_eq!(store.load().unwrap()[0].kind, Kind::Rust);
+    }
+
+    #[test]
+    fn load_readonly_reports_an_old_schema_instead_of_migrating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        write_v1_database(store.path());
+
+        let err = store.load_readonly().unwrap_err();
+        assert!(err.to_string().contains("older"), "error was: {err}");
+        assert!(
+            !fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".v1-")),
+            "load_readonly must not migrate"
         );
     }
 

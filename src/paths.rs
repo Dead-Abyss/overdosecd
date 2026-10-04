@@ -62,18 +62,23 @@ pub fn refuse_symlink(path: &Path, kind: &'static str) -> Result<()> {
     }
 }
 
-/// A sibling name `stem.<tag>-<stamp>[-N]` that does not exist yet.
+/// A sibling name `name.<tag>-<stamp>[-N]` that does not exist yet.
 ///
-/// Quarantine (`json.corrupt-…`) and migration (`json.migrated-…`) both keep
-/// the original file aside; the timestamp has one-second resolution, so a
-/// numeric suffix is what keeps a second event from overwriting the first
-/// forensic copy.
+/// Quarantine (`projects.json.corrupt-…`), JSON migration
+/// (`projects.json.migrated-…`), and the SQLite pre-migration copy
+/// (`projects.db.v1-…`) all keep the original file aside; the timestamp has
+/// one-second resolution, so a numeric suffix is what keeps a second event
+/// from overwriting the first forensic copy.
 pub fn sibling_backup(path: &Path, tag: &str) -> PathBuf {
     let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let mut candidate = path.with_extension(format!("json.{tag}-{stamp}"));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut candidate = path.with_file_name(format!("{name}.{tag}-{stamp}"));
     let mut suffix = 1;
     while candidate.exists() {
-        candidate = path.with_extension(format!("json.{tag}-{stamp}-{suffix}"));
+        candidate = path.with_file_name(format!("{name}.{tag}-{stamp}-{suffix}"));
         suffix += 1;
     }
     candidate

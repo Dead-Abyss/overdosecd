@@ -23,10 +23,13 @@ overdosecd is a local-first tool: no network, no telemetry, no subprocesses, no
 dynamic configuration beyond the local files it documents. The interesting
 attack surfaces are all local:
 
-- **(a) A cloned repository's contents.** Directory names, `.git/config`, and
-  `.git/HEAD` come with the repository. They must never reach a terminal raw,
-  must not make `overdosecd` read an unbounded amount of data, and must not
-  choose where files are written.
+- **(a) A cloned repository's contents.** Directory names, `.git/config`,
+  `.git/HEAD`, and any file its `include.path`/`includeIf` points at come with
+  the repository. They must never reach a terminal raw, must not make
+  `overdosecd` read an unbounded amount of data, and must not choose where
+  files are written. Config includes are followed under fixed caps (eight
+  files, regular files only) and can steer only the sanitized remote display
+  and the bare-repository heuristic, never a write path.
 - **(b) A corrupted or planted data directory.** The index, the SQLite
   database, the home cache, and the visit counters are loaded from disk and
   can predate the current guards. A value read from them is untrusted exactly

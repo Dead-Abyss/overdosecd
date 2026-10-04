@@ -92,9 +92,6 @@ pub struct Context<'a> {
     pub discovery: &'a crate::config::Discovery,
 }
 
-/// How many home-directory rows the picker offers per query.
-const HOME_RESULT_LIMIT: usize = 20;
-
 /// What the picker exited with.
 enum Selected {
     Project(usize),
@@ -169,7 +166,6 @@ fn pick(
 ) -> Result<Option<Selected>> {
     let mut session = Session::enter(options)?;
     picker.set_home_enabled(context.discovery.home);
-    picker.set_home_limit(HOME_RESULT_LIMIT);
     let mut scanner: Option<mpsc::Receiver<Vec<Dir>>> = None;
 
     // Mouse tracking stays on until it is explicitly released, and a default
@@ -334,27 +330,15 @@ fn apply(
     match action {
         RunAction::Jump(index) => {
             let path = &picker.projects()[index].path;
-            if !path.exists() {
-                picker.set_status(
-                    format!(
-                        "directory no longer exists: {}",
-                        output::shorten_home(path, home)
-                    ),
-                    true,
-                );
+            if let Some(status) = missing_target(path, home) {
+                picker.set_status(status, true);
                 return Ok(None);
             }
             Ok(Some(Selected::Project(index)))
         }
         RunAction::JumpHome { path } => {
-            if !path.exists() {
-                picker.set_status(
-                    format!(
-                        "directory no longer exists: {}",
-                        output::shorten_home(&path, home)
-                    ),
-                    true,
-                );
+            if let Some(status) = missing_target(&path, home) {
+                picker.set_status(status, true);
                 return Ok(None);
             }
             Ok(Some(Selected::Home(path)))
@@ -399,6 +383,29 @@ fn apply(
     }
 }
 
+/// The "vanished target" status for a jump, if the directory is gone.
+fn missing_target(path: &Path, home: Option<&Path>) -> Option<String> {
+    if path.exists() {
+        return None;
+    }
+    Some(format!(
+        "directory no longer exists: {}",
+        output::shorten_home(path, home)
+    ))
+}
+
+/// The status for a batch mutation: "verb `name`" for one id, "verb N
+/// projects" when all applied, "verb N of M projects" when some vanished.
+fn batch_message(verb: &str, applied: usize, ids: &[String], single_name: &str) -> String {
+    if applied == 1 && ids.len() == 1 {
+        format!("{verb} `{single_name}`")
+    } else if applied == ids.len() {
+        format!("{verb} {applied} projects")
+    } else {
+        format!("{verb} {applied} of {} projects", ids.len())
+    }
+}
+
 /// Pins or unpins every id in one update, reporting partial applications.
 fn pin(store: &impl Store, picker: &mut Picker, ids: &[String], pinned: bool) {
     let result = store.update(|projects| {
@@ -415,13 +422,7 @@ fn pin(store: &impl Store, picker: &mut Picker, ids: &[String], pinned: bool) {
     match result {
         Ok(applied) => {
             let verb = if pinned { "pinned" } else { "unpinned" };
-            let message = if applied == 1 && ids.len() == 1 {
-                format!("{verb} `{}`", name_of(picker, &ids[0]))
-            } else if applied == ids.len() {
-                format!("{verb} {applied} projects")
-            } else {
-                format!("{verb} {applied} of {} projects", ids.len())
-            };
+            let message = batch_message(verb, applied, ids, &picker.name_of(&ids[0]));
             picker.set_pinned_ids(ids, pinned);
             let preserve = picker.selected_project().map(|project| project.id.clone());
             picker.refilter(preserve.as_deref());
@@ -446,13 +447,7 @@ fn remove(store: &impl Store, picker: &mut Picker, ids: &[String]) {
 
     match result {
         Ok(applied) => {
-            let message = if applied == 1 && ids.len() == 1 {
-                format!("removed `{}`", name_of(picker, &ids[0]))
-            } else if applied == ids.len() {
-                format!("removed {applied} projects")
-            } else {
-                format!("removed {applied} of {} projects", ids.len())
-            };
+            let message = batch_message("removed", applied, ids, &picker.name_of(&ids[0]));
             reload(store, picker, None);
             picker.set_status(message, false);
         }
@@ -572,7 +567,7 @@ fn health(context: &Context, picker: &mut Picker) {
     let rows: Vec<IssueRow> = issues
         .issues
         .iter()
-        .map(|issue| issue_row(issue, picker, home.as_deref()))
+        .map(|issue| issue_row(issue, home.as_deref()))
         .collect();
 
     if rows.is_empty() {
@@ -584,28 +579,21 @@ fn health(context: &Context, picker: &mut Picker) {
 
 /// One compact line per issue; stale projects keep their id so the health
 /// view can relocate or remove them.
-fn issue_row(issue: &Issue, picker: &Picker, home: Option<&Path>) -> IssueRow {
+fn issue_row(issue: &Issue, home: Option<&Path>) -> IssueRow {
     let informational = |label: String| IssueRow { label, stale: None };
 
     match issue {
-        Issue::StalePath { name, path } => {
-            let id = picker
-                .projects()
-                .iter()
-                .find(|project| &project.path == path)
-                .map(|project| project.id.clone());
-            IssueRow {
-                label: format!(
-                    "stale `{}` -> {}",
-                    sanitize::text(name),
-                    output::shorten_home(path, home)
-                ),
-                stale: id.map(|id| StaleRef {
-                    id,
-                    path: path.clone(),
-                }),
-            }
-        }
+        Issue::StalePath { id, name, path } => IssueRow {
+            label: format!(
+                "stale `{}` -> {}",
+                sanitize::text(name),
+                output::shorten_home(path, home)
+            ),
+            stale: Some(StaleRef {
+                id: id.clone(),
+                path: path.clone(),
+            }),
+        },
         Issue::DuplicateName { name, count } => informational(format!(
             "{count} projects share the name `{}`",
             sanitize::text(name)
@@ -629,10 +617,6 @@ fn issue_row(issue: &Issue, picker: &Picker, home: Option<&Path>) -> IssueRow {
             "cannot read {}: {}",
             output::shorten_home(path, home),
             sanitize::text(message)
-        )),
-        Issue::IndexNotWritable(path) => informational(format!(
-            "the index is not writable: {}",
-            output::shorten_home(path, home)
         )),
         Issue::IndexPermissions { path, mode } => informational(format!(
             "index mode is {mode:o}, expected 600: {}",
@@ -701,30 +685,13 @@ fn reload(store: &impl Store, picker: &mut Picker, preserve: Option<&str>) {
     }
 }
 
-fn name_of(picker: &Picker, id: &str) -> String {
-    picker
-        .projects()
-        .iter()
-        .find(|project| project.id == id)
-        .map(|project| project.name.clone())
-        .unwrap_or_else(|| id.to_owned())
-}
-
-/// Opens the controlling terminal for rendering. Stdout is deliberately not
-/// used: the shell captures it with `$(...)`, so only the chosen path may be
-/// written there.
-fn open_terminal() -> Result<File> {
+/// Opens the controlling terminal. Stdout is deliberately not used: the
+/// shell captures it with `$(...)`, so only the chosen path may be written
+/// there. The read-write variant serves the cursor query, which has to read
+/// the terminal's answer back.
+fn open_tty(read: bool) -> Result<File> {
     OpenOptions::new()
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| Error::NoTerminal)
-}
-
-/// Opens the controlling terminal for the cursor query, which has to read the
-/// terminal's answer back.
-fn open_terminal_read_write() -> Result<File> {
-    OpenOptions::new()
-        .read(true)
+        .read(read)
         .write(true)
         .open("/dev/tty")
         .map_err(|_| Error::NoTerminal)
@@ -790,22 +757,7 @@ fn add_project(store: &impl Store, picker: &mut Picker, input: &str) {
 /// Expands `input` (leading `~` included), checks that it is an existing
 /// directory, and inserts it; returns the message and the project name.
 fn add_path(store: &impl Store, input: &str) -> Result<(String, String)> {
-    let input = input.trim();
-    let expanded = if input == "~" || input.starts_with('~') {
-        project::expand_tilde(input)
-    } else {
-        PathBuf::from(input)
-    };
-
-    if !expanded.exists() {
-        return Err(Error::MissingDirectory(expanded));
-    }
-    if !expanded.is_dir() {
-        return Err(Error::NotADirectory(expanded));
-    }
-
-    let canonical = project::normalize(&expanded)?;
-    project::reject_control_chars_path(&canonical)?;
+    let canonical = project::require_dir(Path::new(input.trim()), project::home_dir().as_deref())?;
     let name = project::default_name(&canonical)?;
 
     let message = store.update(move |projects| {
@@ -844,7 +796,7 @@ impl Session {
     fn enter(options: &Options) -> Result<Self> {
         // Until the session exists, this guard undoes any partial setup.
         let mut pending = PendingRestore {
-            output: Some(open_terminal()?),
+            output: Some(open_tty(false)?),
         };
 
         enable_raw_mode()?;
@@ -854,7 +806,7 @@ impl Session {
         }
 
         let rows = ratatui::crossterm::terminal::size().map_or(24, |(_, rows)| rows);
-        let backend = backend::TtyBackend::new(open_terminal()?, open_terminal_read_write()?);
+        let backend = backend::TtyBackend::new(open_tty(false)?, open_tty(true)?);
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions {

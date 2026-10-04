@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The palette's "add" action prefills its prompt (query, highlighted home
+  result, or cwd) exactly like `Ctrl+a`, instead of opening it empty.
+- `scan <root>...` resolves roots to their canonical path like `add`, so a
+  symlinked root reports paths under its target.
+
+### Changed
+
+- Internals: deduplicated the storage, paths, and config layers (one backup
+  namer, one rebuildable-JSON read, one index-file and one schema-version
+  helper, shared directory validation for `add`/`scan`/picker/`doctor --fix`),
+  merged the alias/tag commands behind one shape, and folded small renderer
+  and picker helpers. The CLI surface is unchanged.
+- `doctor` reports a read-only index as its mode (`0400`) instead of both a
+  read-only line and a mode line.
+
 ## [0.1.0] - 2026-10-03
 
 The first release under the overdosecd name: a rename of the predecessor

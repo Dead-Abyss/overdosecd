@@ -86,12 +86,8 @@ pub fn home_dir() -> Option<PathBuf> {
     crate::dirs::home_dir()
 }
 
-/// Expands a leading `~` or `~/` using the current home directory.
-pub fn expand_tilde(input: &str) -> PathBuf {
-    expand_tilde_with(input, home_dir().as_deref())
-}
-
-/// Testable variant of [`expand_tilde`] with an explicit home directory.
+/// Expands a leading `~` or `~/` against an explicit home directory; the
+/// testable core of [`require_dir`].
 pub fn expand_tilde_with(input: &str, home: Option<&Path>) -> PathBuf {
     match home {
         Some(home) if input == "~" => home.to_path_buf(),
@@ -101,6 +97,26 @@ pub fn expand_tilde_with(input: &str, home: Option<&Path>) -> PathBuf {
         },
         None => PathBuf::from(input),
     }
+}
+
+/// Expands `~` against `home`, requires an existing directory, and
+/// canonicalizes it with the control-character guard. The shared front half
+/// of `add`, `scan <root>...`, the picker's add prompt, and `doctor --fix`.
+pub fn require_dir(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
+    let expanded = if path.starts_with("~") {
+        expand_tilde_with(&path.to_string_lossy(), home)
+    } else {
+        path.to_path_buf()
+    };
+    if !expanded.exists() {
+        return Err(Error::MissingDirectory(expanded));
+    }
+    if !expanded.is_dir() {
+        return Err(Error::NotADirectory(expanded));
+    }
+    let canonical = normalize(&expanded)?;
+    reject_control_chars_path(&canonical)?;
+    Ok(canonical)
 }
 
 /// Canonicalizes a path: resolves symlinks, `.`, and `..`.

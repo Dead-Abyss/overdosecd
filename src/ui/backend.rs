@@ -98,7 +98,7 @@ impl Backend for TtyBackend {
 
 /// Asks the terminal for a cursor position report (`ESC [ 6 n`) and parses the
 /// `ESC [ row ; col R` reply. It needs a handle that can read the answer back,
-/// which is why [`open_terminal_read_write`] exists.
+/// which is why `open_tty(true)` exists.
 fn query_cursor_position(tty: &mut File) -> io::Result<Position> {
     tty.write_all(b"\x1b[6n")?;
     tty.flush()?;

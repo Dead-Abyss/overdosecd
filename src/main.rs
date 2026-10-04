@@ -30,8 +30,8 @@ use clap::Parser;
 use colored::Colorize;
 
 use crate::cli::{
-    AddArgs, AliasCommand, Cli, Command, DoctorArgs, ImportArgs, ListArgs, RemoveArgs, ScanArgs,
-    SortBy, TagCommand,
+    AddArgs, Cli, Command, DoctorArgs, ImportArgs, ListArgs, RemoveArgs, ScanArgs, SortBy,
+    TermCommand,
 };
 use crate::config::{ColorMode, StorageBackend};
 use crate::error::{Error, Result};
@@ -163,8 +163,12 @@ fn run(cli: Cli) -> Result<i32> {
                 Command::Rename { old, new, force } => {
                     cmd_rename(&store, &old, &new, force, &matching, debug)?
                 }
-                Command::Alias { action } => cmd_alias(&store, action, &matching, debug)?,
-                Command::Tag { action } => cmd_tag(&store, action, &matching, debug)?,
+                Command::Alias { action } => {
+                    cmd_term(&store, action, TermKind::Alias, &matching, debug)?
+                }
+                Command::Tag { action } => {
+                    cmd_term(&store, action, TermKind::Tag, &matching, debug)?
+                }
                 Command::Migrate => cmd_migrate(&data_dir, backend, &location)?,
                 Command::Import(args) => cmd_import(&store, args)?,
                 Command::Scan(args) => cmd_scan(&data_dir, &config.discovery, args)?,
@@ -188,16 +192,7 @@ fn cmd_add(store: &impl Store, args: AddArgs) -> Result<()> {
         Some(path) => path,
         None => std::env::current_dir()?,
     };
-    let input = expand_input(&input);
-
-    if !input.exists() {
-        return Err(Error::MissingDirectory(input));
-    }
-    if !input.is_dir() {
-        return Err(Error::NotADirectory(input));
-    }
-    let canonical = project::normalize(&input)?;
-    project::reject_control_chars_path(&canonical)?;
+    let canonical = project::require_dir(&input, project::home_dir().as_deref())?;
 
     let provided_name = match args.name {
         Some(name) => Some(project::sanitize_value("project name", &name)?),
@@ -243,14 +238,11 @@ fn cmd_list(store: &impl Store, args: ListArgs) -> Result<()> {
         .map(|project| !project.path.exists())
         .collect();
 
-    let mut visible: Vec<Project> = Vec::with_capacity(projects.len());
-    let mut visible_missing: Vec<bool> = Vec::with_capacity(projects.len());
-    for (project, missing) in projects.into_iter().zip(missing) {
-        if args.all || !missing {
-            visible.push(project);
-            visible_missing.push(missing);
-        }
-    }
+    let (visible, visible_missing): (Vec<Project>, Vec<bool>) = projects
+        .into_iter()
+        .zip(missing)
+        .filter(|(_, missing)| args.all || !missing)
+        .unzip();
 
     if args.json {
         let file = StoreFile::new(visible);
@@ -428,28 +420,15 @@ fn cmd_info(store: &impl Store, query: &str, matching: &MatcherConfig, debug: bo
         ("name:", sanitize::text(&project.name)),
         ("id:", sanitize::text(&project.id)),
         ("path:", sanitize::path(&project.path)),
-        (
-            "aliases:",
-            if project.aliases.is_empty() {
-                dash.clone()
-            } else {
-                sanitize::text(&project.aliases.join(", "))
-            },
-        ),
-        (
-            "tags:",
-            if project.tags.is_empty() {
-                dash.clone()
-            } else {
-                sanitize::text(&project.tags.join(", "))
-            },
-        ),
+        ("aliases:", output::join_or_dash(&project.aliases)),
+        ("tags:", output::join_or_dash(&project.tags)),
         ("created:", created.to_string()),
         ("last used:", last_used),
         ("uses:", project.use_count.to_string()),
     ];
-    if let Some(history) = format_history(store, &project.id)? {
-        rows.push(("history:", history));
+    let history = store.recent_uses(&project.id, 5)?;
+    if !history.is_empty() {
+        rows.push(("history:", output::format_times(&history, Utc::now())));
     }
     rows.push((
         "pinned:",
@@ -481,16 +460,6 @@ fn cmd_info(store: &impl Store, query: &str, matching: &MatcherConfig, debug: bo
         output::print_line(&output::info_line(label, value))?;
     }
     Ok(())
-}
-
-/// The most recent jumps as one relative-time line; `None` when the backend
-/// keeps no usage log (JSON) or the project has no history yet.
-fn format_history(store: &impl Store, id: &str) -> Result<Option<String>> {
-    let history = store.recent_uses(id, 5)?;
-    if history.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(output::format_times(&history, Utc::now())))
 }
 
 fn cmd_remove(
@@ -628,62 +597,20 @@ fn cmd_rename(
     output::print_line(&message)
 }
 
-fn cmd_alias(
-    store: &impl Store,
-    action: AliasCommand,
-    matching: &MatcherConfig,
-    debug: bool,
-) -> Result<()> {
-    match action {
-        AliasCommand::Add { project, alias } => cmd_term(
-            store,
-            &project,
-            &alias,
-            TermKind::Alias,
-            true,
-            matching,
-            debug,
-        ),
-        AliasCommand::Remove { project, alias } => cmd_term(
-            store,
-            &project,
-            &alias,
-            TermKind::Alias,
-            false,
-            matching,
-            debug,
-        ),
-    }
-}
-
-fn cmd_tag(
-    store: &impl Store,
-    action: TagCommand,
-    matching: &MatcherConfig,
-    debug: bool,
-) -> Result<()> {
-    match action {
-        TagCommand::Add { project, tag } => {
-            cmd_term(store, &project, &tag, TermKind::Tag, true, matching, debug)
-        }
-        TagCommand::Remove { project, tag } => {
-            cmd_term(store, &project, &tag, TermKind::Tag, false, matching, debug)
-        }
-    }
-}
-
 fn cmd_term(
     store: &impl Store,
-    query: &str,
-    value: &str,
+    action: TermCommand,
     kind: TermKind,
-    add: bool,
     matching: &MatcherConfig,
     debug: bool,
 ) -> Result<()> {
-    let value = project::sanitize_value(kind.label(), value)?;
+    let (project, value, add) = match action {
+        TermCommand::Add { project, term } => (project, term, true),
+        TermCommand::Remove { project, term } => (project, term, false),
+    };
+    let value = project::sanitize_value(kind.label(), &value)?;
 
-    let (id, name) = resolve_id(store, query, matching, debug)?;
+    let (id, name) = resolve_id(store, &project, matching, debug)?;
 
     let message = store.update(move |projects| {
         let project = project::revalidate(projects, &id, name)?;
@@ -787,13 +714,7 @@ fn cmd_scan_roots(
     let mut total = 0usize;
     let mut projects = 0usize;
     for root in roots {
-        let root = expand_input(root);
-        if !root.exists() {
-            return Err(Error::MissingDirectory(root));
-        }
-        if !root.is_dir() {
-            return Err(Error::NotADirectory(root));
-        }
+        let root = project::require_dir(root, home.as_deref())?;
         let mut dirs = discovery::scan(&root, &options);
         discovery::best_first(&mut dirs);
         for dir in &dirs {
@@ -978,15 +899,6 @@ fn sort_projects(projects: &mut [Project], sort: Option<SortBy>) {
     projects.sort_by(|a, b| project::sort_key(a, b, sort));
 }
 
-/// Expands a leading `~` without mangling non-UTF-8 paths that do not use it.
-fn expand_input(input: &Path) -> PathBuf {
-    if input == Path::new("~") || input.starts_with("~") {
-        project::expand_tilde(&input.to_string_lossy())
-    } else {
-        input.to_path_buf()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,17 +934,5 @@ mod tests {
             .map(|project| project.name.as_str())
             .collect();
         assert_eq!(names, ["alpha", "bravo"]);
-    }
-
-    #[test]
-    fn expand_input_handles_tilde_forms() {
-        assert_eq!(
-            expand_input(Path::new("/abs/path")),
-            PathBuf::from("/abs/path")
-        );
-        let expanded = expand_input(Path::new("~/code"));
-        if let Some(home) = project::home_dir() {
-            assert_eq!(expanded, home.join("code"));
-        }
     }
 }

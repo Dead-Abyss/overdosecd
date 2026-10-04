@@ -14,7 +14,11 @@ use crate::store::sqlite::SqliteStore;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Issue {
     /// The project's directory no longer exists.
-    StalePath { name: String, path: PathBuf },
+    StalePath {
+        id: String,
+        name: String,
+        path: PathBuf,
+    },
 
     /// Two or more projects share a name (case-insensitively).
     DuplicateName { name: String, count: usize },
@@ -37,10 +41,8 @@ pub enum Issue {
     /// The index file that is not the active backend cannot be read.
     InactiveIndexUnreadable { path: PathBuf, message: String },
 
-    /// The index file has no write permission.
-    IndexNotWritable(PathBuf),
-
-    /// The index file mode is wider than `0600`.
+    /// The index file mode is wider than `0600`; `0600` includes the owner
+    /// write bit, so a read-only file lands here too.
     IndexPermissions { path: PathBuf, mode: u32 },
 
     /// The home-discovery cache mode is wider than `0600`.
@@ -91,6 +93,7 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
     for project in projects {
         if !project.path.exists() {
             issues.push(Issue::StalePath {
+                id: project.id.clone(),
                 name: project.name.clone(),
                 path: project.path.clone(),
             });
@@ -240,9 +243,6 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
     }
 
     if let Ok(metadata) = fs::metadata(&index_path) {
-        if metadata.permissions().readonly() {
-            issues.push(Issue::IndexNotWritable(index_path.clone()));
-        }
         use std::os::unix::fs::PermissionsExt;
         let mode = metadata.permissions().mode() & 0o777;
         if mode != 0o600 {
@@ -434,16 +434,7 @@ pub(crate) fn validate_target(
     raw: &str,
     home: Option<&Path>,
 ) -> Result<PathBuf> {
-    let expanded = project::expand_tilde_with(raw, home);
-    if !expanded.exists() {
-        return Err(Error::MissingDirectory(expanded));
-    }
-    if !expanded.is_dir() {
-        return Err(Error::NotADirectory(expanded));
-    }
-
-    let canonical = project::normalize(&expanded)?;
-    project::reject_control_chars_path(&canonical)?;
+    let canonical = project::require_dir(Path::new(raw), home)?;
     if projects
         .iter()
         .any(|project| project.id != id && project.path == canonical)
@@ -567,14 +558,16 @@ mod tests {
         write_index(&index);
         let missing = dir.path().join("gone");
 
+        let sample = project("gone", &missing);
         let report = inspect(
             dir.path(),
             StorageBackend::Json,
-            &[project("gone", &missing)],
+            std::slice::from_ref(&sample),
         );
         assert_eq!(
             report.issues,
             vec![Issue::StalePath {
+                id: sample.id.clone(),
                 name: "gone".to_owned(),
                 path: missing,
             }]
@@ -641,7 +634,14 @@ mod tests {
 
         fs::set_permissions(&index, fs::Permissions::from_mode(0o400)).expect("chmod 0400");
         let report = inspect(dir.path(), StorageBackend::Json, &[]);
-        assert!(report.issues.contains(&Issue::IndexNotWritable(index)));
+        assert_eq!(
+            report.issues,
+            vec![Issue::IndexPermissions {
+                path: index,
+                mode: 0o400,
+            }],
+            "a read-only file is also a wrong-mode file"
+        );
     }
 
     #[cfg(unix)]

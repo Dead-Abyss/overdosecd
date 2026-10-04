@@ -101,13 +101,13 @@ pub enum Command {
     /// Manage project aliases
     Alias {
         #[command(subcommand)]
-        action: AliasCommand,
+        action: TermCommand,
     },
 
     /// Manage project tags
     Tag {
         #[command(subcommand)]
-        action: TagCommand,
+        action: TermCommand,
     },
 
     /// Check the index for problems and repair stale projects
@@ -143,41 +143,24 @@ pub enum Command {
     Hook,
 }
 
+/// The sub-actions `alias` and `tag` share; the parent command picks the
+/// [`TermKind`](crate::project::TermKind) the value belongs to.
 #[derive(Debug, Subcommand)]
-pub enum AliasCommand {
-    /// Add an alias to a project
+pub enum TermCommand {
+    /// Add an alias or tag to a project
     Add {
         /// Project name, alias, tag, or fuzzy query
         project: String,
-        /// Alias to add
-        alias: String,
+        /// Alias or tag to add
+        term: String,
     },
 
-    /// Remove an alias from a project
+    /// Remove an alias or tag from a project
     Remove {
         /// Project name, alias, tag, or fuzzy query
         project: String,
-        /// Alias to remove
-        alias: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum TagCommand {
-    /// Add a tag to a project
-    Add {
-        /// Project name, alias, tag, or fuzzy query
-        project: String,
-        /// Tag to add
-        tag: String,
-    },
-
-    /// Remove a tag from a project
-    Remove {
-        /// Project name, alias, tag, or fuzzy query
-        project: String,
-        /// Tag to remove
-        tag: String,
+        /// Alias or tag to remove
+        term: String,
     },
 }
 

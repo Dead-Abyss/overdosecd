@@ -210,7 +210,7 @@ impl SqliteStore {
         crate::paths::refuse_symlink(&self.path, "SQLite database")?;
         create_private_file(&self.path)?;
 
-        let conn = Connection::open(&self.path).map_err(|err| self.map_rusqlite(err))?;
+        let mut conn = Connection::open(&self.path).map_err(|err| self.map_rusqlite(err))?;
         conn.busy_timeout(timeout)
             .map_err(|err| self.map_rusqlite(err))?;
         // Foreign keys are per-connection; the cascade from `projects` to
@@ -228,11 +228,11 @@ impl SqliteStore {
                 .map_err(|err| self.map_rusqlite(err))?;
         }
 
-        self.ensure_schema(&conn)?;
+        self.ensure_schema(&mut conn)?;
         Ok(conn)
     }
 
-    fn ensure_schema(&self, conn: &Connection) -> Result<()> {
+    fn ensure_schema(&self, conn: &mut Connection) -> Result<()> {
         // Stay read-only when the schema already exists: running the DDL
         // (or the seed insert) on every open would take the write lock and
         // block readers behind another process's transaction.
@@ -266,7 +266,7 @@ impl SqliteStore {
     /// Migrates an older schema in place, after keeping a copy of the file as
     /// it was. Only a writable open calls this; `load_readonly` reports an old
     /// version instead of migrating.
-    fn migrate_schema(&self, conn: &Connection, from: u32) -> Result<()> {
+    fn migrate_schema(&self, conn: &mut Connection, from: u32) -> Result<()> {
         // `VACUUM INTO` writes a consistent copy, WAL content included.
         let backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
         let Some(target) = backup.to_str() else {
@@ -278,13 +278,26 @@ impl SqliteStore {
             .map_err(|err| self.map_rusqlite(err))?;
 
         match from {
-            1 => conn
-                .execute_batch(&format!(
-                    "BEGIN;\nALTER TABLE projects ADD COLUMN kind TEXT;\n\
-                     UPDATE meta SET value = '{CURRENT_VERSION}' \
-                     WHERE key = 'schema_version';\nCOMMIT;"
-                ))
-                .map_err(|err| self.map_rusqlite(err)),
+            1 => {
+                // The write lock serializes concurrent first opens (the `ocd`
+                // wrapper and the cd hook can race after an upgrade); the
+                // version is re-read under it, so the loser of the race skips
+                // the ALTER instead of failing on the duplicate column. Its
+                // backup above may then hold the already-migrated database —
+                // redundant, never wrong.
+                let tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|err| self.map_rusqlite(err))?;
+                if self.read_schema_version(&tx)? == from {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE projects ADD COLUMN kind TEXT;\n\
+                         UPDATE meta SET value = '{CURRENT_VERSION}' \
+                         WHERE key = 'schema_version';"
+                    ))
+                    .map_err(|err| self.map_rusqlite(err))?;
+                }
+                tx.commit().map_err(|err| self.map_rusqlite(err))
+            }
             other => Err(self.storage_err(format!("unsupported schema version {other}"))),
         }
     }

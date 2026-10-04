@@ -82,7 +82,7 @@ pub enum Error {
     )]
     SymlinkedPath { kind: &'static str, path: PathBuf },
 
-    #[error("invalid {kind}: must not contain control or invisible characters: {value:?}")]
+    #[error("invalid {kind}: must not contain control or invisible characters: {}", sanitize::quoted(.value))]
     ControlInValue { kind: &'static str, value: String },
 
     /// A path that cannot be printed as machine output: `goto`'s stdout is

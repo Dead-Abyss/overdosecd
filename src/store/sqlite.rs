@@ -12,15 +12,15 @@ use crate::project::{GitInfo, Project};
 
 use super::Store;
 
-pub const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 1;
 
 /// How long a writer waits for the database lock before giving up, matching
 /// the JSON backend's `LOCK_TIMEOUT` so both feel alike under contention.
-pub const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
+const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Jumps kept per project in the `usage` log; the oldest rows are pruned with
 /// each new jump, so the log stays bounded.
-pub const USAGE_KEEP: usize = 500;
+const USAGE_KEEP: usize = 500;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -56,18 +56,10 @@ FROM projects
 ORDER BY rowid
 ";
 
-const INSERT_PROJECT: &str = "
-INSERT INTO projects (
-    id, name, path, aliases, tags, created_at, last_used_at, use_count,
-    pinned, git, git_remote_name, git_remote_url
-) VALUES (
-    :id, :name, :path, :aliases, :tags, :created_at, :last_used_at,
-    :use_count, :pinned, :git, :git_remote_name, :git_remote_url
-)
-";
-
 /// Upserts instead of `INSERT OR REPLACE` so a rewritten row keeps its
 /// `usage` history (replace would delete and re-insert, cascading the log).
+/// Used for both fresh inserts and rewrites: `ON CONFLICT` cannot fire on a
+/// row that is not there yet.
 const UPSERT_PROJECT: &str = "
 INSERT INTO projects (
     id, name, path, aliases, tags, created_at, last_used_at, use_count,
@@ -250,6 +242,18 @@ impl SqliteStore {
             .map_err(|err| self.map_rusqlite(err))?;
         }
 
+        let version = self.read_schema_version(conn)?;
+        if version > CURRENT_VERSION {
+            return Err(self.storage_err(format!(
+                "written by a newer version of overdosecd (schema version {version}, this build supports {CURRENT_VERSION})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The stored schema version, parsed; an unparsable value is a storage
+    /// error rather than a silent fallback.
+    fn read_schema_version(&self, conn: &Connection) -> Result<u32> {
         let version: String = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'schema_version'",
@@ -257,15 +261,9 @@ impl SqliteStore {
                 |row| row.get(0),
             )
             .map_err(|err| self.map_rusqlite(err))?;
-        let version: u32 = version
+        version
             .parse()
-            .map_err(|_| self.storage_err(format!("unreadable schema version `{version}`")))?;
-        if version > CURRENT_VERSION {
-            return Err(self.storage_err(format!(
-                "written by a newer version of overdosecd (schema version {version}, this build supports {CURRENT_VERSION})"
-            )));
-        }
-        Ok(())
+            .map_err(|_| self.storage_err(format!("unreadable schema version `{version}`")))
     }
 
     fn load_projects(&self, conn: &Connection) -> Result<Vec<Project>> {
@@ -307,7 +305,7 @@ impl SqliteStore {
             .prepare(UPDATE_PROJECT)
             .map_err(|err| self.map_rusqlite(err))?;
         let mut insert = conn
-            .prepare(INSERT_PROJECT)
+            .prepare(UPSERT_PROJECT)
             .map_err(|err| self.map_rusqlite(err))?;
 
         for project in after {
@@ -423,17 +421,7 @@ impl Store for SqliteStore {
             return Ok(None);
         }
         let conn = self.open()?;
-        let version: String = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| self.map_rusqlite(err))?;
-        let version = version
-            .parse()
-            .map_err(|_| self.storage_err(format!("unreadable schema version `{version}`")))?;
-        Ok(Some(version))
+        Ok(Some(self.read_schema_version(&conn)?))
     }
 }
 
@@ -511,33 +499,17 @@ fn parse_time(raw: &str, column: usize) -> rusqlite::Result<DateTime<Utc>> {
 
 /// Creates the database file with mode `0600` up front, so SQLite never
 /// creates it with wider permissions. The WAL and shared-memory files copy
-/// the database's mode; on other platforms the platform defaults apply.
+/// the database's mode.
+///
+/// Every caller refuses a symlink on this path first (`refuse_symlink`), so
+/// this only ever creates a regular file or steps aside for one.
 fn create_private_file(path: &Path) -> Result<()> {
-    // An existing path must be a regular file: `exists()` follows symlinks,
-    // and SQLite would happily write through a planted link into a file the
-    // attacker chose (and owns, mode included). The store-level check in
-    // `open_with_timeout` refuses links too; this covers direct callers.
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(Error::SymlinkedPath {
-                kind: "SQLite database",
-                path: path.to_path_buf(),
-            });
-        }
-        Ok(_) => return Ok(()),
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
+    use std::os::unix::fs::OpenOptionsExt;
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    options.write(true).create_new(true).mode(0o600);
     match options.open(path) {
         Ok(_) => Ok(()),
-        // Another process created it between the check and the open.
+        // Another process created it between the store's check and this open.
         Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(()),
         Err(err) => Err(err.into()),
     }

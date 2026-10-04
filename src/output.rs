@@ -548,23 +548,18 @@ fn shrink_to_budget(widths: &mut [usize], floors: &[usize], priority: &[usize], 
     let overflow =
         |widths: &[usize]| (widths.iter().sum::<usize>() + separators).saturating_sub(budget);
 
-    for &index in priority {
-        let excess = overflow(widths);
-        if excess == 0 {
-            return;
+    // Two passes: give space up in priority order, first down to each
+    // column's floor, then (absurdly narrow terminal) down to one cell.
+    for pass in 0..2 {
+        for &index in priority {
+            let excess = overflow(widths);
+            if excess == 0 {
+                return;
+            }
+            let floor = if pass == 0 { floors[index] } else { 1 };
+            let give = excess.min(widths[index].saturating_sub(floor));
+            widths[index] -= give;
         }
-        let give = excess.min(widths[index].saturating_sub(floors[index]));
-        widths[index] -= give;
-    }
-
-    // Absurdly narrow terminal: floors give way too, down to one cell each.
-    for &index in priority {
-        let excess = overflow(widths);
-        if excess == 0 {
-            return;
-        }
-        let give = excess.min(widths[index].saturating_sub(1));
-        widths[index] -= give;
     }
 }
 
@@ -781,7 +776,7 @@ pub fn format_debug(query: &str, ranked: &[Match], home: Option<&Path>) -> Strin
     out
 }
 
-fn join_or_dash(values: &[String]) -> String {
+pub(crate) fn join_or_dash(values: &[String]) -> String {
     if values.is_empty() {
         "-".to_owned()
     } else {
@@ -863,7 +858,7 @@ pub fn format_doctor(
     let mut stale = false;
     for issue in &report.issues {
         match issue {
-            Issue::StalePath { name, path } => {
+            Issue::StalePath { name, path, .. } => {
                 stale = true;
                 out.push_str(&format!(
                     "  - {} `{}` -> {} (directory no longer exists)\n",
@@ -902,11 +897,6 @@ pub fn format_doctor(
             Issue::InactiveIndexUnreadable { path, message } => out.push_str(&format!(
                 "  - {} {} cannot be read: {message}\n",
                 "unreadable:".red(),
-                shorten_home(path, home)
-            )),
-            Issue::IndexNotWritable(path) => out.push_str(&format!(
-                "  - {} {} is read-only\n",
-                "permissions:".red(),
                 shorten_home(path, home)
             )),
             Issue::IndexPermissions { path, mode } => out.push_str(&format!(
@@ -1244,6 +1234,7 @@ mod tests {
         let report = Report {
             issues: vec![
                 Issue::StalePath {
+                    id: "gone-id".to_owned(),
                     name: "gone".to_owned(),
                     path: PathBuf::from("/tmp/gone"),
                 },

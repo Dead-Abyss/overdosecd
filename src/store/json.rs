@@ -13,15 +13,15 @@ use crate::project::Project;
 
 use super::Store;
 
-pub const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 1;
 
 /// Sidecar lock file. It lives next to the data file but is never renamed:
 /// atomic saves replace the data file's inode, so a lock held on it would not
 /// serialize a second writer.
-pub const LOCK_FILE: &str = "projects.lock";
+const LOCK_FILE: &str = "projects.lock";
 
 /// How long writers wait for the index lock before giving up.
-pub const LOCK_TIMEOUT: Duration = Duration::from_millis(500);
+const LOCK_TIMEOUT: Duration = Duration::from_millis(500);
 
 const LOCK_RETRY: Duration = Duration::from_millis(20);
 

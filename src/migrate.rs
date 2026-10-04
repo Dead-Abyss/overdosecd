@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
-
 use crate::error::{Error, Result};
 use crate::paths;
 use crate::store::Store;
@@ -50,25 +48,12 @@ pub fn run(data_dir: &Path) -> Result<Outcome> {
 
     SqliteStore::new(db_path).save(&projects)?;
 
-    let backup = backup_path(&json_path);
+    let backup = paths::sibling_backup(&json_path, "migrated");
     fs::rename(&json_path, &backup)?;
     Ok(Outcome::Migrated {
         projects: count,
         backup,
     })
-}
-
-/// A `projects.json.migrated-<timestamp>` sibling that does not exist yet, so
-/// an earlier backup is never overwritten.
-fn backup_path(json_path: &Path) -> PathBuf {
-    let stamp = Utc::now().format("%Y%m%d%H%M%S");
-    let mut candidate = json_path.with_extension(format!("json.migrated-{stamp}"));
-    let mut suffix = 1;
-    while candidate.exists() {
-        candidate = json_path.with_extension(format!("json.migrated-{stamp}-{suffix}"));
-        suffix += 1;
-    }
-    candidate
 }
 
 #[cfg(test)]

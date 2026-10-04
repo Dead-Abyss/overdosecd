@@ -90,7 +90,7 @@ pub fn data_local_dir() -> Option<PathBuf> {
 }
 
 /// A non-empty environment value.
-fn os_env(name: &str) -> Option<OsString> {
+pub(crate) fn os_env(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
 

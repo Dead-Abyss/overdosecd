@@ -212,16 +212,12 @@ pub fn locate(env: Option<PathBuf>, platform: Option<PathBuf>) -> Location {
 
 /// The `$OVERDOSECD_CONFIG` value, if it is set and non-empty.
 pub fn env_path() -> Option<PathBuf> {
-    non_empty_env(ENV_CONFIG).map(PathBuf::from)
+    crate::dirs::os_env(ENV_CONFIG).map(PathBuf::from)
 }
 
 /// The `$OVERDOSECD_COLOR` value, if it is set and non-empty.
 pub fn env_color() -> Option<String> {
-    non_empty_env(ENV_COLOR).map(|value| value.to_string_lossy().into_owned())
-}
-
-fn non_empty_env(name: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(name).filter(|value| !value.is_empty())
+    crate::dirs::os_env(ENV_COLOR).map(|value| value.to_string_lossy().into_owned())
 }
 
 /// The platform config path (`~/.config/overdosecd/config.toml` on Linux).
@@ -244,17 +240,12 @@ pub fn load(location: &Location) -> Result<Config> {
     // environment value is the one that can be relative in practice; a
     // relative platform path means a broken home directory, and is refused
     // for the same reason.
-    if !path.is_absolute() {
-        let kind = if location.explicit {
-            "the config file from $OVERDOSECD_CONFIG"
-        } else {
-            "the platform config path"
-        };
-        return Err(Error::RelativePath {
-            kind,
-            value: path.to_string_lossy().into_owned(),
-        });
-    }
+    let kind = if location.explicit {
+        "the config file from $OVERDOSECD_CONFIG"
+    } else {
+        "the platform config path"
+    };
+    crate::paths::absolute(kind, path)?;
 
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -291,13 +282,13 @@ pub enum Status {
     Invalid { path: PathBuf, message: String },
 }
 
-/// Loads the config without surfacing an error, for the `doctor` report.
-pub fn status(location: &Location) -> Status {
+/// Classifies an already-loaded config, for the `doctor` report.
+pub fn status(location: &Location, loaded: Result<Config>) -> Status {
     let Some(path) = &location.path else {
         return Status::Defaults { path: None };
     };
 
-    match load(location) {
+    match loaded {
         Ok(_) if path.exists() => Status::Loaded { path: path.clone() },
         Ok(_) => Status::Defaults {
             path: Some(path.clone()),
@@ -613,16 +604,18 @@ mod tests {
     #[test]
     fn status_distinguishes_defaults_loaded_and_invalid() {
         let (_dir, missing) = temp_path("missing.toml");
-        let defaults = status(&Location {
+        let location = Location {
             path: Some(missing.clone()),
             explicit: false,
-        });
+        };
+        let defaults = status(&location, load(&location));
         assert!(matches!(defaults, Status::Defaults { .. }));
 
-        let explicit_missing = status(&Location {
+        let location = Location {
             path: Some(missing),
             explicit: true,
-        });
+        };
+        let explicit_missing = status(&location, load(&location));
         match explicit_missing {
             Status::Invalid { message, .. } => {
                 assert!(message.contains("not found"), "message was: {message}");
@@ -633,18 +626,20 @@ mod tests {
 
         let (_dir, path) = temp_path("config.toml");
         fs::write(&path, "[general]\ncolor = \"never\"\n").expect("write config");
-        let loaded = status(&Location {
+        let location = Location {
             path: Some(path.clone()),
             explicit: true,
-        });
+        };
+        let loaded = status(&location, load(&location));
         assert_eq!(loaded, Status::Loaded { path });
 
         let (_dir, broken) = temp_path("config.toml");
         fs::write(&broken, "= broken").expect("write config");
-        let invalid = status(&Location {
+        let location = Location {
             path: Some(broken.clone()),
             explicit: true,
-        });
+        };
+        let invalid = status(&location, load(&location));
         match invalid {
             Status::Invalid { path, message } => {
                 assert_eq!(path, broken);

@@ -124,9 +124,11 @@ impl Action {
     }
 
     /// The prompt this action opens, if it needs input.
+    ///
+    /// [`Action::Add`] is not here: `enter_add` opens the same prompt and
+    /// prefills it from the query, the highlighted home row, or the cwd.
     pub fn prompt(self) -> Option<PromptKind> {
         match self {
-            Action::Add => Some(PromptKind::Add),
             Action::Rename => Some(PromptKind::Rename),
             Action::AliasAdd => Some(PromptKind::AliasAdd),
             Action::AliasRemove => Some(PromptKind::AliasRemove),
@@ -218,7 +220,11 @@ mod tests {
 
     #[test]
     fn prompts_and_sorts_are_wired() {
-        assert_eq!(Action::Add.prompt(), Some(PromptKind::Add));
+        assert_eq!(
+            Action::Add.prompt(),
+            None,
+            "add opens through `enter_add` so it prefills"
+        );
         assert_eq!(Action::Rename.prompt(), Some(PromptKind::Rename));
         assert_eq!(Action::Jump.prompt(), None);
         assert_eq!(Action::SortName.sort(), Some(SortBy::Name));

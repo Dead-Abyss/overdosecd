@@ -14,7 +14,11 @@ use crate::store::sqlite::SqliteStore;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Issue {
     /// The project's directory no longer exists.
-    StalePath { name: String, path: PathBuf },
+    StalePath {
+        id: String,
+        name: String,
+        path: PathBuf,
+    },
 
     /// Two or more projects share a name (case-insensitively).
     DuplicateName { name: String, count: usize },
@@ -37,15 +41,11 @@ pub enum Issue {
     /// The index file that is not the active backend cannot be read.
     InactiveIndexUnreadable { path: PathBuf, message: String },
 
-    /// The index file has no write permission.
-    IndexNotWritable(PathBuf),
-
-    /// The index file mode is wider than `0600` (Unix only).
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// The index file mode is wider than `0600`; `0600` includes the owner
+    /// write bit, so a read-only file lands here too.
     IndexPermissions { path: PathBuf, mode: u32 },
 
-    /// The home-discovery cache mode is wider than `0600` (Unix only).
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// The home-discovery cache mode is wider than `0600`.
     CachePermissions { path: PathBuf, mode: u32 },
 
     /// An indexed name, alias, tag, or path contains control characters a
@@ -59,8 +59,7 @@ pub enum Issue {
     /// The data directory has no write permission.
     DataDirNotWritable(PathBuf),
 
-    /// The data directory mode is wider than `0700` (Unix only).
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// The data directory mode is wider than `0700`.
     DataDirPermissions { path: PathBuf, mode: u32 },
 
     /// The config file exists but could not be read or parsed.
@@ -94,6 +93,7 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
     for project in projects {
         if !project.path.exists() {
             issues.push(Issue::StalePath {
+                id: project.id.clone(),
                 name: project.name.clone(),
                 path: project.path.clone(),
             });
@@ -149,13 +149,10 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
 
     let json_path = paths::store_file(data_dir);
     let db_path = paths::sqlite_file(data_dir);
+    let index_path = paths::index_file(data_dir, backend);
 
     // A link where a store file belongs can point into a directory someone
     // else controls; every open refuses it, and this is where it is reported.
-    let active = match backend {
-        StorageBackend::Json => json_path.clone(),
-        StorageBackend::Sqlite => db_path.clone(),
-    };
     for path in [
         json_path.clone(),
         db_path.clone(),
@@ -165,7 +162,7 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
     ] {
         // The active index is refused by the store already and reported by
         // `cmd_doctor`'s load arm; listing it here too would double it.
-        if path == active {
+        if path == index_path {
             continue;
         }
         if let Ok(metadata) = fs::symlink_metadata(&path)
@@ -174,10 +171,6 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
             issues.push(Issue::SymlinkedFile(path));
         }
     }
-    let index_path = match backend {
-        StorageBackend::Json => json_path.clone(),
-        StorageBackend::Sqlite => db_path.clone(),
-    };
 
     // `store::json` quarantines corrupt indexes as `<file>.corrupt-<stamp>`;
     // only the JSON backend ever creates those, whichever backend is active.
@@ -250,49 +243,37 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
     }
 
     if let Ok(metadata) = fs::metadata(&index_path) {
-        if metadata.permissions().readonly() {
-            issues.push(Issue::IndexNotWritable(index_path.clone()));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode != 0o600 {
-                issues.push(Issue::IndexPermissions {
-                    path: index_path,
-                    mode,
-                });
-            }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            issues.push(Issue::IndexPermissions {
+                path: index_path,
+                mode,
+            });
         }
     }
     if let Ok(metadata) = fs::metadata(data_dir) {
         if metadata.permissions().readonly() {
             issues.push(Issue::DataDirNotWritable(data_dir.to_path_buf()));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                issues.push(Issue::DataDirPermissions {
-                    path: data_dir.to_path_buf(),
-                    mode,
-                });
-            }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            issues.push(Issue::DataDirPermissions {
+                path: data_dir.to_path_buf(),
+                mode,
+            });
         }
     }
     let cache_path = crate::discovery::cache_path(data_dir);
     if let Ok(metadata) = fs::metadata(&cache_path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode != 0o600 {
-                issues.push(Issue::CachePermissions {
-                    path: cache_path,
-                    mode,
-                });
-            }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            issues.push(Issue::CachePermissions {
+                path: cache_path,
+                mode,
+            });
         }
     }
 
@@ -453,16 +434,7 @@ pub(crate) fn validate_target(
     raw: &str,
     home: Option<&Path>,
 ) -> Result<PathBuf> {
-    let expanded = project::expand_tilde_with(raw, home);
-    if !expanded.exists() {
-        return Err(Error::MissingDirectory(expanded));
-    }
-    if !expanded.is_dir() {
-        return Err(Error::NotADirectory(expanded));
-    }
-
-    let canonical = project::normalize(&expanded)?;
-    project::reject_control_chars_path(&canonical)?;
+    let canonical = project::require_dir(Path::new(raw), home)?;
     if projects
         .iter()
         .any(|project| project.id != id && project.path == canonical)
@@ -586,14 +558,16 @@ mod tests {
         write_index(&index);
         let missing = dir.path().join("gone");
 
+        let sample = project("gone", &missing);
         let report = inspect(
             dir.path(),
             StorageBackend::Json,
-            &[project("gone", &missing)],
+            std::slice::from_ref(&sample),
         );
         assert_eq!(
             report.issues,
             vec![Issue::StalePath {
+                id: sample.id.clone(),
                 name: "gone".to_owned(),
                 path: missing,
             }]
@@ -660,7 +634,14 @@ mod tests {
 
         fs::set_permissions(&index, fs::Permissions::from_mode(0o400)).expect("chmod 0400");
         let report = inspect(dir.path(), StorageBackend::Json, &[]);
-        assert!(report.issues.contains(&Issue::IndexNotWritable(index)));
+        assert_eq!(
+            report.issues,
+            vec![Issue::IndexPermissions {
+                path: index,
+                mode: 0o400,
+            }],
+            "a read-only file is also a wrong-mode file"
+        );
     }
 
     #[cfg(unix)]

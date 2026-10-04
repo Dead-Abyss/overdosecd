@@ -9,7 +9,6 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -53,16 +52,6 @@ pub struct Options {
     pub max_entries: usize,
     /// Extra directory names to skip, on top of [`DEFAULT_SKIP`].
     pub skip: Vec<String>,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            max_depth: 8,
-            max_entries: 50_000,
-            skip: Vec::new(),
-        }
-    }
 }
 
 /// One directory the walk found.
@@ -265,26 +254,7 @@ pub fn cache_path(data_dir: &Path) -> PathBuf {
 /// Reads the cache, or `None` when it is missing or unreadable: a cache is
 /// always rebuildable, so a broken one is never an error and never quarantined.
 pub fn load_cache(path: &Path) -> Option<Cache> {
-    // A planted symlink is not a cache to trust; treat it as missing and let
-    // the caller rescan (the cache is rebuildable by design).
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    if metadata.len() > MAX_CACHE_BYTES {
-        return None;
-    }
-    let mut raw = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(MAX_CACHE_BYTES + 1)
-        .read_to_end(&mut raw)
-        .ok()?;
-    if raw.len() as u64 > MAX_CACHE_BYTES {
-        return None;
-    }
-    let raw = String::from_utf8(raw).ok()?;
-    let mut cache: Cache = serde_json::from_str(&raw).ok()?;
+    let mut cache: Cache = crate::paths::read_rebuildable_json(path, MAX_CACHE_BYTES)?;
     if cache.version != CACHE_VERSION {
         return None;
     }
@@ -320,6 +290,15 @@ mod tests {
         dirs.iter().map(|dir| dir.name.clone()).collect()
     }
 
+    /// The walk options production builds from `[discovery]` defaults.
+    fn options(max_depth: u16) -> Options {
+        Options {
+            max_depth,
+            max_entries: 50_000,
+            skip: Vec::new(),
+        }
+    }
+
     fn fixture() -> tempfile::TempDir {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
@@ -336,10 +315,7 @@ mod tests {
     fn scan_is_bounded_skips_and_marks_projects() {
         let temp = fixture();
         let root = temp.path();
-        let options = Options {
-            max_depth: 4,
-            ..Options::default()
-        };
+        let options = options(4);
         let dirs = scan(root, &options);
         let found = names(&dirs);
 
@@ -402,13 +378,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(root, root.join("loop/self")).expect("symlink");
 
-        let dirs = scan(
-            root,
-            &Options {
-                max_depth: 6,
-                ..Options::default()
-            },
-        );
+        let dirs = scan(root, &options(6));
         assert!(
             !dirs.iter().any(|dir| dir.path.ends_with("loop/self")),
             "a symlinked directory must not be entered"
@@ -432,13 +402,7 @@ mod tests {
     #[test]
     fn rank_prefers_projects_and_shallow_paths() {
         let temp = fixture();
-        let dirs = scan(
-            temp.path(),
-            &Options {
-                max_depth: 4,
-                ..Options::default()
-            },
-        );
+        let dirs = scan(temp.path(), &options(4));
 
         let matches = rank("alph", &dirs, 10);
         assert_eq!(matches[0].name, "alpha");
@@ -462,13 +426,7 @@ mod tests {
         let path = cache_path(temp.path());
         assert_eq!(path.file_name().unwrap(), "home-dirs.json");
 
-        let dirs = scan(
-            temp.path(),
-            &Options {
-                max_depth: 2,
-                ..Options::default()
-            },
-        );
+        let dirs = scan(temp.path(), &options(2));
         let cache = Cache::new(dirs.clone(), Utc::now());
         save_cache(&path, &cache).expect("save");
         let loaded = load_cache(&path).expect("load");
@@ -517,7 +475,7 @@ mod tests {
         let root = temp.path();
         fs::create_dir(root.join("ok")).expect("create ok");
         fs::create_dir(root.join("bad\u{1b}name")).expect("create bad");
-        let dirs = scan(root, &Options::default());
+        let dirs = scan(root, &options(8));
         let names: Vec<&str> = dirs.iter().map(|dir| dir.name.as_str()).collect();
         assert!(names.contains(&"ok"), "{names:?}");
         assert!(
@@ -594,7 +552,7 @@ mod tests {
 
     #[test]
     fn scanning_a_missing_root_is_empty() {
-        let dirs = scan(Path::new("/definitely/not/there"), &Options::default());
+        let dirs = scan(Path::new("/definitely/not/there"), &options(8));
         assert!(dirs.is_empty());
     }
 
@@ -605,7 +563,7 @@ mod tests {
         let Some(home) = home_dir() else {
             return;
         };
-        let options = Options::default();
+        let options = options(8);
         let start = std::time::Instant::now();
         let dirs = scan(&home, &options);
         let elapsed = start.elapsed();

@@ -17,7 +17,7 @@ use crate::matcher;
 use crate::output;
 
 use super::actions::HELP;
-use super::picker::{Mode, Picker};
+use super::picker::{Mode, Picker, sort_label};
 
 /// Rows the detail pane takes from the list when it is open.
 const DETAIL_ROWS: u16 = 4;
@@ -42,7 +42,7 @@ pub fn draw(
     };
 
     // The detail pane only makes sense over the project list.
-    let details = picker.details() && matches!(picker.mode(), Mode::Search | Mode::Nav);
+    let details = picker.details_visible();
     // The box keeps its height: the pane takes rows from the list.
     let detail_rows = if details {
         DETAIL_ROWS.min(inner.height.saturating_sub(3))
@@ -149,14 +149,14 @@ fn project_row(
     let marked = picker.marks().contains(&project.id);
 
     let state = if project.pinned {
-        Span::styled("* ", palette.pinned())
+        Span::styled("* ", palette.fg(Color::Yellow))
     } else if missing {
-        Span::styled("! ", palette.stale())
+        Span::styled("! ", palette.fg(Color::Red))
     } else {
         Span::styled("  ", palette.dim())
     };
     let mark = if marked {
-        Span::styled("▌ ", palette.mark())
+        Span::styled("▌ ", palette.fg(Color::Cyan))
     } else {
         Span::raw("  ")
     };
@@ -175,7 +175,7 @@ fn project_row(
     spans.push(Span::styled(
         detail,
         if missing {
-            palette.stale()
+            palette.fg(Color::Red)
         } else {
             palette.dim()
         },
@@ -206,7 +206,7 @@ fn home_row(
     };
 
     let indices = matcher::highlight_indices(picker.query(), &found.name);
-    let mut spans = vec![Span::styled("~ ", palette.home())];
+    let mut spans = vec![Span::styled("~ ", palette.fg(Color::Blue))];
     spans.extend(highlighted(&found.name, &indices, palette.accent()));
     spans.push(Span::styled(
         format!("  {}  ·  home", output::shorten_home(&found.path, home)),
@@ -297,7 +297,7 @@ fn draw_health(frame: &mut Frame, area: Rect, picker: &mut Picker, palette: &Pal
                 Span::styled(
                     marker.to_owned(),
                     if row.stale.is_some() {
-                        palette.stale()
+                        palette.fg(Color::Red)
                     } else {
                         palette.dim()
                     },
@@ -422,12 +422,7 @@ fn draw_input(frame: &mut Frame, area: Rect, picker: &Picker, palette: &Palette)
         format!("{position}/{count}")
     } else {
         // The active sort is worth showing once it is not the default.
-        let sort = match picker.sort() {
-            crate::cli::SortBy::Name => "name",
-            crate::cli::SortBy::Created => "created",
-            crate::cli::SortBy::Used => "used",
-        };
-        format!("{sort} · {position}/{count}")
+        format!("{} · {position}/{count}", sort_label(picker.sort()))
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(count, palette.dim()))).alignment(Alignment::Right),
@@ -450,7 +445,7 @@ fn draw_status(frame: &mut Frame, area: Rect, picker: &Picker, palette: &Palette
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 crate::sanitize::text(&confirm.message),
-                palette.warn(),
+                palette.fg(Color::Yellow),
             ))),
             area,
         );
@@ -461,9 +456,9 @@ fn draw_status(frame: &mut Frame, area: Rect, picker: &Picker, palette: &Palette
         Some(status) => Line::from(Span::styled(
             crate::sanitize::text(&status.text),
             if status.error {
-                palette.error()
+                palette.fg(Color::Red)
             } else {
-                palette.ok()
+                palette.fg(Color::Green)
             },
         )),
         None => Line::from(Span::styled(hint(picker.mode()), palette.dim())),
@@ -561,52 +556,9 @@ impl Palette {
         }
     }
 
-    fn pinned(&self) -> Style {
-        Style::new().fg(if self.color {
-            Color::Yellow
-        } else {
-            Color::Reset
-        })
-    }
-
-    fn mark(&self) -> Style {
-        Style::new().fg(if self.color {
-            Color::Cyan
-        } else {
-            Color::Reset
-        })
-    }
-
-    fn home(&self) -> Style {
-        Style::new().fg(if self.color {
-            Color::Blue
-        } else {
-            Color::Reset
-        })
-    }
-
-    fn stale(&self) -> Style {
-        Style::new().fg(if self.color { Color::Red } else { Color::Reset })
-    }
-
-    fn warn(&self) -> Style {
-        Style::new().fg(if self.color {
-            Color::Yellow
-        } else {
-            Color::Reset
-        })
-    }
-
-    fn error(&self) -> Style {
-        Style::new().fg(if self.color { Color::Red } else { Color::Reset })
-    }
-
-    fn ok(&self) -> Style {
-        Style::new().fg(if self.color {
-            Color::Green
-        } else {
-            Color::Reset
-        })
+    /// A plain foreground color; colorless output resets it.
+    fn fg(&self, color: Color) -> Style {
+        Style::new().fg(if self.color { color } else { Color::Reset })
     }
 }
 

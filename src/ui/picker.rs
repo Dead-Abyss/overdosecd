@@ -25,6 +25,9 @@ use super::actions::{self, Action, PromptKind};
 /// Rows the wheel moves per notch.
 const MOUSE_SCROLL_STEP: isize = 3;
 
+/// How many home-directory rows the picker offers per query.
+const HOME_RESULT_LIMIT: usize = 20;
+
 /// What the picker asks the event loop to execute against the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunAction {
@@ -177,7 +180,6 @@ pub struct Picker {
     home_enabled: bool,
     /// Show home matches even when the index has matches.
     force_home: bool,
-    home_limit: usize,
     issues: Vec<IssueRow>,
     health_selected: usize,
     /// Cached `!path.exists()` per project, filled on demand.
@@ -218,7 +220,6 @@ impl Picker {
             home_loaded: false,
             home_enabled: true,
             force_home: false,
-            home_limit: 20,
             issues: Vec::new(),
             health_selected: 0,
             missing: Vec::new(),
@@ -269,10 +270,6 @@ impl Picker {
 
     pub fn status(&self) -> Option<&Status> {
         self.status.as_ref()
-    }
-
-    pub fn details(&self) -> bool {
-        self.details
     }
 
     pub fn details_info(&self) -> Option<&DetailsInfo> {
@@ -356,10 +353,6 @@ impl Picker {
         }
     }
 
-    pub fn set_home_limit(&mut self, limit: usize) {
-        self.home_limit = limit.max(1);
-    }
-
     /// Whether the project at display position `position` is missing.
     pub fn is_missing(&self, position: usize) -> bool {
         self.entries
@@ -402,10 +395,15 @@ impl Picker {
         self.set_mode(Mode::Health);
     }
 
+    /// Whether the detail pane can be drawn in the current mode.
+    pub fn details_visible(&self) -> bool {
+        self.details && matches!(self.mode, Mode::Search | Mode::Nav)
+    }
+
     /// The project whose detail info must be fetched next, when the pane is
     /// open and the highlighted project changed.
     pub fn details_request(&self) -> Option<String> {
-        if !self.details || self.mode == Mode::Palette || self.mode == Mode::Help {
+        if !self.details_visible() {
             return None;
         }
         let project = self.selected_project()?;
@@ -456,7 +454,7 @@ impl Picker {
             && !query.is_empty()
             && (self.entries.is_empty() || self.force_home)
         {
-            discovery::rank(&query, &self.home_dirs, self.home_limit)
+            discovery::rank(&query, &self.home_dirs, HOME_RESULT_LIMIT)
                 .into_iter()
                 .filter(|found| {
                     !self
@@ -575,7 +573,7 @@ impl Picker {
                 }
                 Outcome::Continue
             }
-            Mode::Health => self.handle_health(key, ctrl),
+            Mode::Health => self.handle_health(key),
         }
     }
 
@@ -724,7 +722,7 @@ impl Picker {
                 self.prompt.input.push(ch);
                 Outcome::Continue
             }
-            KeyCode::Backspace | KeyCode::Delete => {
+            KeyCode::Backspace => {
                 self.prompt.input.pop();
                 Outcome::Continue
             }
@@ -753,8 +751,6 @@ impl Picker {
             },
             KeyCode::Char('j') | KeyCode::Down => self.move_palette(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_palette(-1),
-            KeyCode::PageDown => self.move_palette(self.page()),
-            KeyCode::PageUp => self.move_palette(-self.page()),
             KeyCode::Char(ch) if !ctrl => {
                 self.palette.query.push(ch);
                 self.palette.selected = 0;
@@ -769,21 +765,12 @@ impl Picker {
         }
     }
 
-    fn handle_health(&mut self, key: KeyEvent, ctrl: bool) -> Outcome {
+    fn handle_health(&mut self, key: KeyEvent) -> Outcome {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_health(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_health(-1),
-            KeyCode::Char('g') | KeyCode::Home => {
-                self.health_selected = 0;
-                Outcome::Continue
-            }
-            KeyCode::Char('G') | KeyCode::End => {
-                self.health_selected = self.issues.len().saturating_sub(1);
-                Outcome::Continue
-            }
             KeyCode::Char('r') => Outcome::Run(RunAction::Health),
-            KeyCode::Char('x') if !ctrl => self.ask_remove_stale(),
-            KeyCode::Char('x') if ctrl => self.ask_remove_stale(),
+            KeyCode::Char('x') => self.ask_remove_stale(),
             KeyCode::Enter => self.open_prompt(PromptKind::Repath),
             KeyCode::Esc => {
                 self.set_mode(Mode::Search);
@@ -795,6 +782,12 @@ impl Picker {
 
     /// Runs a palette action.
     fn run_action(&mut self, action: Action) -> Outcome {
+        // The palette's add entry and `^a` must open the same prefilled
+        // prompt; `enter_add` owns the prefill rule.
+        if action == Action::Add {
+            self.enter_add();
+            return Outcome::Continue;
+        }
         if let Some(prompt) = action.prompt() {
             return self.open_prompt(prompt);
         }
@@ -802,7 +795,8 @@ impl Picker {
             Action::Jump => self.jump(),
             Action::Pin => self.ask_pin(),
             Action::Remove => self.ask_remove(),
-            // Prompts were handled above; the match still has to name them.
+            // Add and the prompts were handled above; the match still has to
+            // name them.
             Action::Add
             | Action::Rename
             | Action::AliasAdd
@@ -1085,7 +1079,7 @@ impl Picker {
         Outcome::Continue
     }
 
-    fn name_of(&self, id: &str) -> String {
+    pub(crate) fn name_of(&self, id: &str) -> String {
         self.projects
             .iter()
             .find(|project| project.id == id)
@@ -1174,7 +1168,8 @@ impl Picker {
     }
 }
 
-fn sort_label(sort: SortBy) -> &'static str {
+/// The human label for a sort order; also the picker status's wording.
+pub(super) fn sort_label(sort: SortBy) -> &'static str {
     match sort {
         SortBy::Used => "last used",
         SortBy::Name => "name",
@@ -1372,6 +1367,16 @@ mod tests {
     }
 
     #[test]
+    fn palette_add_prefills_like_the_ctrl_chord() {
+        let mut picker = fixture(&["alpha"]);
+        picker.set_query("over".into());
+        assert_eq!(run_palette(&mut picker, "add"), Outcome::Continue);
+        assert_eq!(picker.mode(), Mode::Prompt);
+        assert_eq!(picker.prompt().kind, PromptKind::Add);
+        assert_eq!(picker.prompt().input, "over", "prefilled with the query");
+    }
+
+    #[test]
     fn prompts_submit_run_actions() {
         // Rename: prefilled with the current name, edited before submitting.
         let mut picker = fixture(&["alpha"]);
@@ -1538,9 +1543,9 @@ mod tests {
         assert!(picker.status().expect("status").text.contains("name"));
 
         assert_eq!(run_palette(&mut picker, "details"), Outcome::Continue);
-        assert!(picker.details());
+        assert!(picker.details_visible());
         assert_eq!(run_palette(&mut picker, "details"), Outcome::Continue);
-        assert!(!picker.details());
+        assert!(!picker.details_visible());
 
         assert_eq!(run_palette(&mut picker, "quit"), Outcome::Cancel);
 

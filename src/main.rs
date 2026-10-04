@@ -103,9 +103,13 @@ fn run(cli: Cli) -> Result<i32> {
         });
 
     match cli.command {
-        Command::Doctor(args) => {
-            cmd_doctor(&store, &data_dir, backend, args, config::status(&location))
-        }
+        Command::Doctor(args) => cmd_doctor(
+            &store,
+            &data_dir,
+            backend,
+            args,
+            config::status(&location, config),
+        ),
         // Completion runs on every TAB press and uses no matcher knobs, so it
         // deliberately does not fail on a broken config.
         Command::Complete { prefix } => cmd_complete(&store, &prefix).map(|()| 0),
@@ -865,10 +869,7 @@ fn cmd_doctor(
     args: DoctorArgs,
     config_status: config::Status,
 ) -> Result<i32> {
-    let index_path = match backend {
-        StorageBackend::Json => paths::store_file(data_dir),
-        StorageBackend::Sqlite => paths::sqlite_file(data_dir),
-    };
+    let index_path = paths::index_file(data_dir, backend);
 
     if args.refresh {
         let (total, changed) = store.update(|projects| {

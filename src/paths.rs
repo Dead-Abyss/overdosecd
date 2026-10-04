@@ -1,5 +1,7 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::config::StorageBackend;
 use crate::error::{Error, Result};
 
 /// Environment override for the data directory, used by tests and power users.
@@ -15,28 +17,20 @@ const ENV_DATA_DIR: &str = "OVERDOSECD_DATA_DIR";
 /// used to create the index in the current directory).
 pub fn resolve_data_dir(cli_override: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = cli_override {
-        return absolute(kind_for_flag(), dir);
+        return absolute("--data-dir", dir);
     }
 
-    if let Some(value) = std::env::var_os(ENV_DATA_DIR)
-        && !value.is_empty()
-    {
-        return absolute(kind_for_env(), Path::new(&value));
+    if let Some(value) = crate::dirs::os_env(ENV_DATA_DIR) {
+        return absolute(
+            "the data directory from $OVERDOSECD_DATA_DIR",
+            Path::new(&value),
+        );
     }
 
     let platform = crate::dirs::data_dir().ok_or_else(|| {
         Error::Storage("could not determine a data directory for overdosecd".into())
     })?;
     absolute("the platform data directory", &platform)
-}
-
-/// The flag and variable names, used in the "must be absolute" error.
-const fn kind_for_flag() -> &'static str {
-    "--data-dir"
-}
-
-const fn kind_for_env() -> &'static str {
-    "the data directory from $OVERDOSECD_DATA_DIR"
 }
 
 /// Requires an absolute path, naming where it came from in the error.
@@ -85,6 +79,33 @@ pub fn sibling_backup(path: &Path, tag: &str) -> PathBuf {
     candidate
 }
 
+/// Reads a rebuildable JSON file through the hostile-file gate: a small
+/// regular file, not a symlink, the size cap enforced by the read itself,
+/// valid UTF-8 and JSON. `None` on any failure: the caller rebuilds.
+pub fn read_rebuildable_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    max_bytes: u64,
+) -> Option<T> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    if metadata.len() > max_bytes {
+        return None;
+    }
+    let mut raw = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(max_bytes + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() as u64 > max_bytes {
+        return None;
+    }
+    let raw = String::from_utf8(raw).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 /// Creates `path` and any missing parents, private (`0700`) on Unix.
 ///
 /// The data directory holds indexed paths, jump history, and the
@@ -93,18 +114,11 @@ pub fn sibling_backup(path: &Path, tag: &str) -> PathBuf {
 /// other local users enumerate it or plant the predictable temp and lock
 /// names.
 pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        builder.mode(0o700);
-        builder.create(path)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path)
-    }
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder.create(path)
 }
 
 pub fn store_file(data_dir: &Path) -> PathBuf {
@@ -113,6 +127,14 @@ pub fn store_file(data_dir: &Path) -> PathBuf {
 
 pub fn sqlite_file(data_dir: &Path) -> PathBuf {
     data_dir.join("projects.db")
+}
+
+/// The file the active backend reads and writes.
+pub fn index_file(data_dir: &Path, backend: StorageBackend) -> PathBuf {
+    match backend {
+        StorageBackend::Json => store_file(data_dir),
+        StorageBackend::Sqlite => sqlite_file(data_dir),
+    }
 }
 
 #[cfg(test)]

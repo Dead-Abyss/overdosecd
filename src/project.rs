@@ -83,10 +83,7 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The user's home directory, if one can be determined.
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(crate::dirs::home_dir)
+    crate::dirs::home_dir()
 }
 
 /// Expands a leading `~` or `~/` using the current home directory.

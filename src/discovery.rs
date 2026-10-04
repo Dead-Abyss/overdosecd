@@ -9,7 +9,6 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -265,26 +264,7 @@ pub fn cache_path(data_dir: &Path) -> PathBuf {
 /// Reads the cache, or `None` when it is missing or unreadable: a cache is
 /// always rebuildable, so a broken one is never an error and never quarantined.
 pub fn load_cache(path: &Path) -> Option<Cache> {
-    // A planted symlink is not a cache to trust; treat it as missing and let
-    // the caller rescan (the cache is rebuildable by design).
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    if metadata.len() > MAX_CACHE_BYTES {
-        return None;
-    }
-    let mut raw = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(MAX_CACHE_BYTES + 1)
-        .read_to_end(&mut raw)
-        .ok()?;
-    if raw.len() as u64 > MAX_CACHE_BYTES {
-        return None;
-    }
-    let raw = String::from_utf8(raw).ok()?;
-    let mut cache: Cache = serde_json::from_str(&raw).ok()?;
+    let mut cache: Cache = crate::paths::read_rebuildable_json(path, MAX_CACHE_BYTES)?;
     if cache.version != CACHE_VERSION {
         return None;
     }

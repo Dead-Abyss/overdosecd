@@ -8,8 +8,7 @@ use crate::config::ColorMode;
 #[command(
     name = "overdosecd",
     version,
-    about = "A smart directory and project jumper for the terminal",
-    long_about = None
+    about = "A smart directory and project jumper for the terminal"
 )]
 pub struct Cli {
     /// Override the data directory (default: $OVERDOSECD_DATA_DIR or the platform data dir)

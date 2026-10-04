@@ -55,7 +55,7 @@ stdout or stderr can carry a terminal escape from any stored or live value.
 
 ## Roadmap
 
-Order: v0.2.0 → v0.3.0 → v0.4.0.
+Order: v0.2.0 → v0.3.0 → v0.4.0 → v0.5.0.
 The next milestone carries a full task list and definition of done; later ones
 are sketches that get detailed when they become next.
 
@@ -69,28 +69,15 @@ recorded failure), the `Picker` state machine (wide, not deep), `AnyStore`
 the three import parsers, and the hand-rolled `git.rs` (v0.2.0 extends it; it
 is never replaced by `git2`/`gix`/subprocess).
 
-### v0.2.0 — Git health & project typing
+### v0.2.0 — Config debt & project typing
 
-Goal: see the state of a project before jumping into it.
+Goal: make the git reads honest about real-world configs, and say what kind of
+project an entry is.
 
-`git::status()` is built in three layers of cost, each with budgets, over the
-hand-rolled reader:
-
-- **Free layer** — plain text: mid-operation (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
-  `REVERT_HEAD`, bisect, rebase), unmerged index stages (conflicts), stash
-  count, upstream configured.
-- **Stat layer** — an index v2/v3 parser plus one `stat()` per entry with early
-  exit on the first mismatch: `dirty`, git's own racy heuristic.
-- **Object layer** — `flate2` (miniz backend), loose objects, packed-idx v2,
-  pack v2 with bounded delta chains, a capped walk (200, rendered `200+`), and
-  a visited-set guard: ahead/behind.
-
-Fail-closed: an unreadable or hostile index/object store never reports "clean" —
-it reports nothing. Every new parser gets caps, bounds checks, and proptests,
-and every rendered string rides `sanitize` + `output::print*`. Documented
-non-goals: untracked files (`.gitignore` matching is a project of its own),
-staged-vs-HEAD counts (tree diffing), and index v4/split-index (reported as
-`unknown`).
+Deferred on 2026-10-04 to v0.5.0: the `git::status()` reader and its UI. The
+object layer (flate2, packfile, delta chains) is the riskiest parser work on
+this roadmap; the config debt and project typing are orthogonal to it and ship
+first.
 
 Tasks:
 
@@ -111,31 +98,23 @@ Tasks:
   stored — never stat'd per query. `info` gains `type:`, `list --type <t>`
   filters, picker rows carry a badge, and `doctor --refresh` re-detects. Kind
   is display and filter, never a matcher signal.
-- [ ] 4. **Git status reader** — the three layers above in `git.rs`, with the
-  fail-closed rule, per-parse caps, fixtures, proptests, and an `#[ignore]`d
-  accuracy check against real `git status` on generated repositories.
-- [ ] 5. **Status UI** — status in `info` and the picker detail pane (single
-  project, always); `list --status` behind a flag plus `[general] status =
-  false` (off by default; flag > env > config > default). `remote_name` is now
-  read so the upstream renders as `origin/main`. A pty-smoke scenario for the
-  detail pane; `--status` bench numbers recorded.
-- [ ] 6. **Release** — CHANGELOG section, README reference, AGENTS.md facts
-  (status semantics, per-layer budgets, schema-v2 rule), tick this milestone,
-  delete limitation #2's row, bump `Cargo.toml`, tag → publish + GitHub
-  release.
+- [ ] 4. **Release** — CHANGELOG section, README reference, AGENTS.md facts
+  (include semantics and budgets, the schema-v2 rule, the kind rule), tick this
+  milestone, delete limitation #2's row, bump `Cargo.toml`, tag → publish +
+  GitHub release.
 
 Definition of done:
 
-- Every field `status()` reports is true or absent; no hostile input can make it
-  report "clean".
+- `include`/`includeIf`/`insteadOf`/bare detection run under the stated budgets,
+  refuse non-regular files, and no hostile repository escapes a cap or reaches
+  a terminal unsanitized; limitation #2 is gone.
 - Schema v1→2 is non-destructive, keeps a backup, runs only on writable open,
-  and `doctor` reports both sides.
-- `list`, `goto`, and `complete` hold the recorded floors at 1k/10k/100k; plain
-  `list` does no status read.
-- Ranking and `--debug` output stay bit-identical — `kind` and `status` never
-  reach the matcher.
-- `cargo deny` is clean with `flate2`; the pty smoke harness covers the detail
-  pane; all new parsers are proptested.
+  `load_readonly` reports the old version instead of migrating, and `doctor`
+  reports it.
+- `kind` is detected once at `add` and never on the query path; ranking and
+  `--debug` output stay bit-identical — kind is display and filter only.
+- `list`, `goto`, and `complete` hold the recorded floors at 1k/10k/100k.
+- No new runtime dependency; every new parser is proptested.
 
 ### v0.3.0 — Notes, entry hooks & single backend
 
@@ -170,6 +149,56 @@ Goal: land in the right session and the right worktree.
   name (`--tmux` vs the reserved subcommand namespace); how `:` queries
   negotiate with name matching.
 
+### v0.5.0 — Git status & health UI
+
+Goal: see the state of a project before jumping into it. (Deferred from v0.2.0
+on 2026-10-04; gets full build-ready detail when it becomes next.)
+
+`git::status()` is built in three layers of cost, each with budgets, over the
+hand-rolled reader:
+
+- **Free layer** — plain text: mid-operation (`MERGE_HEAD`, `CHERRY_PICK_HEAD`,
+  `REVERT_HEAD`, bisect, rebase), unmerged index stages (conflicts), stash
+  count, upstream configured.
+- **Stat layer** — an index v2/v3 parser plus one `stat()` per entry with early
+  exit on the first mismatch: `dirty`, git's own racy heuristic.
+- **Object layer** — `flate2` (backend choice recorded when this milestone
+  turns next; expected `rust_backend` so `cargo deny`, the MSRV job, and source
+  installs stay clean), loose objects, packed-idx v2, pack v2 with bounded
+  delta chains, a capped walk (200, rendered `200+`), and a visited-set guard:
+  ahead/behind.
+
+Fail-closed: an unreadable or hostile index/object store never reports "clean" —
+it reports nothing. Every new parser gets caps, bounds checks, and proptests,
+and every rendered string rides `sanitize` + `output::print*`. Documented
+non-goals: untracked files (`.gitignore` matching is a project of its own),
+staged-vs-HEAD counts (tree diffing), and index v4/split-index (reported as
+`unknown`).
+
+Tasks (sketch):
+
+- [ ] Status reader — the three layers in `git.rs`, fail-closed, per-parse
+  caps, fixtures, proptests, and an `#[ignore]`d accuracy check against real
+  `git status` on generated repositories.
+- [ ] Status UI — status in `info` and the picker detail pane (single project,
+  always); `list --status` behind a flag plus `[general] status = false` (off
+  by default; flag > env > config > default). `remote_name` is read so the
+  upstream renders as `origin/main`. A pty-smoke scenario for the detail pane;
+  `--status` bench numbers recorded.
+- [ ] Release — CHANGELOG, README, AGENTS.md facts (status semantics,
+  per-layer budgets), tick, bump, tag.
+
+Definition of done:
+
+- Every field `status()` reports is true or absent; no hostile input can make
+  it report "clean".
+- Plain `list` does no status read; `list`, `goto`, and `complete` hold the
+  recorded floors at 1k/10k/100k; `--status` numbers recorded.
+- Ranking and `--debug` output stay bit-identical — status never reaches the
+  matcher.
+- `cargo deny` is clean with `flate2`; the pty smoke harness covers the detail
+  pane; all new parsers are proptested.
+
 ### Backlog (unscheduled)
 
 - Multi-machine sync through a plain file (git or a synced folder): only if a
@@ -187,6 +216,10 @@ Goal: land in the right session and the right worktree.
 - The JSON backend retires in v0.3.0, with a one-shot auto-migrate and a kept
   backup.
 - The multiplexer target is tmux only.
+- The git status reader and its UI ship as v0.5.0, not v0.2.0 (2026-10-04
+  re-scope): the object layer — `flate2`, packfile, delta chains — is the
+  roadmap's riskiest parser work and would hold the orthogonal config-debt and
+  typing wins hostage.
 - Linux is the only supported platform (0.1.0): the crate refuses to build
   elsewhere, and no pre-built binaries are published — crates.io source
   installs are the delivery path.

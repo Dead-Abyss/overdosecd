@@ -9,7 +9,15 @@ and [README.md](README.md).
 
 ## Where we are
 
-0.1.0 is the first release under the overdosecd name — a rename of the
+0.2.0 shipped the first slice of the git-health work: `.git/config` reads honor
+`include`/`includeIf` and `url.<base>.insteadOf`, bare repositories are
+detected, and projects remember their kind (`info`'s `type:`, `list --type`,
+a picker badge, SQLite schema v2 with a backed-up migration). The status
+reader and its UI moved to v0.5.0 by a 2026-10-04 re-scope: the object layer
+(flate2, packfile, delta chains) is the riskiest parser work on this roadmap
+and does not need to hold the config debt and typing hostage.
+
+0.1.0 was the first release under the overdosecd name — a rename of the
 predecessor project, whose crate no longer exists. It carries the whole shipped
 feature set: `add`/`list`/`goto`/`info`/`remove` with alias/tag/pin/rename and
 git-aware matching; `config.toml`, width-aware output, `--debug`, completions,
@@ -81,33 +89,33 @@ first.
 
 Tasks:
 
-- [ ] 1. **Git-config debt** — `include.path` and `includeIf.gitdir[:/]`
+- [x] 1. **Git-config debt** — `include.path` and `includeIf.gitdir[:/]`
   (`~` and config-relative expansion, ≤8 files, caps, regular files only),
   `url.<base>.insteadOf` longest-prefix rewrite, and bare-repository detection
   (`core.bare`, or `HEAD` + `objects/` + `refs/`). Hostile-include tests; a
   SECURITY.md note that a cloned config can steer only the sanitized remote
-  display. Removes limitation #2.
-- [ ] 2. **Schema v2** — `schema_version` 1→2 with `ALTER TABLE projects ADD
+  display. Removed the stale config limitation.
+- [x] 2. **Schema v2** — `schema_version` 1→2 with `ALTER TABLE projects ADD
   COLUMN kind TEXT`, migrating only on the first writable open; `load_readonly`
   reports an old version instead of migrating, and the pre-migration copy goes
   through `paths::sibling_backup`. JSON gets `#[serde(default)] kind`. `doctor`
   reports the version.
-- [ ] 3. **Project typing** — `project::kind_of` from marker files
+- [x] 3. **Project typing** — `project::kind_of` from marker files
   (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`) with a stable
   precedence: `rust | node | python | go | unknown`. Detected once at `add` and
   stored — never stat'd per query. `info` gains `type:`, `list --type <t>`
   filters, picker rows carry a badge, and `doctor --refresh` re-detects. Kind
   is display and filter, never a matcher signal.
-- [ ] 4. **Release** — CHANGELOG section, README reference, AGENTS.md facts
+- [x] 4. **Release** — CHANGELOG section, README reference, AGENTS.md facts
   (include semantics and budgets, the schema-v2 rule, the kind rule), tick this
-  milestone, delete limitation #2's row, bump `Cargo.toml`, tag → publish +
-  GitHub release.
+  milestone, delete the fixed limitation's row, bump `Cargo.toml`, tag → publish
+  + GitHub release.
 
 Definition of done:
 
 - `include`/`includeIf`/`insteadOf`/bare detection run under the stated budgets,
   refuse non-regular files, and no hostile repository escapes a cap or reaches
-  a terminal unsanitized; limitation #2 is gone.
+  a terminal unsanitized; the old config limitation is gone.
 - Schema v1→2 is non-destructive, keeps a backup, runs only on writable open,
   `load_readonly` reports the old version instead of migrating, and `doctor`
   reports it.
@@ -229,10 +237,9 @@ Definition of done:
 | # | Limitation | Track |
 | - | ---------- | ----- |
 | 1 | Subcommand names are reserved by the `ocd` wrapper, so a project named `tag` needs `ocd goto tag` | by design |
-| 2 | `.git/config` `include`/`insteadOf` are not honored; bare repositories are not detected | v0.2.0 |
-| 3 | Ranking aggregates jumps into one `use_count` instead of weighting the history log | by design |
-| 4 | The JSON backend rewrites the whole index file on every mutation (SQLite updates single rows) | by design (json); moot at v0.3.0 |
-| 5 | Data directories, config paths, and store entries must be absolute; a relative value is refused | by design |
+| 2 | Ranking aggregates jumps into one `use_count` instead of weighting the history log | by design |
+| 3 | The JSON backend rewrites the whole index file on every mutation (SQLite updates single rows) | by design (json); moot at v0.3.0 |
+| 4 | Data directories, config paths, and store entries must be absolute; a relative value is refused | by design |
 
 ## Recorded numbers
 

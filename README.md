@@ -244,12 +244,13 @@ ocd acme/widgets              # the full owner/repo slug
 `info` shows live details:
 
 ```text
+type:      rust
 git:       yes
 branch:    main
 remote:    origin git@github.com:Dead-Abyss/overdosecd.git
 ```
 
-The remote is a snapshot taken at `add`; refresh it with `overdosecd doctor --refresh` (or `overdosecd add --force <path>`) after changing it. Worktrees are understood (branch from the worktree, config from the main repository), `include.path`/`includeIf "gitdir:…"` config includes and `url.<base>.insteadOf` rewrites are honored, and bare repositories are detected. The org/owner alone is not searchable.
+The remote is a snapshot taken at `add`; refresh it with `overdosecd doctor --refresh` (or `overdosecd add --force <path>`) after changing it. Worktrees are understood (branch from the worktree, config from the main repository), `include.path`/`includeIf "gitdir:…"` config includes and `url.<base>.insteadOf` rewrites are honored, and bare repositories are detected. The org/owner alone is not searchable. Projects also remember their kind — `rust`, `node`, `python`, `go`, or `unknown`, from marker files at `add` — shown as `type:` and filterable with `list --type`.
 
 ## Health check
 

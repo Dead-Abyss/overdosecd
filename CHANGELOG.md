@@ -4,7 +4,28 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-04
+
+Git configs are read the way git reads them, and projects remember what kind of
+project they are.
+
+### Features
+
+- `.git/config` reads honor `include.path` and `includeIf` (`gitdir:` and
+  `gitdir/i:`) under fixed caps (8 files, 16 MiB merged, regular files only),
+  and `url.<base>.insteadOf` rewrites apply by longest prefix. The `gitdir:`
+  pattern subset is `*`, `**`, and `?`; character classes and `onbranch:` never
+  match.
+- Bare repositories are detected through `core.bare` or the
+  `HEAD` + `objects/` + `refs/` layout.
+- Projects remember their kind (`rust`, `node`, `python`, `go`, `unknown`),
+  detected once from marker files at `add` (`--force` refreshes it). `info`
+  gains `type:`, `list --type T` filters, picker rows carry a badge, and
+  `doctor --refresh` re-detects it.
+- SQLite schema v2 stores the kind. A v1 database migrates on its first
+  writable open, after a consistent `VACUUM INTO` backup
+  (`projects.db.v1-<timestamp>`); a read-only open reports the old version
+  instead of migrating, and `doctor` shows the schema version.
 
 ### Fixed
 
@@ -12,6 +33,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   result, or cwd) exactly like `Ctrl+a`, instead of opening it empty.
 - `scan <root>...` resolves roots to their canonical path like `add`, so a
   symlinked root reports paths under its target.
+- A `.git` file that is a FIFO is refused instead of blocking the read.
 
 ### Changed
 
@@ -21,7 +43,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   merged the alias/tag commands behind one shape, and folded small renderer
   and picker helpers. The CLI surface is unchanged.
 - `doctor` reports a read-only index as its mode (`0400`) instead of both a
-  read-only line and a mode line.
+  read-only line and a mode line; `--refresh` now refreshes stored metadata
+  (git remote and project kind), and its wording says "metadata".
 
 ## [0.1.0] - 2026-10-03
 

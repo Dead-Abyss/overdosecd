@@ -28,6 +28,69 @@ pub struct Project {
     pub pinned: bool,
     #[serde(default)]
     pub git: Option<GitInfo>,
+    /// What kind of project the directory is; display and filter only, never
+    /// a matcher signal. Detected once at `add`.
+    #[serde(default)]
+    pub kind: Kind,
+}
+
+/// What kind of project a directory is, from its marker files.
+///
+/// The stored labels (`rust`, `node`, `python`, `go`, `unknown`) are part of
+/// the on-disk format: a v1 database reads back as `unknown`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Rust,
+    Node,
+    Python,
+    Go,
+    #[default]
+    Unknown,
+}
+
+impl Kind {
+    /// The lowercase name used in output, filtering, and storage.
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Rust => "rust",
+            Kind::Node => "node",
+            Kind::Python => "python",
+            Kind::Go => "go",
+            Kind::Unknown => "unknown",
+        }
+    }
+
+    /// Parses a stored label; anything unrecognized is `unknown`.
+    pub fn parse(text: &str) -> Self {
+        match text {
+            "rust" => Kind::Rust,
+            "node" => Kind::Node,
+            "python" => Kind::Python,
+            "go" => Kind::Go,
+            _ => Kind::Unknown,
+        }
+    }
+}
+
+/// Marker files, in precedence order: the first one present wins.
+const KIND_MARKERS: [(Kind, &str); 4] = [
+    (Kind::Rust, "Cargo.toml"),
+    (Kind::Node, "package.json"),
+    (Kind::Python, "pyproject.toml"),
+    (Kind::Go, "go.mod"),
+];
+
+/// The kind of project at `path`; `unknown` when no marker file is present.
+///
+/// Called once at `add` (and by `doctor --refresh`), never per query.
+pub fn kind_of(path: &Path) -> Kind {
+    for (kind, marker) in KIND_MARKERS {
+        if path.join(marker).is_file() {
+            return kind;
+        }
+    }
+    Kind::Unknown
 }
 
 /// Git metadata captured when a project is added.
@@ -75,6 +138,7 @@ impl Project {
             use_count: 0,
             pinned: false,
             git: None,
+            kind: Kind::Unknown,
         }
     }
 }
@@ -191,6 +255,7 @@ pub fn insert(
             existing.name = name;
         }
         existing.git = GitInfo::detect(&path);
+        existing.kind = kind_of(&path);
         for alias in &aliases {
             push_unique(&mut existing.aliases, alias);
         }
@@ -219,6 +284,7 @@ pub fn insert(
         use_count: 0,
         pinned: false,
         git: GitInfo::detect(&path),
+        kind: kind_of(&path),
     };
     let name = project.name.clone();
     projects.push(project);
@@ -598,5 +664,28 @@ mod tests {
         assert!(!remove_unique(&mut list, "rust"));
         assert_eq!(list, vec!["cli".to_owned()]);
         assert!(!remove_unique(&mut list, "  "));
+    }
+
+    #[test]
+    fn kind_of_uses_marker_precedence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        assert_eq!(kind_of(path), Kind::Unknown);
+
+        std::fs::write(path.join("go.mod"), "module x").unwrap();
+        assert_eq!(kind_of(path), Kind::Go);
+
+        std::fs::write(path.join("pyproject.toml"), "[project]").unwrap();
+        assert_eq!(kind_of(path), Kind::Python, "python beats go");
+
+        std::fs::write(path.join("package.json"), "{}").unwrap();
+        assert_eq!(kind_of(path), Kind::Node, "node beats python");
+
+        std::fs::write(path.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(kind_of(path), Kind::Rust, "rust beats node");
+
+        assert_eq!(Kind::parse("go"), Kind::Go);
+        assert_eq!(Kind::parse("cobol"), Kind::Unknown);
+        assert_eq!(Kind::parse("unknown"), Kind::Unknown);
     }
 }

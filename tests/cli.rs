@@ -1209,7 +1209,60 @@ fn doctor_reports_the_sqlite_schema() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("storage: sqlite (schema v1)"));
+        .stdout(predicate::str::contains("storage: sqlite (schema v2)"));
+}
+
+#[test]
+fn project_kind_is_detected_and_filtered() {
+    dual!(sandbox, {
+        let rust = sandbox.project("engine");
+        fs::write(rust.join("Cargo.toml"), "[package]").unwrap();
+        let node = sandbox.project("website");
+        fs::write(node.join("package.json"), "{}").unwrap();
+        sandbox.add(&rust);
+        sandbox.add(&node);
+
+        sandbox
+            .cmd()
+            .args(["info", "engine"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("type:      rust"));
+
+        sandbox
+            .cmd()
+            .args(["list", "--type", "rust"])
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("engine").and(predicate::str::contains("website").not()),
+            );
+
+        sandbox
+            .cmd()
+            .args(["list", "--type", "go"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("no go projects indexed"));
+
+        // Re-detection: a marker appearing after `add` needs a refresh.
+        // `rust` outranks the existing `package.json`.
+        fs::write(node.join("Cargo.toml"), "[package]").unwrap();
+        sandbox
+            .cmd()
+            .args(["doctor", "--refresh"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "refreshed metadata: 1 of 2 projects updated",
+            ));
+        sandbox
+            .cmd()
+            .args(["list", "--type", "rust"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("website"));
+    });
 }
 
 #[test]
@@ -2786,7 +2839,7 @@ fn doctor_refresh_updates_stored_git_remotes() {
             .assert()
             .success()
             .stdout(predicate::str::contains(
-                "refreshed git metadata: 1 of 1 projects updated",
+                "refreshed metadata: 1 of 1 projects updated",
             ));
 
         sandbox
@@ -2801,7 +2854,7 @@ fn doctor_refresh_updates_stored_git_remotes() {
             .args(["doctor", "--refresh"])
             .assert()
             .success()
-            .stdout(predicate::str::contains("git metadata is up to date"));
+            .stdout(predicate::str::contains("metadata is up to date"));
     });
 }
 

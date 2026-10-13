@@ -709,6 +709,62 @@ class Harness:
                 f"code={code} out={out!r}",
             )
 
+        # Entry profiles ([general] hooks): a wrapper jump exports the
+        # profile's variables and runs its command inside this shell. Runs
+        # last: it leaves a config behind that other scenarios must not see.
+        self.setup()
+        config_dir = os.path.join(self.config, "overdosecd")
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "config.toml"), "w") as handle:
+            handle.write("[general]\nhooks = true\n")
+        subprocess.run(
+            [binary, "profile", "env", "add", "alpha", "OCD_SMOKE=applied"],
+            env=self.env(),
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [binary, "profile", "run", "set", "alpha", "echo RUN-ON-ENTER"],
+            env=self.env(),
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        code, out, pty = self.run(
+            'eval "$(overdosecd init bash)"; ocd alph; printf "ENV=%s\\n" "$OCD_SMOKE"',
+            [],
+            cwd=self.root,
+            shell="bash",
+        )
+        self.check(
+            "ocd applies the profile environment and command",
+            code == 0 and "ENV=applied" in out and "RUN-ON-ENTER" in out,
+            f"code={code} out={out!r}",
+        )
+        self.check(
+            "the run-on-enter command is shown before it runs",
+            b"running: echo RUN-ON-ENTER" in pty,
+            "the notice was not on the terminal",
+        )
+
+        # Without the switch (fresh config), the wrapper init carries no
+        # enter step at all.
+        self.setup()
+        with open(os.path.join(config_dir, "config.toml"), "w") as handle:
+            handle.write("")
+        code, out, _ = self.run(
+            'eval "$(overdosecd init bash)"; ocd alph; printf "ENV=%s\\n" "${OCD_SMOKE:-unset}"',
+            [],
+            cwd=self.root,
+            shell="bash",
+        )
+        self.check(
+            "hooks off means no profile step",
+            code == 0 and "ENV=unset" in out,
+            f"code={code} out={out!r}",
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

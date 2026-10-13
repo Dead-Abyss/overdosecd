@@ -87,11 +87,12 @@ fn parse_width(value: Option<&str>) -> Option<usize> {
 
 /// Whether the optional `cd` wrapper is installed: `[general] hook` records
 /// jumps into indexed projects, `[general] hint` counts visits to the ones
-/// that are not indexed.
+/// that are not indexed, and `[general] hooks` applies entry profiles.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HookSettings {
     pub record: bool,
     pub hint: bool,
+    pub enter: bool,
 }
 
 impl HookSettings {
@@ -105,8 +106,10 @@ impl HookSettings {
 pub fn init_script(shell: Shell, hooks: HookSettings) -> String {
     let commands = passthrough_commands();
     match shell {
-        Shell::Bash => bash_zsh_script(&commands, &embed(BASH_COMPLETION, &commands), hooks),
-        Shell::Zsh => bash_zsh_script(&commands, &embed(ZSH_COMPLETION, &commands), hooks),
+        Shell::Bash => {
+            bash_zsh_script("bash", &commands, &embed(BASH_COMPLETION, &commands), hooks)
+        }
+        Shell::Zsh => bash_zsh_script("zsh", &commands, &embed(ZSH_COMPLETION, &commands), hooks),
         Shell::Fish => fish_script(&commands, hooks),
     }
 }
@@ -172,9 +175,21 @@ fn passthrough_commands() -> Vec<String> {
     names
 }
 
-fn bash_zsh_script(commands: &[String], completion: &str, hooks: HookSettings) -> String {
+fn bash_zsh_script(
+    shell_word: &str,
+    commands: &[String],
+    completion: &str,
+    hooks: HookSettings,
+) -> String {
     let commands = commands.join("|");
     let hook = if hooks.any() { HOOK_SCRIPT } else { "" };
+    // `[general] hooks`: after every jump's `cd`, the profile step runs in
+    // this shell. Omitted entirely unless the switch was on at init time.
+    let enter = if hooks.enter {
+        format!("\n  eval \"$(command overdosecd enter {shell_word} \"$target\")\"")
+    } else {
+        String::new()
+    };
     format!(
         r#"# overdosecd shell integration (bash / zsh)
 ocd() {{
@@ -185,7 +200,7 @@ ocd() {{
   # selected path.
   if [ "$#" -eq 0 ]; then
     target="$(command overdosecd ui)" || return 1
-    builtin cd "$target" || return 1
+    builtin cd "$target" || return 1{enter}
     return 0
   fi
 
@@ -210,7 +225,7 @@ ocd() {{
     ui|--ui)
       shift
       target="$(command overdosecd ui "$@")" || return 1
-      builtin cd "$target" || return 1
+      builtin cd "$target" || return 1{enter}
       ;;
     {commands})
       command overdosecd "$@"
@@ -221,14 +236,14 @@ ocd() {{
       # `goto` and its messages.
       if [ -t 0 ]; then
         if target="$(command overdosecd goto --confident "$@" 2>/dev/null)"; then
-          builtin cd "$target" || return 1
+          builtin cd "$target" || return 1{enter}
           return 0
         fi
         target="$(command overdosecd ui --query "$*")" || return 1
-        builtin cd "$target" || return 1
+        builtin cd "$target" || return 1{enter}
       else
         target="$(command overdosecd goto "$@")" || return 1
-        builtin cd "$target" || return 1
+        builtin cd "$target" || return 1{enter}
       fi
       ;;
   esac
@@ -308,6 +323,13 @@ fn fish_script(commands: &[String], hooks: HookSettings) -> String {
     let completion = embed(FISH_COMPLETION, commands);
     let commands = commands.join(" ");
     let hook = if hooks.any() { FISH_HOOK_SCRIPT } else { "" };
+    // `[general] hooks`: after every jump's `cd`, the profile is sourced into
+    // this shell. Omitted entirely unless the switch was on at init time.
+    let enter = if hooks.enter {
+        "\n        command overdosecd enter fish $target | source"
+    } else {
+        ""
+    };
     format!(
         r#"# overdosecd shell integration (fish)
 function ocd
@@ -318,7 +340,7 @@ function ocd
         set -l target (command overdosecd ui)
         or return 1
         builtin cd $target
-        or return 1
+        or return 1{enter}
         return 0
     end
 
@@ -341,7 +363,7 @@ function ocd
             set -l target (command overdosecd ui $argv[2..-1])
             or return 1
             builtin cd $target
-            or return 1
+            or return 1{enter}
         case {commands}
             command overdosecd $argv
         case '*'
@@ -352,18 +374,18 @@ function ocd
                 set -l target (command overdosecd goto --confident $argv 2>/dev/null)
                 if test $status -eq 0
                     builtin cd $target
-                    or return 1
+                    or return 1{enter}
                     return 0
                 end
                 set target (command overdosecd ui --query "$argv")
                 or return 1
                 builtin cd $target
-                or return 1
+                or return 1{enter}
             else
                 set -l target (command overdosecd goto $argv)
                 or return 1
                 builtin cd $target
-                or return 1
+                or return 1{enter}
             end
     end
 end
@@ -1070,10 +1092,12 @@ mod tests {
                 HookSettings {
                     record: true,
                     hint: false,
+                    enter: false,
                 },
                 HookSettings {
                     record: false,
                     hint: true,
+                    enter: false,
                 },
             ] {
                 let script = init_script(shell, hooks);
@@ -1084,12 +1108,30 @@ mod tests {
                 };
                 assert!(script.contains(wrapper), "{shell:?} wrapper: {script}");
             }
+
+            // `[general] hooks` adds the enter step to every jump; the
+            // default wrapper does not carry it at all.
+            let with_enter = init_script(
+                shell,
+                HookSettings {
+                    record: false,
+                    hint: false,
+                    enter: true,
+                },
+            );
+            let word = match shell {
+                Shell::Fish => "enter fish",
+                Shell::Bash => "enter bash",
+                Shell::Zsh => "enter zsh",
+            };
+            assert!(with_enter.contains(word), "{shell:?}: {with_enter}");
         }
         assert!(!HookSettings::default().any());
         assert!(
             HookSettings {
                 record: false,
-                hint: true
+                hint: true,
+                enter: false,
             }
             .any()
         );

@@ -3,6 +3,7 @@ mod config;
 mod dirs;
 mod discovery;
 mod doctor;
+mod enter;
 mod error;
 mod git;
 mod hook;
@@ -30,8 +31,8 @@ use clap::Parser;
 use colored::Colorize;
 
 use crate::cli::{
-    AddArgs, Cli, Command, DoctorArgs, ImportArgs, ListArgs, NoteCommand, RemoveArgs, ScanArgs,
-    SortBy, TermCommand,
+    AddArgs, Cli, Command, DoctorArgs, ImportArgs, ListArgs, NoteCommand, ProfileCommand,
+    ProfileEnvCommand, ProfileRunCommand, RemoveArgs, ScanArgs, SortBy, TermCommand,
 };
 use crate::config::ColorMode;
 use crate::error::{Error, Result};
@@ -74,7 +75,11 @@ fn run(cli: Cli) -> Result<i32> {
     // other command stops with the reason.
     let lenient = matches!(
         cli.command,
-        Command::Doctor(_) | Command::Complete { .. } | Command::Hook | Command::Init { .. }
+        Command::Doctor(_)
+            | Command::Complete { .. }
+            | Command::Hook
+            | Command::Init { .. }
+            | Command::Enter { .. }
     );
     match migrate::auto(&data_dir) {
         Ok(Some(migrate::Outcome::Migrated { projects, backup })) => {
@@ -114,6 +119,7 @@ fn run(cli: Cli) -> Result<i32> {
             output::HookSettings {
                 record: config.general.hook,
                 hint: config.general.hint,
+                enter: config.general.hooks,
             }
         });
 
@@ -138,6 +144,14 @@ fn run(cli: Cli) -> Result<i32> {
         // exits 0 so it can never break the shell's cd.
         Command::Hook => {
             cmd_hook(&store, &data_dir, hooks);
+            Ok(0)
+        }
+        // `enter` runs inside every wrapper jump; like the hook it is silent
+        // unless a profile applies, and never fails the jump.
+        Command::Enter { shell, path } => {
+            if hooks.enter {
+                enter::apply(shell, &path, &data_dir);
+            }
             Ok(0)
         }
         Command::Init { shell } => {
@@ -190,6 +204,7 @@ fn run(cli: Cli) -> Result<i32> {
                     cmd_term(&store, action, TermKind::Tag, &matching, debug)?
                 }
                 Command::Note { action } => cmd_note(&store, action, &matching, debug)?,
+                Command::Profile { action } => cmd_profile(&store, action, &matching, debug)?,
                 Command::Migrate => cmd_migrate(&data_dir)?,
                 Command::Import(args) => cmd_import(&store, args)?,
                 Command::Scan(args) => cmd_scan(&data_dir, &config.discovery, args)?,
@@ -201,6 +216,7 @@ fn run(cli: Cli) -> Result<i32> {
                 }
                 Command::Hook => unreachable!("hook is dispatched before the config load"),
                 Command::Init { .. } => unreachable!("init is dispatched before the config load"),
+                Command::Enter { .. } => unreachable!("enter is dispatched before the config load"),
             }
 
             Ok(0)
@@ -723,6 +739,122 @@ fn cmd_note(
             })?;
             output::print_line(&message)
         }
+    }
+}
+
+/// The `profile` subcommands: the explicit, user-authored entry profile that
+/// `enter` applies on a wrapper jump. Imports and scans never write any of
+/// this; only these commands do.
+fn cmd_profile(
+    store: &SqliteStore,
+    action: ProfileCommand,
+    matching: &MatcherConfig,
+    debug: bool,
+) -> Result<()> {
+    match action {
+        ProfileCommand::Show { project } => {
+            let (id, name) = resolve_id(store, &project, matching, debug)?;
+            let projects = store.load()?;
+            let found = projects
+                .iter()
+                .find(|project| project.id == id)
+                .ok_or(Error::NoLongerIndexed(name))?;
+            if found.env.is_empty() && found.enter_cmd.is_none() {
+                return output::print_line(&format!(
+                    "no profile on `{}`",
+                    sanitize::text(&found.name)
+                ));
+            }
+            let mut out = String::new();
+            for (key, value) in &found.env {
+                out.push_str(&format!("env {key}={}\n", sanitize::text(value)));
+            }
+            if let Some(cmd) = &found.enter_cmd {
+                out.push_str(&format!("run {}\n", sanitize::text(cmd)));
+            }
+            output::print(&out)
+        }
+        ProfileCommand::Env { action } => match action {
+            ProfileEnvCommand::Add {
+                project,
+                assignment,
+            } => {
+                let Some((key, value)) = assignment.split_once('=') else {
+                    return Err(Error::InvalidValue("expected KEY=VALUE".to_owned()));
+                };
+                if !enter::valid_env_name(key) {
+                    return Err(Error::InvalidValue(format!(
+                        "`{}` is not a valid environment variable name",
+                        sanitize::text(key)
+                    )));
+                }
+                project::reject_control_chars("environment value", value)?;
+                let (key, value) = (key.to_owned(), value.to_owned());
+                let (id, name) = resolve_id(store, &project, matching, debug)?;
+                let message = store.update(move |projects| {
+                    let found = project::revalidate(projects, &id, name)?;
+                    found.env.insert(key.clone(), value);
+                    Ok(format!("set {key} on `{}`", sanitize::text(&found.name)))
+                })?;
+                output::print_line(&message)
+            }
+            ProfileEnvCommand::Remove { project, key } => {
+                if !enter::valid_env_name(&key) {
+                    return Err(Error::InvalidValue(format!(
+                        "`{}` is not a valid environment variable name",
+                        sanitize::text(&key)
+                    )));
+                }
+                let (id, name) = resolve_id(store, &project, matching, debug)?;
+                let message = store.update(move |projects| {
+                    let found = project::revalidate(projects, &id, name)?;
+                    if found.env.remove(&key).is_none() {
+                        return Err(Error::InvalidValue(format!(
+                            "`{key}` is not set on `{}`",
+                            sanitize::text(&found.name)
+                        )));
+                    }
+                    Ok(format!(
+                        "removed {key} from `{}`",
+                        sanitize::text(&found.name)
+                    ))
+                })?;
+                output::print_line(&message)
+            }
+        },
+        ProfileCommand::Run { action } => match action {
+            ProfileRunCommand::Set { project, command } => {
+                let command = command.trim().to_owned();
+                if command.is_empty() {
+                    return Err(Error::InvalidValue(
+                        "the command must not be empty".to_owned(),
+                    ));
+                }
+                project::reject_control_chars("enter command", &command)?;
+                let (id, name) = resolve_id(store, &project, matching, debug)?;
+                let message = store.update(move |projects| {
+                    let found = project::revalidate(projects, &id, name)?;
+                    found.enter_cmd = Some(command);
+                    Ok(format!(
+                        "set the run-on-enter command on `{}`",
+                        sanitize::text(&found.name)
+                    ))
+                })?;
+                output::print_line(&message)
+            }
+            ProfileRunCommand::Clear { project } => {
+                let (id, name) = resolve_id(store, &project, matching, debug)?;
+                let message = store.update(move |projects| {
+                    let found = project::revalidate(projects, &id, name)?;
+                    let name = sanitize::text(&found.name);
+                    if found.enter_cmd.take().is_none() {
+                        return Ok(format!("no run-on-enter command on `{name}`"));
+                    }
+                    Ok(format!("cleared the run-on-enter command on `{name}`"))
+                })?;
+                output::print_line(&message)
+            }
+        },
     }
 }
 

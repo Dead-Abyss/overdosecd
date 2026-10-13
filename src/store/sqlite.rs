@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, ErrorCode, TransactionBehavior};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior};
 
 use crate::error::{Error, Result};
 use crate::project::{GitInfo, Kind, Project};
@@ -520,6 +520,46 @@ impl SqliteStore {
         let conn = self.open()?;
         Ok(Some(self.read_schema_version(&conn)?))
     }
+
+    /// The entry profile for the project at `path`, if any: one indexed
+    /// lookup, the cost `enter` pays on every wrapper jump. A missing
+    /// database or an unknown path is `None`.
+    pub fn profile_for_path(&self, path: &str) -> Result<Option<ProjectProfile>> {
+        crate::paths::refuse_symlink(&self.path, "SQLite database")?;
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let conn = self.open()?;
+        let row = conn
+            .query_row(
+                "SELECT env, enter_cmd FROM projects WHERE path = ?1",
+                [path],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|err| self.map_rusqlite(err))?;
+        let Some((env, enter_cmd)) = row else {
+            return Ok(None);
+        };
+        let env = match env {
+            Some(raw) => serde_json::from_str(&raw)
+                .map_err(|err| self.storage_err(format!("unreadable profile JSON: {err}")))?,
+            None => BTreeMap::new(),
+        };
+        Ok(Some(ProjectProfile { env, enter_cmd }))
+    }
+}
+
+/// A project's entry profile: what `enter` applies on a wrapper jump.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectProfile {
+    pub env: BTreeMap<String, String>,
+    pub enter_cmd: Option<String>,
 }
 
 /// Binds one project to the named parameters every statement shares.

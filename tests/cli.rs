@@ -3884,3 +3884,170 @@ fn doctor_reports_planted_notes_with_control_characters() {
             .and(predicate::str::contains(r"\u{1b}")),
     );
 }
+
+#[test]
+fn profile_round_trips_and_enter_applies_it() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project("overdosecd");
+    sandbox.add(&project);
+    let path = sandbox.canonical(&project);
+
+    // Without [general] hooks, `enter` stays silent.
+    sandbox
+        .cmd()
+        .args(["enter", "bash", &path])
+        .assert()
+        .success()
+        .stdout("");
+
+    sandbox
+        .cmd()
+        .args(["profile", "env", "add", "overdosecd", "EDITOR=vim"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("set EDITOR"));
+    sandbox
+        .cmd()
+        .args(["profile", "env", "add", "overdosecd", "GREETING=it's fine"])
+        .assert()
+        .success();
+    sandbox
+        .cmd()
+        .args(["profile", "run", "set", "overdosecd", "echo entered"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run-on-enter"));
+
+    sandbox
+        .cmd()
+        .args(["profile", "show", "overdosecd"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("env EDITOR=vim")
+                .and(predicate::str::contains("env GREETING=it's fine"))
+                .and(predicate::str::contains("run echo entered")),
+        );
+
+    let config = sandbox.write_config("[general]\nhooks = true\n");
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_CONFIG", &config)
+        .args(["enter", "bash", &path])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("export EDITOR='vim'")
+                .and(predicate::str::contains("export GREETING='it'\\''s fine'"))
+                .and(predicate::str::contains("echo entered || printf")),
+        )
+        .stderr(predicate::str::contains("running: echo entered"));
+
+    // Fish gets its own spelling of the same profile.
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_CONFIG", &config)
+        .args(["enter", "fish", &path])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("set -gx EDITOR 'vim'")
+                .and(predicate::str::contains("echo entered; or echo")),
+        );
+
+    // A jumped-to directory without a profile stays silent.
+    let other = sandbox.project("other");
+    sandbox.add(&other);
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_CONFIG", &config)
+        .args(["enter", "bash", &sandbox.canonical(&other)])
+        .assert()
+        .success()
+        .stdout("");
+
+    // Clearing works and is idempotent afterwards.
+    sandbox
+        .cmd()
+        .args(["profile", "run", "clear", "overdosecd"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleared"));
+    sandbox
+        .cmd()
+        .args(["profile", "run", "clear", "overdosecd"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no run-on-enter"));
+}
+
+#[test]
+fn profile_guards_refuse_bad_keys_and_values() {
+    let sandbox = Sandbox::new();
+    sandbox.add(&sandbox.project("overdosecd"));
+
+    sandbox
+        .cmd()
+        .args(["profile", "env", "add", "overdosecd", "1BAD=x"])
+        .assert()
+        .failure()
+        .code(1);
+    sandbox
+        .cmd()
+        .args(["profile", "env", "add", "overdosecd", "NOEQUALS"])
+        .assert()
+        .failure()
+        .code(1);
+    sandbox
+        .cmd()
+        .args(["profile", "env", "add", "overdosecd", "OK=bad\nvalue"])
+        .assert()
+        .failure()
+        .code(1);
+    sandbox
+        .cmd()
+        .args(["profile", "run", "set", "overdosecd", "bad\ncmd"])
+        .assert()
+        .failure()
+        .code(1);
+    sandbox
+        .cmd()
+        .args(["profile", "env", "remove", "overdosecd", "MISSING"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("not set"));
+    sandbox
+        .cmd()
+        .args(["profile", "show", "overdosecd"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no profile"));
+}
+
+#[test]
+fn enter_refuses_planted_unsafe_profiles_without_failing() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project("overdosecd");
+    sandbox.add(&project);
+    let config = sandbox.write_config("[general]\nhooks = true\n");
+
+    // A planted index smuggles a hostile variable name and command in.
+    let connection = rusqlite::Connection::open(sandbox.index_file()).expect("open database");
+    connection
+        .execute(
+            "UPDATE projects SET env = ?1, enter_cmd = ?2",
+            rusqlite::params!["{\"BAD NAME\":\"x\"}", "echo\nrm"],
+        )
+        .expect("plant profile");
+    drop(connection);
+
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_CONFIG", &config)
+        .args(["enter", "bash", &sandbox.canonical(&project)])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr(predicate::str::contains("refusing the profile"));
+}

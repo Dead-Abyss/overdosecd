@@ -47,6 +47,10 @@ pub(crate) struct General {
     /// Count visits to directories that are not indexed and suggest `ocd add`
     /// after enough of them. Implies the wrapper too.
     pub hint: bool,
+    /// Apply a project's profile (exported variables and the run-on-enter
+    /// command) when the wrapper jumps into it. Off by default: a planted
+    /// index must not turn a jump into code execution on its own.
+    pub hooks: bool,
 }
 
 /// The retired storage selector.

@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,6 +34,18 @@ pub struct Project {
     /// a matcher signal. Detected once at `add`.
     #[serde(default)]
     pub kind: Kind,
+    /// Environment variables exported on entering the project, keyed by name.
+    /// User-authored through `overdosecd profile`; never imported or
+    /// detected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// A command run on entering the project. User-authored through
+    /// `overdosecd profile`; never imported or detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enter_cmd: Option<String>,
+    /// Single-line notes, in display order (`overdosecd note`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// What kind of project a directory is, from its marker files.
@@ -108,8 +122,8 @@ pub struct GitInfo {
 
 impl GitInfo {
     pub fn detect(path: &Path) -> Option<Self> {
-        crate::git::git_dir(path)?;
-        let remote = crate::git::read_remote(path);
+        let git_dir = crate::git::git_dir(path)?;
+        let remote = crate::git::read_remote_in(&git_dir);
         Some(Self {
             remote_name: remote.as_ref().map(|remote| remote.name.clone()),
             remote_url: remote.map(|remote| remote.url),
@@ -118,12 +132,6 @@ impl GitInfo {
 }
 
 impl Project {
-    /// Records a successful jump: bumps the count and stamps the time.
-    pub fn record_use(&mut self, now: DateTime<Utc>) {
-        self.last_used_at = Some(now);
-        self.use_count = self.use_count.saturating_add(1);
-    }
-
     /// Creates a fresh, unpinned project with no aliases or tags.
     #[cfg(test)]
     pub(crate) fn for_test(name: &str, path: &str) -> Self {
@@ -139,6 +147,9 @@ impl Project {
             pinned: false,
             git: None,
             kind: Kind::Unknown,
+            env: BTreeMap::new(),
+            enter_cmd: None,
+            notes: Vec::new(),
         }
     }
 }
@@ -205,31 +216,29 @@ pub fn default_name(path: &Path) -> Result<String> {
 
 /// The default display order: pinned first, then most recently used, then
 /// name (case-insensitively). Shared by `list` and the picker so both agree.
-fn display_order(a: &Project, b: &Project) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    b.pinned
-        .cmp(&a.pinned)
-        .then_with(|| match (a.last_used_at, b.last_used_at) {
-            (Some(a_time), Some(b_time)) => b_time.cmp(&a_time),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        })
-        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+///
+/// Returned as a key rather than a comparator so `sort_by_cached_key`
+/// lowercases each name once per sort instead of once per comparison.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SortKey {
+    Used(Reverse<bool>, Reverse<Option<DateTime<Utc>>>, String),
+    Name(String),
+    Created(Reverse<DateTime<Utc>>, String),
 }
 
-/// The comparator behind every sort order `list --sort` and the picker's sort
-/// cycle offer. [`SortBy::Used`] is [`display_order`]; the explicit orders
-/// ignore pinning.
-pub fn sort_key(a: &Project, b: &Project, sort: crate::cli::SortBy) -> std::cmp::Ordering {
+/// The key behind every sort order `list --sort` and the picker's sort cycle
+/// offer. [`SortBy::Used`] keeps pinning; the explicit orders ignore it.
+pub fn sort_key(project: &Project, sort: crate::cli::SortBy) -> SortKey {
     match sort {
-        crate::cli::SortBy::Used => display_order(a, b),
-        crate::cli::SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        crate::cli::SortBy::Created => b
-            .created_at
-            .cmp(&a.created_at)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        crate::cli::SortBy::Used => SortKey::Used(
+            Reverse(project.pinned),
+            Reverse(project.last_used_at),
+            project.name.to_lowercase(),
+        ),
+        crate::cli::SortBy::Name => SortKey::Name(project.name.to_lowercase()),
+        crate::cli::SortBy::Created => {
+            SortKey::Created(Reverse(project.created_at), project.name.to_lowercase())
+        }
     }
 }
 
@@ -285,6 +294,9 @@ pub fn insert(
         pinned: false,
         git: GitInfo::detect(&path),
         kind: kind_of(&path),
+        env: BTreeMap::new(),
+        enter_cmd: None,
+        notes: Vec::new(),
     };
     let name = project.name.clone();
     projects.push(project);
@@ -504,23 +516,6 @@ mod tests {
         assert_eq!(default_name(Path::new("/a/b/c")).unwrap(), "c");
         assert_eq!(default_name(Path::new("relative")).unwrap(), "relative");
         assert!(default_name(Path::new("/")).is_err());
-    }
-
-    #[test]
-    fn record_use_stamps_time_and_counts() {
-        let mut project = Project::for_test("alpha", "/tmp/alpha");
-        let now = Utc::now();
-
-        project.record_use(now);
-        assert_eq!(project.last_used_at, Some(now));
-        assert_eq!(project.use_count, 1);
-
-        project.record_use(now);
-        assert_eq!(project.use_count, 2);
-
-        project.use_count = u64::MAX;
-        project.record_use(now);
-        assert_eq!(project.use_count, u64::MAX, "the count must saturate");
     }
 
     #[test]

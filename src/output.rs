@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -27,42 +27,38 @@ fn guard(text: &str) -> Result<()> {
     }
 }
 
+/// The one writer behind every stdout/stderr funnel: the guard runs first, so
+/// a missed renderer fails closed instead of leaking an escape.
+fn write_to(mut stream: impl std::io::Write, text: &str, newline: bool) -> Result<()> {
+    guard(text)?;
+    if newline {
+        writeln!(stream, "{text}")?;
+    } else {
+        stream.write_all(text.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// Writes a line to stdout, turning broken pipes into an error that `main`
 /// can exit quietly on.
 pub fn print_line(text: &str) -> Result<()> {
-    guard(text)?;
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    writeln!(handle, "{text}")?;
-    Ok(())
+    write_to(std::io::stdout().lock(), text, true)
 }
 
 /// Writes raw text (no trailing newline added) to stdout.
 pub fn print(text: &str) -> Result<()> {
-    guard(text)?;
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    handle.write_all(text.as_bytes())?;
-    Ok(())
+    write_to(std::io::stdout().lock(), text, false)
 }
 
 /// Writes raw text (no trailing newline added) to stderr through the same
 /// guard as stdout.
 pub fn print_stderr(text: &str) -> Result<()> {
-    guard(text)?;
-    let stderr = std::io::stderr();
-    let mut handle = stderr.lock();
-    handle.write_all(text.as_bytes())?;
-    Ok(())
+    write_to(std::io::stderr().lock(), text, false)
 }
 
 /// Writes a line to stderr through the same guard as stdout.
 pub fn print_stderr_line(text: &str) -> Result<()> {
-    guard(text)?;
-    let stderr = std::io::stderr();
-    let mut handle = stderr.lock();
-    writeln!(handle, "{text}")?;
-    Ok(())
+    write_to(std::io::stderr().lock(), text, true)
 }
 
 /// The terminal's width in columns, or `None` when stdout is not a tty (or the
@@ -91,11 +87,12 @@ fn parse_width(value: Option<&str>) -> Option<usize> {
 
 /// Whether the optional `cd` wrapper is installed: `[general] hook` records
 /// jumps into indexed projects, `[general] hint` counts visits to the ones
-/// that are not indexed.
+/// that are not indexed, and `[general] hooks` applies entry profiles.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HookSettings {
     pub record: bool,
     pub hint: bool,
+    pub enter: bool,
 }
 
 impl HookSettings {
@@ -109,8 +106,10 @@ impl HookSettings {
 pub fn init_script(shell: Shell, hooks: HookSettings) -> String {
     let commands = passthrough_commands();
     match shell {
-        Shell::Bash => bash_zsh_script(&commands, &bash_completion(&commands), hooks),
-        Shell::Zsh => bash_zsh_script(&commands, &zsh_completion(&commands), hooks),
+        Shell::Bash => {
+            bash_zsh_script("bash", &commands, &embed(BASH_COMPLETION, &commands), hooks)
+        }
+        Shell::Zsh => bash_zsh_script("zsh", &commands, &embed(ZSH_COMPLETION, &commands), hooks),
         Shell::Fish => fish_script(&commands, hooks),
     }
 }
@@ -176,9 +175,21 @@ fn passthrough_commands() -> Vec<String> {
     names
 }
 
-fn bash_zsh_script(commands: &[String], completion: &str, hooks: HookSettings) -> String {
+fn bash_zsh_script(
+    shell_word: &str,
+    commands: &[String],
+    completion: &str,
+    hooks: HookSettings,
+) -> String {
     let commands = commands.join("|");
     let hook = if hooks.any() { HOOK_SCRIPT } else { "" };
+    // `[general] hooks`: after every jump's `cd`, the profile step runs in
+    // this shell. Omitted entirely unless the switch was on at init time.
+    let enter = if hooks.enter {
+        format!("\n  eval \"$(command overdosecd enter {shell_word} \"$target\")\"")
+    } else {
+        String::new()
+    };
     format!(
         r#"# overdosecd shell integration (bash / zsh)
 ocd() {{
@@ -189,7 +200,7 @@ ocd() {{
   # selected path.
   if [ "$#" -eq 0 ]; then
     target="$(command overdosecd ui)" || return 1
-    builtin cd "$target" || return 1
+    builtin cd "$target" || return 1{enter}
     return 0
   fi
 
@@ -214,7 +225,7 @@ ocd() {{
     ui|--ui)
       shift
       target="$(command overdosecd ui "$@")" || return 1
-      builtin cd "$target" || return 1
+      builtin cd "$target" || return 1{enter}
       ;;
     {commands})
       command overdosecd "$@"
@@ -225,14 +236,14 @@ ocd() {{
       # `goto` and its messages.
       if [ -t 0 ]; then
         if target="$(command overdosecd goto --confident "$@" 2>/dev/null)"; then
-          builtin cd "$target" || return 1
+          builtin cd "$target" || return 1{enter}
           return 0
         fi
         target="$(command overdosecd ui --query "$*")" || return 1
-        builtin cd "$target" || return 1
+        builtin cd "$target" || return 1{enter}
       else
         target="$(command overdosecd goto "$@")" || return 1
-        builtin cd "$target" || return 1
+        builtin cd "$target" || return 1{enter}
       fi
       ;;
   esac
@@ -276,8 +287,8 @@ _ocd() {
 complete -F _ocd ocd
 "#;
 
-fn bash_completion(commands: &[String]) -> String {
-    BASH_COMPLETION.replace("%COMMANDS%", &commands.join(" "))
+fn embed(template: &str, commands: &[String]) -> String {
+    template.replace("%COMMANDS%", &commands.join(" "))
 }
 
 /// Zsh completion for `ocd`, registered only after `compinit` has run so
@@ -308,14 +319,17 @@ if (( $+functions[compdef] )); then
 fi
 "#;
 
-fn zsh_completion(commands: &[String]) -> String {
-    ZSH_COMPLETION.replace("%COMMANDS%", &commands.join(" "))
-}
-
 fn fish_script(commands: &[String], hooks: HookSettings) -> String {
+    let completion = embed(FISH_COMPLETION, commands);
     let commands = commands.join(" ");
-    let completion = fish_completion(&commands);
     let hook = if hooks.any() { FISH_HOOK_SCRIPT } else { "" };
+    // `[general] hooks`: after every jump's `cd`, the profile is sourced into
+    // this shell. Omitted entirely unless the switch was on at init time.
+    let enter = if hooks.enter {
+        "\n        command overdosecd enter fish $target | source"
+    } else {
+        ""
+    };
     format!(
         r#"# overdosecd shell integration (fish)
 function ocd
@@ -326,7 +340,7 @@ function ocd
         set -l target (command overdosecd ui)
         or return 1
         builtin cd $target
-        or return 1
+        or return 1{enter}
         return 0
     end
 
@@ -349,7 +363,7 @@ function ocd
             set -l target (command overdosecd ui $argv[2..-1])
             or return 1
             builtin cd $target
-            or return 1
+            or return 1{enter}
         case {commands}
             command overdosecd $argv
         case '*'
@@ -360,18 +374,18 @@ function ocd
                 set -l target (command overdosecd goto --confident $argv 2>/dev/null)
                 if test $status -eq 0
                     builtin cd $target
-                    or return 1
+                    or return 1{enter}
                     return 0
                 end
                 set target (command overdosecd ui --query "$argv")
                 or return 1
                 builtin cd $target
-                or return 1
+                or return 1{enter}
             else
                 set -l target (command overdosecd goto $argv)
                 or return 1
                 builtin cd $target
-                or return 1
+                or return 1{enter}
             end
     end
 end
@@ -389,10 +403,6 @@ complete -c ocd -f -n 'test (count (commandline -opc)) -eq 1' -a '(command overd
 complete -c ocd -f -n 'set -l opc (commandline -opc); test (count $opc) -eq 1; and string match -q -- "-*" (commandline -ct)' -a '--cmd --no-track'
 complete -c ocd -f -n 'set -l opc (commandline -opc); test (count $opc) -eq 2; and test $opc[2] = --cmd' -a '%COMMANDS%'
 "#;
-
-fn fish_completion(commands: &str) -> String {
-    FISH_COMPLETION.replace("%COMMANDS%", commands)
-}
 
 /// Replaces a home prefix with `~` for display, escaping anything a terminal
 /// would interpret (paths can arrive from a planted index).
@@ -528,16 +538,16 @@ fn take_prefix(text: &str, budget: usize) -> String {
 /// The longest suffix of `text` that fits in `budget` display columns.
 fn take_suffix(text: &str, budget: usize) -> String {
     let mut used = 0;
-    let mut characters = Vec::new();
-    for character in text.chars().rev() {
+    let mut start = text.len();
+    for (index, character) in text.char_indices().rev() {
         let width = UnicodeWidthChar::width(character).unwrap_or(0);
         if used + width > budget {
             break;
         }
         used += width;
-        characters.push(character);
+        start = index;
     }
-    characters.into_iter().rev().collect()
+    text[start..].to_owned()
 }
 
 /// Shrinks `widths` until the table fits `budget`, giving space up in
@@ -882,22 +892,14 @@ pub fn format_doctor(
                 "stray:".red(),
                 shorten_home(path, home)
             )),
-            Issue::BackendDisagreement {
-                json,
-                db,
-                differing,
-            } => {
-                let json_noun = plural(*json, "project", "projects");
-                let db_noun = plural(*db, "project", "projects");
-                out.push_str(&format!(
-                    "  - {} projects.json ({json} {json_noun}) and projects.db ({db} {db_noun}) disagree ({differing} ids differ); `overdosecd migrate` or remove the inactive file\n",
-                    "mismatch:".yellow()
-                ));
-            }
-            Issue::InactiveIndexUnreadable { path, message } => out.push_str(&format!(
-                "  - {} {} cannot be read: {message}\n",
-                "unreadable:".red(),
+            Issue::LegacyJson { path } => out.push_str(&format!(
+                "  - {} {} was not migrated (the database already holds projects); `overdosecd migrate` reports why\n",
+                "legacy:".yellow(),
                 shorten_home(path, home)
+            )),
+            Issue::DeprecatedStorageKey => out.push_str(&format!(
+                "  - {} the `[storage] backend` setting is ignored; SQLite is the only backend\n",
+                "config:".dimmed()
             )),
             Issue::IndexPermissions { path, mode } => out.push_str(&format!(
                 "  - {} {} is mode {mode:04o} (expected 0600)\n",
@@ -1090,10 +1092,12 @@ mod tests {
                 HookSettings {
                     record: true,
                     hint: false,
+                    enter: false,
                 },
                 HookSettings {
                     record: false,
                     hint: true,
+                    enter: false,
                 },
             ] {
                 let script = init_script(shell, hooks);
@@ -1104,12 +1108,30 @@ mod tests {
                 };
                 assert!(script.contains(wrapper), "{shell:?} wrapper: {script}");
             }
+
+            // `[general] hooks` adds the enter step to every jump; the
+            // default wrapper does not carry it at all.
+            let with_enter = init_script(
+                shell,
+                HookSettings {
+                    record: false,
+                    hint: false,
+                    enter: true,
+                },
+            );
+            let word = match shell {
+                Shell::Fish => "enter fish",
+                Shell::Bash => "enter bash",
+                Shell::Zsh => "enter zsh",
+            };
+            assert!(with_enter.contains(word), "{shell:?}: {with_enter}");
         }
         assert!(!HookSettings::default().any());
         assert!(
             HookSettings {
                 record: false,
-                hint: true
+                hint: true,
+                enter: false,
             }
             .any()
         );
@@ -1243,13 +1265,13 @@ mod tests {
         };
         let rendered = format_doctor(
             &report,
-            Path::new("/data/projects.json"),
+            Path::new("/data/projects.db"),
             2,
             None,
             &config::Status::Defaults { path: None },
-            "json",
+            "sqlite (schema v2)",
         );
-        assert!(rendered.contains("index: /data/projects.json (2 projects)"));
+        assert!(rendered.contains("index: /data/projects.db (2 projects)"));
         assert!(rendered.contains("issues (2):"));
         assert!(rendered.contains("stale: `gone` -> /tmp/gone"));
         assert!(rendered.contains("quarantine: /data/projects.json.corrupt-1"));

@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::paths;
-use crate::store::Store;
-use crate::store::json::JsonStore;
+use crate::store::json::read_legacy;
 use crate::store::sqlite::SqliteStore;
 
 /// What [`run`] did.
@@ -42,8 +41,7 @@ pub fn run(data_dir: &Path) -> Result<Outcome> {
         return Err(Error::NothingToMigrate(json_path));
     }
 
-    let json = JsonStore::new(json_path.clone());
-    let projects = json.load()?;
+    let projects = read_legacy(&json_path)?;
     let count = projects.len();
 
     SqliteStore::new(db_path).save(&projects)?;
@@ -56,10 +54,23 @@ pub fn run(data_dir: &Path) -> Result<Outcome> {
     })
 }
 
+/// The startup one-shot: migrates a `projects.json` left by 0.2.0 before any
+/// command touches the index. `None` when there is nothing to migrate.
+///
+/// A corrupt legacy file is quarantined by [`read_legacy`] and the error is
+/// returned; a clash with a populated database is [`Error::MigrationClash`].
+pub fn auto(data_dir: &Path) -> Result<Option<Outcome>> {
+    if !paths::store_file(data_dir).exists() {
+        return Ok(None);
+    }
+    run(data_dir).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::project::Project;
+    use crate::store::json::StoreFile;
 
     fn directory() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
@@ -70,9 +81,41 @@ mod tests {
     }
 
     fn write_json(dir: &Path, projects: &[Project]) {
-        JsonStore::new(paths::store_file(dir))
-            .save(projects)
-            .expect("write json");
+        let body =
+            serde_json::to_string_pretty(&StoreFile::new(projects.to_vec())).expect("encode index");
+        crate::paths::write_private(&paths::store_file(dir), body.as_bytes()).expect("write json");
+    }
+
+    #[test]
+    fn auto_does_nothing_without_a_legacy_index() {
+        let dir = directory();
+        assert!(
+            auto(dir.path()).expect("auto is quiet").is_none(),
+            "no json, no migration"
+        );
+    }
+
+    #[test]
+    fn auto_migrates_a_legacy_index_once() {
+        let dir = directory();
+        write_json(dir.path(), &[project("alpha"), project("beta")]);
+
+        let outcome = auto(dir.path())
+            .expect("auto migrates")
+            .expect("an outcome");
+        assert!(matches!(outcome, Outcome::Migrated { projects: 2, .. }));
+        assert!(
+            !paths::store_file(dir.path()).exists(),
+            "the live json moves aside"
+        );
+        assert!(
+            auto(dir.path()).expect("second run").is_none(),
+            "the second run has nothing to do"
+        );
+        let loaded = SqliteStore::new(paths::sqlite_file(dir.path()))
+            .load()
+            .expect("load migrated database");
+        assert_eq!(loaded.len(), 2);
     }
 
     #[test]

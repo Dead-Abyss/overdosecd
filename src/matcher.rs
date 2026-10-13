@@ -153,7 +153,7 @@ impl Reason {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Match {
     pub index: usize,
     pub name: String,
@@ -166,7 +166,7 @@ pub struct Match {
 }
 
 /// One term's contribution to a [`Match`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TermHit {
     pub term: String,
     pub reason: Reason,
@@ -199,6 +199,69 @@ impl Match {
     }
 }
 
+/// The lowercased view of a project that every signal compares against,
+/// computed once per candidate and query instead of once per term.
+struct Lowered {
+    name: String,
+    aliases: Vec<String>,
+    tags: Vec<String>,
+    /// The `owner/repo` slug of the stored remote, already lowercased.
+    repo: Option<(String, String)>,
+}
+
+impl Lowered {
+    fn new(project: &Project) -> Self {
+        Self {
+            name: project.name.to_lowercase(),
+            aliases: project
+                .aliases
+                .iter()
+                .map(|alias| alias.to_lowercase())
+                .collect(),
+            tags: project.tags.iter().map(|tag| tag.to_lowercase()).collect(),
+            repo: project
+                .git
+                .as_ref()
+                .and_then(|git| git.remote_url.as_deref())
+                .and_then(crate::git::slug_from_url),
+        }
+    }
+}
+
+/// The one fuzzy matcher every path shares. `SkimMatcherV2` is stateless for
+/// scoring, so a single instance serves every call; the picker's hot paths
+/// used to construct one per row per frame.
+pub(crate) fn skim() -> &'static SkimMatcherV2 {
+    static MATCHER: std::sync::LazyLock<SkimMatcherV2> =
+        std::sync::LazyLock::new(|| SkimMatcherV2::default().smart_case());
+    &MATCHER
+}
+
+/// A scored candidate before its name and path are materialized. The
+/// tie-break compares precomputed lowercase names, and callers that only need
+/// the order never pay for the clones [`Match`] carries.
+struct Scored {
+    index: usize,
+    score: i64,
+    reason: Reason,
+    terms: Vec<TermHit>,
+    name_lower: String,
+}
+
+impl Scored {
+    fn into_match(self, projects: &[Project]) -> Match {
+        let project = &projects[self.index];
+        Match {
+            index: self.index,
+            name: project.name.clone(),
+            path: project.path.clone(),
+            score: self.score,
+            reason: self.reason,
+            terms: self.terms,
+        }
+    }
+}
+
 /// Ranks every project that matches `query`, best first.
 ///
 /// A single-term query takes the original path exactly. A multi-term query
@@ -206,28 +269,28 @@ impl Match {
 /// signals with the bonuses applied once — unless the *whole* query scores
 /// higher as one term, which is how project names containing spaces keep
 /// matching exactly.
-pub fn rank(query: &str, projects: &[Project], config: &MatcherConfig) -> Vec<Match> {
+fn rank_scored(query: &str, projects: &[Project], config: &MatcherConfig) -> Vec<Scored> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return Vec::new();
     }
     let terms: Vec<&str> = query.split_whitespace().collect();
 
-    let matcher = SkimMatcherV2::default().smart_case();
+    let matcher = skim();
     let now = Utc::now();
 
-    let mut matches: Vec<Match> = projects
+    let mut matches: Vec<Scored> = projects
         .iter()
         .enumerate()
         .filter_map(|(index, project)| {
-            score_query(&query, &terms, project, config, &matcher, now).map(
-                |(score, reason, terms)| Match {
+            let lowered = Lowered::new(project);
+            score_query(&query, &terms, project, &lowered, config, matcher, now).map(
+                |(score, reason, terms)| Scored {
                     index,
-                    name: project.name.clone(),
-                    path: project.path.clone(),
                     score,
                     reason,
                     terms,
+                    name_lower: lowered.name,
                 },
             )
         })
@@ -236,10 +299,31 @@ pub fn rank(query: &str, projects: &[Project], config: &MatcherConfig) -> Vec<Ma
     matches.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name_lower.cmp(&b.name_lower))
     });
 
     matches
+}
+
+/// [`rank_scored`] with each winner's name and path materialized.
+pub fn rank(query: &str, projects: &[Project], config: &MatcherConfig) -> Vec<Match> {
+    rank_scored(query, projects, config)
+        .into_iter()
+        .map(|scored| scored.into_match(projects))
+        .collect()
+}
+
+/// The display order of the matching projects, for the picker's hot path:
+/// the same ranking as [`rank`], without materializing any [`Match`].
+pub(crate) fn rank_indices(
+    query: &str,
+    projects: &[Project],
+    config: &MatcherConfig,
+) -> Vec<usize> {
+    rank_scored(query, projects, config)
+        .into_iter()
+        .map(|scored| scored.index)
+        .collect()
 }
 
 /// The shell-completion candidates for `prefix`: project names, aliases, and
@@ -279,7 +363,7 @@ pub fn highlight_indices(query: &str, text: &str) -> Vec<usize> {
     if query.is_empty() || text.is_empty() {
         return Vec::new();
     }
-    let matcher = SkimMatcherV2::default().smart_case();
+    let matcher = skim();
     let mut indices: Vec<usize> = Vec::new();
     for term in query.split_whitespace() {
         if let Some((_, mut term_indices)) = matcher.fuzzy_indices(text, term) {
@@ -298,24 +382,64 @@ pub fn best(query: &str, projects: &[Project], config: &MatcherConfig) -> Result
         return Err(Error::EmptyIndex);
     }
 
-    let mut ranked = rank(query, projects, config);
+    best_of(
+        query,
+        rank_scored(query, projects, config),
+        projects,
+        config.ambiguity_margin,
+    )
+}
+
+/// Chooses the winner from an already-computed ranking, materializing only
+/// what is returned: the winner, or the first [`MAX_CANDIDATES`] on
+/// ambiguity.
+fn best_of(query: &str, scored: Vec<Scored>, projects: &[Project], margin: i64) -> Result<Match> {
+    if scored.is_empty() {
+        return Err(Error::NoMatch(query.trim().to_owned()));
+    }
+
+    let ambiguous = scored
+        .get(1)
+        .is_some_and(|second| scored[0].score - second.score <= margin);
+    if ambiguous {
+        return Err(Error::Ambiguous {
+            query: query.trim().to_owned(),
+            candidates: Candidates(
+                scored
+                    .into_iter()
+                    .take(MAX_CANDIDATES)
+                    .map(|scored| scored.into_match(projects))
+                    .collect(),
+            ),
+        });
+    }
+
+    Ok(scored
+        .into_iter()
+        .next()
+        .expect("the ranking is not empty")
+        .into_match(projects))
+}
+
+/// [`best_of`] for a caller that already holds the materialized ranking (the
+/// `--debug` listing), so a command ranks the index once.
+pub(crate) fn best_of_ranked(query: &str, mut ranked: Vec<Match>, margin: i64) -> Result<Match> {
     if ranked.is_empty() {
         return Err(Error::NoMatch(query.trim().to_owned()));
     }
 
-    let top = ranked.remove(0);
     let ambiguous = ranked
-        .first()
-        .is_some_and(|second| top.score - second.score <= config.ambiguity_margin);
+        .get(1)
+        .is_some_and(|second| ranked[0].score - second.score <= margin);
     if ambiguous {
-        ranked.insert(0, top.clone());
+        ranked.truncate(MAX_CANDIDATES);
         return Err(Error::Ambiguous {
             query: query.trim().to_owned(),
-            candidates: Candidates(ranked.into_iter().take(MAX_CANDIDATES).collect()),
+            candidates: Candidates(ranked),
         });
     }
 
-    Ok(top)
+    Ok(ranked.swap_remove(0))
 }
 
 fn improve(best: &mut Option<(i64, Reason)>, score: i64, reason: Reason) {
@@ -330,19 +454,21 @@ fn current(best: &Option<(i64, Reason)>) -> i64 {
     best.as_ref().map_or(i64::MIN, |(score, _)| *score)
 }
 
-/// The signals one term fires for a project, before the bonuses.
+/// The signals one term fires for a project, before the bonuses. Comparisons
+/// use the precomputed [`Lowered`] view so each string is lowercased once per
+/// query instead of once per term.
 fn signal_score(
     query: &str,
     project: &Project,
+    lowered: &Lowered,
     config: &MatcherConfig,
     matcher: &SkimMatcherV2,
 ) -> Option<(i64, Reason)> {
     let mut best: Option<(i64, Reason)> = None;
 
-    let name = project.name.to_lowercase();
-    if name == query {
+    if lowered.name == query {
         improve(&mut best, EXACT_NAME, Reason::ExactName);
-    } else if name.starts_with(query) {
+    } else if lowered.name.starts_with(query) {
         improve(&mut best, NAME_PREFIX, Reason::NamePrefix);
     }
     // Each fuzzy signal is skipped once the running best exceeds its hard
@@ -352,7 +478,7 @@ fn signal_score(
     // prefix, alias, and tag paths.
     if config.fuzzy
         && current(&best) < FUZZY_NAME_BASE + FUZZY_NAME_MAX
-        && let Some(raw) = matcher.fuzzy_match(&name, query)
+        && let Some(raw) = matcher.fuzzy_match(&lowered.name, query)
     {
         improve(
             &mut best,
@@ -361,8 +487,7 @@ fn signal_score(
         );
     }
 
-    for alias in &project.aliases {
-        let alias = alias.to_lowercase();
+    for alias in &lowered.aliases {
         if alias == query {
             improve(&mut best, EXACT_ALIAS, Reason::ExactAlias);
         } else if alias.starts_with(query) {
@@ -370,7 +495,7 @@ fn signal_score(
         }
         if config.fuzzy
             && current(&best) < FUZZY_ALIAS_BASE + FUZZY_ALIAS_MAX
-            && let Some(raw) = matcher.fuzzy_match(&alias, query)
+            && let Some(raw) = matcher.fuzzy_match(alias, query)
         {
             improve(
                 &mut best,
@@ -380,7 +505,7 @@ fn signal_score(
         }
     }
 
-    if project.tags.iter().any(|tag| tag.to_lowercase() == query) {
+    if lowered.tags.iter().any(|tag| tag == query) {
         improve(&mut best, TAG_EXACT, Reason::Tag);
     }
 
@@ -395,17 +520,14 @@ fn signal_score(
         );
     }
 
-    if let Some(git) = &project.git
-        && let Some(url) = git.remote_url.as_deref()
-        && let Some((owner, repo)) = crate::git::slug_from_url(url)
-    {
+    if let Some((owner, repo)) = &lowered.repo {
         if repo == query {
             improve(&mut best, EXACT_REPO, Reason::GitRepoExact);
         } else if repo.starts_with(query) {
             improve(&mut best, REPO_PREFIX, Reason::GitRepoPrefix);
         } else if config.fuzzy
             && current(&best) < FUZZY_REPO_BASE + FUZZY_REPO_MAX
-            && let Some(raw) = matcher.fuzzy_match(&repo, query)
+            && let Some(raw) = matcher.fuzzy_match(repo, query)
         {
             improve(
                 &mut best,
@@ -447,12 +569,13 @@ fn score_query(
     query: &str,
     terms: &[&str],
     project: &Project,
+    lowered: &Lowered,
     config: &MatcherConfig,
     matcher: &SkimMatcherV2,
     now: DateTime<Utc>,
 ) -> Option<(i64, Reason, Vec<TermHit>)> {
     if let [term] = terms {
-        let (signal, reason) = signal_score(term, project, config, matcher)?;
+        let (signal, reason) = signal_score(term, project, lowered, config, matcher)?;
         return Some((
             apply_bonuses(signal, project, config, now),
             reason,
@@ -464,12 +587,13 @@ fn score_query(
         ));
     }
 
-    let whole = signal_score(query, project, config, matcher).map(|(signal, reason)| TermHit {
-        term: query.to_owned(),
-        reason,
-        signal,
-    });
-    let and = and_terms(terms, project, config, matcher);
+    let whole =
+        signal_score(query, project, lowered, config, matcher).map(|(signal, reason)| TermHit {
+            term: query.to_owned(),
+            reason,
+            signal,
+        });
+    let and = and_terms(terms, project, lowered, config, matcher);
 
     let hits = match (whole, and) {
         (Some(whole), Some(and)) => {
@@ -501,12 +625,13 @@ fn score_query(
 fn and_terms(
     terms: &[&str],
     project: &Project,
+    lowered: &Lowered,
     config: &MatcherConfig,
     matcher: &SkimMatcherV2,
 ) -> Option<Vec<TermHit>> {
     let mut hits = Vec::with_capacity(terms.len());
     for term in terms {
-        let (signal, reason) = signal_score(term, project, config, matcher)?;
+        let (signal, reason) = signal_score(term, project, lowered, config, matcher)?;
         hits.push(TermHit {
             term: (*term).to_owned(),
             reason,
@@ -1036,6 +1161,16 @@ mod tests {
         };
         let err = super::best("app o", &projects, &strict).expect_err("ambiguous");
         assert!(matches!(err, Error::Ambiguous { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn built_in_defaults_match_the_config_defaults() {
+        // The cfg(test) constant and `config::Matching::default()` are two
+        // spellings of the same numbers; this fails the moment they drift.
+        assert_eq!(
+            MatcherConfig::DEFAULT,
+            MatcherConfig::from(&crate::config::Matching::default())
+        );
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub struct Layout {
     xdg_config: Option<PathBuf>,
 }
 
+/// The application segment of every overdosecd path.
+const APP: &str = "overdosecd";
+
 impl Layout {
     /// Reads the process environment; `None` when no home directory can be
     /// determined.
@@ -43,16 +46,16 @@ impl Layout {
     }
 
     /// The per-application data directory (`projects.json` lives here).
-    pub fn data_dir(&self, app: &str) -> PathBuf {
-        self.base_data().join(app)
+    pub fn data_dir(&self) -> PathBuf {
+        self.base_data().join(APP)
     }
 
     /// The per-application config directory (`config.toml` lives here).
-    pub fn config_dir(&self, app: &str) -> PathBuf {
+    pub fn config_dir(&self) -> PathBuf {
         self.xdg_config
             .clone()
             .unwrap_or_else(|| self.home.join(".config"))
-            .join(app)
+            .join(APP)
     }
 
     /// The base local data directory, without an application segment; this is
@@ -76,12 +79,12 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// `~/.local/share/overdosecd`.
 pub fn data_dir() -> Option<PathBuf> {
-    Layout::discover().map(|layout| layout.data_dir("overdosecd"))
+    Layout::discover().map(|layout| layout.data_dir())
 }
 
 /// The overdosecd config directory (`~/.config/overdosecd`).
 pub fn config_dir() -> Option<PathBuf> {
-    Layout::discover().map(|layout| layout.config_dir("overdosecd"))
+    Layout::discover().map(|layout| layout.config_dir())
 }
 
 /// The local data directory used by third-party tools such as zoxide.
@@ -123,11 +126,11 @@ mod tests {
     fn layout_matches_the_documented_paths() {
         let layout = Layout::for_test(PathBuf::from("/home/user"));
         assert_eq!(
-            layout.data_dir("overdosecd"),
+            layout.data_dir(),
             PathBuf::from("/home/user/.local/share/overdosecd")
         );
         assert_eq!(
-            layout.config_dir("overdosecd"),
+            layout.config_dir(),
             PathBuf::from("/home/user/.config/overdosecd")
         );
         assert_eq!(
@@ -140,12 +143,9 @@ mod tests {
             xdg_config: Some(PathBuf::from("/xdg/config")),
             ..Layout::for_test(PathBuf::from("/home/user"))
         };
+        assert_eq!(with_xdg.data_dir(), PathBuf::from("/xdg/data/overdosecd"));
         assert_eq!(
-            with_xdg.data_dir("overdosecd"),
-            PathBuf::from("/xdg/data/overdosecd")
-        );
-        assert_eq!(
-            with_xdg.config_dir("overdosecd"),
+            with_xdg.config_dir(),
             PathBuf::from("/xdg/config/overdosecd")
         );
     }

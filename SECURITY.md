@@ -7,8 +7,8 @@ branch is the development line and is expected to be releasable at any time.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | ✅        |
-| < 0.1   | ❌        |
+| 0.3.x   | ✅        |
+| < 0.3   | ❌        |
 
 ## Reporting a vulnerability
 
@@ -30,10 +30,10 @@ attack surfaces are all local:
   files are written. Config includes are followed under fixed caps (eight
   files, regular files only) and can steer only the sanitized remote display
   and the bare-repository heuristic, never a write path.
-- **(b) A corrupted or planted data directory.** The index, the SQLite
-  database, the home cache, and the visit counters are loaded from disk and
-  can predate the current guards. A value read from them is untrusted exactly
-  like a value typed on the command line.
+- **(b) A corrupted or planted data directory.** The database, the home cache,
+  and the visit counters are loaded from disk and can predate the current
+  guards. A value read from them is untrusted exactly like a value typed on
+  the command line.
 - **(c) Another local user.** The data directory is created `0700` and the
   store files `0600`, so a second user cannot read the index or plant files
   beside it. If those modes are lost, `doctor` reports it and store opens
@@ -47,15 +47,27 @@ attack surfaces are all local:
   controls, and never-visible characters, machine output (`goto`'s stdout,
   completion candidates) refuses them outright, and the output funnel rejects
   any escape sequence that is not one of overdosecd's own colour changes. A
-  project name, alias, tag, path, branch, or remote added by any route — typed,
-  imported, or selected in the picker — obeys the same rule.
+  project name, alias, tag, note, path, branch, or remote added by any route —
+  typed, imported, or selected in the picker — obeys the same rule.
+- **(f) Entry profiles.** `overdosecd profile` and the wrapper's `enter` step
+  turn a stored value into shell code the wrapper evaluates. The boundary:
+  profiles are explicit and user-authored — nothing imported or scanned can
+  register one; the `[general] hooks` switch defaults to **off**, so a jump
+  never evaluates a profile until the user asks for it; a command is shown on
+  stderr before it runs; variable names must be shell identifiers and values
+  and commands pass the control-character guard both when written and when
+  rendered. A profile a planted database smuggles in is still arbitrary
+  shell — the switch, explicit authoring, and the display-before-run notice
+  are what keep that boundary, per the out-of-scope note below.
 
 ### Out of scope
 
 - An attacker who can already write to the `0700` data directory owns the
   index by design (they can index any path). The link and mode checks raise
   the cost of turning that into a jump to an attacker-chosen directory, they
-  do not make it impossible.
+  do not make it impossible; with `[general] hooks` on, a database write is
+  code execution on the next wrapper jump, which is why the switch is
+  explicit, off by default, and per-project profiles are shown as they run.
 - `overdosecd import` reads third-party stores the user points it at; importing
   a store the user chose is an explicit, documented action.
 - Denial of service that requires active racing against the user's own
@@ -75,9 +87,13 @@ The rules that keep the guarantees above are recorded in
   files are never opened through a symbolic link.
 - Every read of a file that arrives from outside the tool is capped and
   requires a regular file.
-- `projects.json` and `projects.db` are written atomically and privately;
-  corrupt files are quarantined, never wiped, and two events in the same
-  second cannot overwrite the first backup.
+- `projects.db` is written through one transaction at a time and created
+  privately (`0600`); a legacy `projects.json` is moved aside once, never
+  wiped, and a corrupt file is quarantined so two events in the same second
+  cannot overwrite the first backup.
+- `enter` emits only quoted values it validated, and refuses — never escapes —
+  a profile it cannot render; `[general] hooks` gates it, and a jump's exit
+  status never depends on it.
 
 ## Supply chain
 

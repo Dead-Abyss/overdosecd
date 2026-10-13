@@ -111,6 +111,19 @@ pub enum Command {
         action: TermCommand,
     },
 
+    /// Manage a project's notes: one-line memory aids shown by `info`
+    Note {
+        #[command(subcommand)]
+        action: NoteCommand,
+    },
+
+    /// Manage a project's entry profile: variables and a command applied when
+    /// the `ocd` wrapper jumps in ([general] hooks)
+    Profile {
+        #[command(subcommand)]
+        action: ProfileCommand,
+    },
+
     /// Check the index for problems and repair stale projects
     Doctor(DoctorArgs),
 
@@ -142,6 +155,17 @@ pub enum Command {
     /// Record a jump for the current directory (used by the optional cd hook)
     #[command(hide = true)]
     Hook,
+
+    /// Apply a project's entry profile (used by the ocd wrapper)
+    #[command(hide = true)]
+    Enter {
+        /// Shell the wrapper will evaluate the output with
+        #[arg(value_enum)]
+        shell: Shell,
+
+        /// The directory the wrapper just cd'd into
+        path: PathBuf,
+    },
 }
 
 /// The sub-actions `alias` and `tag` share; the parent command picks the
@@ -162,6 +186,90 @@ pub enum TermCommand {
         project: String,
         /// Alias or tag to remove
         term: String,
+    },
+}
+
+/// The `note` sub-actions; notes are single lines, shown in order.
+#[derive(Debug, Subcommand)]
+pub enum NoteCommand {
+    /// Append a note to a project
+    Add {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+        /// The note text (one line)
+        text: String,
+    },
+
+    /// List a project's notes, numbered
+    List {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+    },
+
+    /// Remove a note by its number in `note list`
+    Remove {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+        /// The note's number (1-based), as shown by `note list`
+        index: usize,
+    },
+}
+
+/// The `profile` sub-actions: what `enter` applies on a wrapper jump.
+#[derive(Debug, Subcommand)]
+pub enum ProfileCommand {
+    /// Manage exported environment variables
+    Env {
+        #[command(subcommand)]
+        action: ProfileEnvCommand,
+    },
+
+    /// Manage the run-on-enter command
+    Run {
+        #[command(subcommand)]
+        action: ProfileRunCommand,
+    },
+
+    /// Show a project's profile
+    Show {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfileEnvCommand {
+    /// Add or update a variable
+    Add {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+        /// KEY=VALUE
+        assignment: String,
+    },
+
+    /// Remove a variable
+    Remove {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+        /// Variable name
+        key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfileRunCommand {
+    /// Set the command
+    Set {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+        /// Command to run on entering the project (one line)
+        command: String,
+    },
+
+    /// Clear the command
+    Clear {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
     },
 }
 

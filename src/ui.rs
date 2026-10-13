@@ -32,7 +32,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
-use crate::config::{ColorMode, MouseMode, StorageBackend, Ui};
+use crate::config::{ColorMode, MouseMode, Ui};
 use crate::discovery::{self, Dir};
 use crate::doctor::{self, Issue, Repair};
 use crate::error::{Error, Result};
@@ -42,7 +42,7 @@ use crate::migrate;
 use crate::output;
 use crate::project::{self, TermKind};
 use crate::sanitize;
-use crate::store::Store;
+use crate::store::sqlite::SqliteStore;
 
 use self::picker::{IssueRow, Outcome, Picker, RunAction, StaleRef};
 
@@ -83,12 +83,10 @@ impl Options {
     }
 }
 
-/// What the picker cannot know on its own: where the index lives, which
-/// backend is active (for the health view and `migrate`), and how the home
-/// fallback should behave.
+/// What the picker cannot know on its own: where the index lives, and how
+/// the home fallback should behave.
 pub struct Context<'a> {
     pub data_dir: &'a Path,
-    pub backend: StorageBackend,
     pub discovery: &'a crate::config::Discovery,
 }
 
@@ -101,7 +99,7 @@ enum Selected {
 /// Runs the picker and returns the process exit code: `0` after a jump (the
 /// path is on stdout by then), `1` when the user cancels.
 pub fn run(
-    store: &impl Store,
+    store: &SqliteStore,
     context: &Context,
     matching: &MatcherConfig,
     color: ColorMode,
@@ -157,7 +155,7 @@ pub fn run(
 
 /// Renders the picker until Enter selects a project or the user cancels.
 fn pick(
-    store: &impl Store,
+    store: &SqliteStore,
     context: &Context,
     picker: &mut Picker,
     home: Option<&Path>,
@@ -182,15 +180,22 @@ fn pick(
         signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
     }
 
+    let mut dirty = true;
     loop {
         if interrupted.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        session
-            .terminal
-            .draw(|frame| render::draw(frame, picker, home, color, options.border))?;
-        refresh_details(store, picker);
-        load_home(context, picker, &mut scanner);
+        // Redraw only when something visible changed: the pane/status updates
+        // below report whether they touched the picker, and every event
+        // marks the screen dirty. Poll timeouts alone repaint nothing.
+        dirty |= refresh_details(store, picker);
+        dirty |= load_home(context, picker, &mut scanner);
+        if dirty {
+            session
+                .terminal
+                .draw(|frame| render::draw(frame, picker, home, color, options.border))?;
+            dirty = false;
+        }
 
         // Wake up to pick up a finished scan or a signal; otherwise block
         // until there is input.
@@ -202,6 +207,7 @@ fn pick(
         if !event::poll(timeout)? {
             continue;
         }
+        dirty = true;
 
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => match picker.handle_key(key) {
@@ -223,12 +229,13 @@ fn pick(
 }
 
 /// Loads the home-directory cache when the picker needs it, and refreshes it
-/// in the background when it is older than the configured TTL.
+/// in the background when it is older than the configured TTL. Returns
+/// whether the picker changed and the screen must be redrawn.
 fn load_home(
     context: &Context,
     picker: &mut Picker,
     scanner: &mut Option<mpsc::Receiver<Vec<Dir>>>,
-) {
+) -> bool {
     // A finished background scan wins over anything else.
     if let Some(receiver) = scanner {
         match receiver.try_recv() {
@@ -245,17 +252,17 @@ fn load_home(
                     picker.set_status("home search updated", false);
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Empty) => return false,
             Err(mpsc::TryRecvError::Disconnected) => {
                 *scanner = None;
                 picker.set_status("home scan failed", true);
             }
         }
-        return;
+        return true;
     }
 
     if !picker.needs_home() {
-        return;
+        return false;
     }
 
     let cache_path = discovery::cache_path(context.data_dir);
@@ -275,6 +282,7 @@ fn load_home(
             start_scan(context, picker, scanner);
         }
     }
+    true
 }
 
 /// Starts a background scan; the result is picked up by [`load_home`].
@@ -304,10 +312,10 @@ fn drop_data_dir(dirs: Vec<Dir>, data_dir: &Path) -> Vec<Dir> {
 }
 
 /// Fetches the live data the detail pane shows (branch, recent jumps) when
-/// the highlighted project changed.
-fn refresh_details(store: &impl Store, picker: &mut Picker) {
+/// the highlighted project changed; returns whether it did.
+fn refresh_details(store: &SqliteStore, picker: &mut Picker) -> bool {
     let Some(id) = picker.details_request() else {
-        return;
+        return false;
     };
     let branch = picker
         .projects()
@@ -316,12 +324,13 @@ fn refresh_details(store: &impl Store, picker: &mut Picker) {
         .and_then(|project| git::current_branch(&project.path).map(git::Branch::label));
     let history = store.recent_uses(&id, 5).unwrap_or_default();
     picker.set_details_info(id, branch, history);
+    true
 }
 
 /// Executes one run action; `Ok(Some(selected))` means the picker should exit
 /// with that selection.
 fn apply(
-    store: &impl Store,
+    store: &SqliteStore,
     context: &Context,
     picker: &mut Picker,
     home: Option<&Path>,
@@ -407,7 +416,7 @@ fn batch_message(verb: &str, applied: usize, ids: &[String], single_name: &str) 
 }
 
 /// Pins or unpins every id in one update, reporting partial applications.
-fn pin(store: &impl Store, picker: &mut Picker, ids: &[String], pinned: bool) {
+fn pin(store: &SqliteStore, picker: &mut Picker, ids: &[String], pinned: bool) {
     let result = store.update(|projects| {
         let mut applied = 0;
         for id in ids {
@@ -433,17 +442,12 @@ fn pin(store: &impl Store, picker: &mut Picker, ids: &[String], pinned: bool) {
 }
 
 /// Removes every id in one update.
-fn remove(store: &impl Store, picker: &mut Picker, ids: &[String]) {
-    let result = store.update(|projects| {
-        let mut applied = 0;
-        for id in ids {
-            if let Some(position) = projects.iter().position(|project| &project.id == id) {
-                projects.remove(position);
-                applied += 1;
-            }
-        }
-        Ok(applied)
-    });
+fn remove(store: &SqliteStore, picker: &mut Picker, ids: &[String]) {
+    let repairs: Vec<Repair> = ids
+        .iter()
+        .map(|id| Repair::Remove { id: id.clone() })
+        .collect();
+    let result = store.update(move |projects| Ok(doctor::apply_repairs(projects, &repairs)));
 
     match result {
         Ok(applied) => {
@@ -457,7 +461,7 @@ fn remove(store: &impl Store, picker: &mut Picker, ids: &[String]) {
 
 /// Renames one project; a name collision asks for the force confirmation
 /// instead of failing.
-fn rename(store: &impl Store, picker: &mut Picker, id: String, name: String, force: bool) {
+fn rename(store: &SqliteStore, picker: &mut Picker, id: String, name: String, force: bool) {
     let name = match project::sanitize_value("project name", &name) {
         Ok(name) => name,
         Err(err) => {
@@ -499,7 +503,7 @@ fn rename(store: &impl Store, picker: &mut Picker, id: String, name: String, for
 
 /// Adds or removes an alias / tag on one project.
 fn set_term(
-    store: &impl Store,
+    store: &SqliteStore,
     picker: &mut Picker,
     kind: TermKind,
     id: &str,
@@ -531,7 +535,7 @@ fn set_term(
 }
 
 /// Moves a stale project to a validated new path.
-fn repath(store: &impl Store, picker: &mut Picker, id: &str, raw: &str, home: Option<&Path>) {
+fn repath(store: &SqliteStore, picker: &mut Picker, id: &str, raw: &str, home: Option<&Path>) {
     let projects = picker.projects().to_vec();
     let path = match doctor::validate_target(&projects, id, raw, home) {
         Ok(path) => path,
@@ -563,7 +567,7 @@ fn repath(store: &impl Store, picker: &mut Picker, id: &str, raw: &str, home: Op
 /// Runs the read-only doctor checks and shows them as a list.
 fn health(context: &Context, picker: &mut Picker) {
     let home = project::home_dir();
-    let issues = doctor::inspect(context.data_dir, context.backend, picker.projects());
+    let issues = doctor::inspect(context.data_dir, picker.projects());
     let rows: Vec<IssueRow> = issues
         .issues
         .iter()
@@ -606,18 +610,13 @@ fn issue_row(issue: &Issue, home: Option<&Path>) -> IssueRow {
             "leftover SQLite file: {}",
             output::shorten_home(path, home)
         )),
-        Issue::BackendDisagreement {
-            json,
-            db,
-            differing,
-        } => informational(format!(
-            "projects.json and projects.db disagree: {differing} differing ids ({json} vs {db})"
+        Issue::LegacyJson { path } => informational(format!(
+            "not migrated (projects.db already holds projects): {}",
+            output::shorten_home(path, home)
         )),
-        Issue::InactiveIndexUnreadable { path, message } => informational(format!(
-            "cannot read {}: {}",
-            output::shorten_home(path, home),
-            sanitize::text(message)
-        )),
+        Issue::DeprecatedStorageKey => {
+            informational("`[storage] backend` in the config is ignored".to_owned())
+        }
         Issue::IndexPermissions { path, mode } => informational(format!(
             "index mode is {mode:o}, expected 600: {}",
             output::shorten_home(path, home)
@@ -662,10 +661,7 @@ fn migrate_index(context: &Context, picker: &mut Picker) {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| backup.display().to_string());
             picker.set_status(
-                format!(
-                    "migrated {projects} projects to projects.db (kept as {backup_name}); \
-                     set backend = \"sqlite\" and restart"
-                ),
+                format!("migrated {projects} projects to projects.db (kept as {backup_name})"),
                 false,
             );
         }
@@ -678,7 +674,7 @@ fn migrate_index(context: &Context, picker: &mut Picker) {
 }
 
 /// Replaces the in-memory index from the store.
-fn reload(store: &impl Store, picker: &mut Picker, preserve: Option<&str>) {
+fn reload(store: &SqliteStore, picker: &mut Picker, preserve: Option<&str>) {
     match store.load() {
         Ok(projects) => picker.set_projects(projects, preserve),
         Err(err) => picker.set_status(error_status(&err), true),
@@ -734,7 +730,7 @@ fn viewport_height(configured: u16, rows: u16) -> u16 {
 
 /// Adds `input` through the store and shows the result. On failure the add
 /// prompt stays open so the path can be fixed.
-fn add_project(store: &impl Store, picker: &mut Picker, input: &str) {
+fn add_project(store: &SqliteStore, picker: &mut Picker, input: &str) {
     let (message, name) = match add_path(store, input) {
         Ok(added) => added,
         Err(err) => {
@@ -756,7 +752,7 @@ fn add_project(store: &impl Store, picker: &mut Picker, input: &str) {
 
 /// Expands `input` (leading `~` included), checks that it is an existing
 /// directory, and inserts it; returns the message and the project name.
-fn add_path(store: &impl Store, input: &str) -> Result<(String, String)> {
+fn add_path(store: &SqliteStore, input: &str) -> Result<(String, String)> {
     let canonical = project::require_dir(Path::new(input.trim()), project::home_dir().as_deref())?;
     let name = project::default_name(&canonical)?;
 
@@ -873,48 +869,18 @@ impl Drop for PendingRestore {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
-    use chrono::DateTime;
-
     use super::*;
     use crate::project::Project;
     use crate::ui::picker::{Mode, Picker};
 
-    /// In-memory [`Store`] for exercising the picker's mutations without a
-    /// data directory.
-    struct FakeStore {
-        projects: RefCell<Vec<Project>>,
-    }
-
-    impl FakeStore {
-        fn new(projects: Vec<Project>) -> Self {
-            Self {
-                projects: RefCell::new(projects),
-            }
-        }
-    }
-
-    impl Store for FakeStore {
-        fn load(&self) -> Result<Vec<Project>> {
-            Ok(self.projects.borrow().clone())
-        }
-
-        fn update<R>(&self, f: impl FnOnce(&mut Vec<Project>) -> Result<R>) -> Result<R> {
-            f(&mut self.projects.borrow_mut())
-        }
-
-        fn record_use(&self, _id: &str, _now: DateTime<Utc>) -> Result<()> {
-            Ok(())
-        }
-
-        fn recent_uses(&self, _id: &str, _limit: usize) -> Result<Vec<DateTime<Utc>>> {
-            Ok(Vec::new())
-        }
-
-        fn schema_version(&self) -> Result<Option<u32>> {
-            Ok(None)
-        }
+    /// A fresh database seeded with `projects`, and the tempdir keeping it
+    /// alive; SQLite is the only backend, so the tests run against a real
+    /// store instead of an in-memory double.
+    fn store_with(projects: Vec<Project>) -> (SqliteStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::new(dir.path().join("projects.db"));
+        store.save(&projects).expect("seed the store");
+        (store, dir)
     }
 
     fn project(name: &str, path: &str) -> Project {
@@ -984,7 +950,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("alpha");
         std::fs::create_dir_all(&target).expect("create the target directory");
-        let store = FakeStore::new(Vec::new());
+        let (store, _dir) = store_with(Vec::new());
 
         let (message, name) =
             add_path(&store, target.to_str().expect("utf-8 temp path")).expect("add");
@@ -999,7 +965,7 @@ mod tests {
     #[test]
     fn add_path_rejects_missing_and_duplicate_paths() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = FakeStore::new(Vec::new());
+        let (store, _dir) = store_with(Vec::new());
 
         let missing = dir.path().join("missing");
         let err = add_path(&store, missing.to_str().unwrap()).expect_err("missing path");
@@ -1020,7 +986,7 @@ mod tests {
 
     #[test]
     fn pin_updates_the_store_and_follows_the_row() {
-        let store = FakeStore::new(vec![
+        let (store, _dir) = store_with(vec![
             project("alpha", "/x/alpha"),
             project("beta", "/x/beta"),
         ]);
@@ -1045,7 +1011,7 @@ mod tests {
 
     #[test]
     fn pin_reports_partial_batches() {
-        let store = FakeStore::new(vec![
+        let (store, _dir) = store_with(vec![
             project("alpha", "/x/alpha"),
             project("beta", "/x/beta"),
         ]);
@@ -1065,7 +1031,7 @@ mod tests {
 
     #[test]
     fn remove_deletes_the_ids_and_reloads() {
-        let store = FakeStore::new(vec![
+        let (store, _dir) = store_with(vec![
             project("alpha", "/x/alpha"),
             project("beta", "/x/beta"),
             project("gamma", "/x/gamma"),
@@ -1084,7 +1050,7 @@ mod tests {
 
     #[test]
     fn rename_reports_a_collision_and_force_renames() {
-        let store = FakeStore::new(vec![
+        let (store, _dir) = store_with(vec![
             project("alpha", "/x/alpha"),
             project("beta", "/x/beta"),
         ]);
@@ -1117,7 +1083,7 @@ mod tests {
 
     #[test]
     fn terms_are_added_and_removed() {
-        let store = FakeStore::new(vec![project("alpha", "/x/alpha")]);
+        let (store, _dir) = store_with(vec![project("alpha", "/x/alpha")]);
         let mut picker = picker_with(store.load().unwrap());
 
         set_term(&store, &mut picker, TermKind::Alias, "alpha", "a", true);
@@ -1155,7 +1121,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("moved");
         std::fs::create_dir_all(&target).expect("create the target directory");
-        let store = FakeStore::new(vec![project("alpha", "/x/gone")]);
+        let (store, _dir) = store_with(vec![project("alpha", "/x/gone")]);
         let mut picker = picker_with(store.load().unwrap());
 
         repath(&store, &mut picker, "alpha", target.to_str().unwrap(), None);
@@ -1181,7 +1147,7 @@ mod tests {
         let taken = dir.path().join("taken");
         std::fs::create_dir_all(&taken).expect("create the target directory");
         let canonical = project::normalize(&taken).expect("canonical");
-        let store = FakeStore::new(vec![
+        let (store, _dir) = store_with(vec![
             project("alpha", "/x/gone"),
             project("beta", canonical.to_str().unwrap()),
         ]);
@@ -1206,7 +1172,7 @@ mod tests {
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("chmod 0700");
         }
-        let store = FakeStore::new(vec![
+        let (store, _dir) = store_with(vec![
             project("alpha", "/x/gone"),
             project("beta", dir.path().to_str().unwrap()),
         ]);
@@ -1214,7 +1180,6 @@ mod tests {
         let discovery = crate::config::Discovery::default();
         let context = Context {
             data_dir: dir.path(),
-            backend: StorageBackend::Json,
             discovery: &discovery,
         };
 
@@ -1231,7 +1196,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("alpha");
         std::fs::create_dir_all(&target).expect("create the target directory");
-        let store = FakeStore::new(Vec::new());
+        let (store, _dir) = store_with(Vec::new());
         let mut picker = picker_with(Vec::new());
         picker.enter_add_with(Some(PathBuf::from("/somewhere")));
 
@@ -1246,7 +1211,7 @@ mod tests {
 
     #[test]
     fn a_failed_add_keeps_the_prompt_open() {
-        let store = FakeStore::new(Vec::new());
+        let (store, _dir) = store_with(Vec::new());
         let mut picker = picker_with(Vec::new());
         picker.enter_add_with(Some(PathBuf::from("/somewhere")));
 

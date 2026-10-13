@@ -1,14 +1,11 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use crate::config::StorageBackend;
 use crate::error::{Error, Result};
 use crate::paths;
 use crate::project::{self, GitInfo, Project};
-use crate::store::json::StoreFile;
-use crate::store::sqlite::SqliteStore;
 
 /// A problem found by [`inspect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,16 +27,13 @@ pub enum Issue {
     /// database, usually after a crash.
     StrayFile(PathBuf),
 
-    /// `projects.json` and `projects.db` both exist but do not hold the same
-    /// project ids.
-    BackendDisagreement {
-        json: usize,
-        db: usize,
-        differing: usize,
-    },
+    /// A legacy `projects.json` is still present: the one-shot migration did
+    /// not get to move it aside (usually because the database already holds
+    /// projects).
+    LegacyJson { path: PathBuf },
 
-    /// The index file that is not the active backend cannot be read.
-    InactiveIndexUnreadable { path: PathBuf, message: String },
+    /// The config still sets the retired `[storage] backend` key.
+    DeprecatedStorageKey,
 
     /// The index file mode is wider than `0600`; `0600` includes the owner
     /// write bit, so a read-only file lands here too.
@@ -65,7 +59,7 @@ pub enum Issue {
     /// The config file exists but could not be read or parsed.
     ConfigProblem { path: PathBuf, message: String },
 
-    /// A store file (index, cache, counters, lock) is a symbolic link, which
+    /// A store file (index, cache, counters) is a symbolic link, which
     /// overdosecd refuses: the target could belong to someone else.
     SymlinkedFile(PathBuf),
 }
@@ -84,10 +78,10 @@ impl Report {
 
 /// Runs the read-only checks against an already-loaded index.
 ///
-/// The permission checks target the active backend's file; the other file is
-/// still inspected (quarantine leftovers, a disagreeing pair, orphaned SQLite
-/// sidecars), but nothing is written or quarantined here.
-pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -> Report {
+/// The permission checks target the database; the legacy JSON file is still
+/// inspected (quarantine leftovers, a migration that did not run), but
+/// nothing is written or quarantined here.
+pub fn inspect(data_dir: &Path, projects: &[Project]) -> Report {
     let mut issues = Vec::new();
 
     for project in projects {
@@ -117,6 +111,9 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
         for tag in &project.tags {
             report("tag", tag);
         }
+        for note in &project.notes {
+            report("note", note);
+        }
         let path = project.path.to_string_lossy();
         report("path", &path);
         // Git metadata is read from a repository's own `.git` files, so it is
@@ -133,15 +130,18 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
         }
     }
 
-    let mut names: Vec<(String, String, usize)> = Vec::new();
+    let mut order: HashMap<String, usize> = HashMap::new();
+    let mut names: Vec<(String, usize)> = Vec::new();
     for project in projects {
         let key = project.name.to_lowercase();
-        match names.iter().position(|(seen, _, _)| *seen == key) {
-            Some(index) => names[index].2 += 1,
-            None => names.push((key, project.name.clone(), 1)),
+        if let Some(&index) = order.get(&key) {
+            names[index].1 += 1;
+        } else {
+            order.insert(key, names.len());
+            names.push((project.name.clone(), 1));
         }
     }
-    for (_, name, count) in names {
+    for (name, count) in names {
         if count > 1 {
             issues.push(Issue::DuplicateName { name, count });
         }
@@ -149,7 +149,7 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
 
     let json_path = paths::store_file(data_dir);
     let db_path = paths::sqlite_file(data_dir);
-    let index_path = paths::index_file(data_dir, backend);
+    let index_path = db_path.clone();
 
     // A link where a store file belongs can point into a directory someone
     // else controls; every open refuses it, and this is where it is reported.
@@ -158,7 +158,6 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
         db_path.clone(),
         crate::discovery::cache_path(data_dir),
         crate::hook::file_path(data_dir),
-        json_path.with_file_name("projects.lock"),
     ] {
         // The active index is refused by the store already and reported by
         // `cmd_doctor`'s load arm; listing it here too would double it.
@@ -170,6 +169,15 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
         {
             issues.push(Issue::SymlinkedFile(path));
         }
+    }
+
+    // A legacy file still on disk after the startup migration means the
+    // migration refused (a populated database, a hostile link); it stays
+    // untouched. A link is reported above instead.
+    if json_path.exists() && !json_path.is_symlink() {
+        issues.push(Issue::LegacyJson {
+            path: json_path.clone(),
+        });
     }
 
     // `store::json` quarantines corrupt indexes as `<file>.corrupt-<stamp>`;
@@ -204,53 +212,13 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
         }
     }
 
-    if json_path.exists() && db_path.exists() {
-        let inactive = match backend {
-            StorageBackend::Json => SqliteStore::new(db_path.clone())
-                .load_readonly()
-                .map_err(|err| err.to_string()),
-            StorageBackend::Sqlite => read_json_projects(&json_path),
-        };
-        match inactive {
-            Ok(inactive_projects) => {
-                let active_ids: HashSet<&str> =
-                    projects.iter().map(|project| project.id.as_str()).collect();
-                let inactive_ids: HashSet<&str> = inactive_projects
-                    .iter()
-                    .map(|project| project.id.as_str())
-                    .collect();
-                let differing = active_ids.symmetric_difference(&inactive_ids).count();
-                if differing > 0 {
-                    let (json, db) = match backend {
-                        StorageBackend::Json => (projects.len(), inactive_projects.len()),
-                        StorageBackend::Sqlite => (inactive_projects.len(), projects.len()),
-                    };
-                    issues.push(Issue::BackendDisagreement {
-                        json,
-                        db,
-                        differing,
-                    });
-                }
-            }
-            Err(message) => {
-                let path = match backend {
-                    StorageBackend::Json => db_path,
-                    StorageBackend::Sqlite => json_path,
-                };
-                issues.push(Issue::InactiveIndexUnreadable { path, message });
-            }
-        }
-    }
-
-    if let Ok(metadata) = fs::metadata(&index_path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            issues.push(Issue::IndexPermissions {
-                path: index_path,
-                mode,
-            });
-        }
+    if let Some(mode) = owner_rw_mode(&index_path)
+        && mode != 0o600
+    {
+        issues.push(Issue::IndexPermissions {
+            path: index_path,
+            mode,
+        });
     }
     if let Ok(metadata) = fs::metadata(data_dir) {
         if metadata.permissions().readonly() {
@@ -266,26 +234,24 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
         }
     }
     let cache_path = crate::discovery::cache_path(data_dir);
-    if let Ok(metadata) = fs::metadata(&cache_path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            issues.push(Issue::CachePermissions {
-                path: cache_path,
-                mode,
-            });
-        }
+    if let Some(mode) = owner_rw_mode(&cache_path)
+        && mode != 0o600
+    {
+        issues.push(Issue::CachePermissions {
+            path: cache_path,
+            mode,
+        });
     }
 
     Report { issues }
 }
 
-/// Parses a `projects.json` without the quarantine side effect `JsonStore`
-/// has, since `doctor` must stay read-only.
-fn read_json_projects(path: &Path) -> std::result::Result<Vec<Project>, String> {
-    let raw = fs::read_to_string(path).map_err(|err| err.to_string())?;
-    let file: StoreFile = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
-    Ok(file.projects)
+/// The `0600`-style permission bits of a file, when it can be read.
+fn owner_rw_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o777)
 }
 
 /// A change the user chose for a stale project.
@@ -449,11 +415,13 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Creates a fresh index file with private permissions so only the
-    /// check under test reports an issue.
+    /// Creates a fresh database with private permissions so only the check
+    /// under test reports an issue.
     fn write_index(path: &Path) {
         fs::create_dir_all(path.parent().expect("index has a parent")).expect("create data dir");
-        fs::write(path, "{}").expect("write index");
+        crate::store::sqlite::SqliteStore::new(path.to_path_buf())
+            .save(&[])
+            .expect("create database");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -483,14 +451,10 @@ mod tests {
         let dir = private_dir();
         let project_dir = dir.path().join("project");
         fs::create_dir_all(&project_dir).expect("create project dir");
-        let index = dir.path().join("projects.json");
+        let index = dir.path().join("projects.db");
         write_index(&index);
 
-        let report = inspect(
-            dir.path(),
-            StorageBackend::Json,
-            &[project("alpha", &project_dir)],
-        );
+        let report = inspect(dir.path(), &[project("alpha", &project_dir)]);
         assert!(report.is_clean(), "unexpected issues: {report:?}");
     }
 
@@ -502,7 +466,7 @@ mod tests {
         let dir = private_dir();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("chmod 0755");
 
-        let report = inspect(dir.path(), StorageBackend::Json, &[]);
+        let report = inspect(dir.path(), &[]);
         assert!(
             report.issues.contains(&Issue::DataDirPermissions {
                 path: dir.path().to_path_buf(),
@@ -513,11 +477,7 @@ mod tests {
         );
 
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("restore 0700");
-        assert!(
-            inspect(dir.path(), StorageBackend::Json, &[])
-                .issues
-                .is_empty()
-        );
+        assert!(inspect(dir.path(), &[]).issues.is_empty());
     }
 
     #[test]
@@ -531,7 +491,7 @@ mod tests {
         let mut two = project("plain", &bad_path);
         two.aliases.push("bad\u{9b}alias".into());
 
-        let report = inspect(dir.path(), StorageBackend::Json, &[one, two]);
+        let report = inspect(dir.path(), &[one, two]);
         let rendered: Vec<String> = report
             .issues
             .iter()
@@ -554,16 +514,12 @@ mod tests {
     #[test]
     fn stale_paths_are_reported() {
         let dir = private_dir();
-        let index = dir.path().join("projects.json");
+        let index = dir.path().join("projects.db");
         write_index(&index);
         let missing = dir.path().join("gone");
 
         let sample = project("gone", &missing);
-        let report = inspect(
-            dir.path(),
-            StorageBackend::Json,
-            std::slice::from_ref(&sample),
-        );
+        let report = inspect(dir.path(), std::slice::from_ref(&sample));
         assert_eq!(
             report.issues,
             vec![Issue::StalePath {
@@ -577,18 +533,14 @@ mod tests {
     #[test]
     fn duplicate_names_are_reported_case_insensitively() {
         let dir = private_dir();
-        let index = dir.path().join("projects.json");
+        let index = dir.path().join("projects.db");
         write_index(&index);
         let one = dir.path().join("one");
         let two = dir.path().join("two");
         fs::create_dir_all(&one).expect("create one");
         fs::create_dir_all(&two).expect("create two");
 
-        let report = inspect(
-            dir.path(),
-            StorageBackend::Json,
-            &[project("App", &one), project("app", &two)],
-        );
+        let report = inspect(dir.path(), &[project("App", &one), project("app", &two)]);
         assert_eq!(
             report.issues,
             vec![Issue::DuplicateName {
@@ -601,12 +553,12 @@ mod tests {
     #[test]
     fn quarantine_files_are_reported() {
         let dir = private_dir();
-        let index = dir.path().join("projects.json");
+        let index = dir.path().join("projects.db");
         write_index(&index);
         let quarantined = dir.path().join("projects.json.corrupt-20260101000000");
         fs::write(&quarantined, "{ not json").expect("write quarantine file");
 
-        let report = inspect(dir.path(), StorageBackend::Json, &[]);
+        let report = inspect(dir.path(), &[]);
         assert_eq!(report.issues, vec![Issue::QuarantineFile(quarantined)]);
     }
 
@@ -616,11 +568,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = private_dir();
-        let index = dir.path().join("projects.json");
+        let index = dir.path().join("projects.db");
         write_index(&index);
 
         fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
-        let report = inspect(dir.path(), StorageBackend::Json, &[]);
+        let report = inspect(dir.path(), &[]);
         assert_eq!(
             report.issues,
             vec![Issue::IndexPermissions {
@@ -630,10 +582,10 @@ mod tests {
         );
 
         fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
-        assert!(inspect(dir.path(), StorageBackend::Json, &[]).is_clean());
+        assert!(inspect(dir.path(), &[]).is_clean());
 
         fs::set_permissions(&index, fs::Permissions::from_mode(0o400)).expect("chmod 0400");
-        let report = inspect(dir.path(), StorageBackend::Json, &[]);
+        let report = inspect(dir.path(), &[]);
         assert_eq!(
             report.issues,
             vec![Issue::IndexPermissions {
@@ -651,11 +603,11 @@ mod tests {
 
         let dir = private_dir();
         let data = dir.path().join("data");
-        let index = data.join("projects.json");
+        let index = data.join("projects.db");
         write_index(&index);
 
         fs::set_permissions(&data, fs::Permissions::from_mode(0o500)).expect("chmod 0500");
-        let report = inspect(&data, StorageBackend::Json, &[]);
+        let report = inspect(&data, &[]);
         assert_eq!(report.issues, vec![Issue::DataDirNotWritable(data.clone())]);
 
         // Restore write access so the tempdir can be cleaned up.

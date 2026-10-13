@@ -1,7 +1,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::config::StorageBackend;
 use crate::error::{Error, Result};
 
 /// Environment override for the data directory, used by tests and power users.
@@ -126,20 +125,55 @@ pub fn ensure_dir(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+/// Writes `body` to `path` atomically and privately: a sibling tmp file with
+/// mode `0600`, fsync, then rename. Shared by the home discovery cache and the
+/// visit counters.
+pub(crate) fn write_private(path: &Path, body: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+
+    // A pid-suffixed name plus `create_new`: a crashed write can leave a
+    // leftover behind, and a planted file or symlink (in a data directory
+    // someone else can write) must never be opened and truncated.
+    // `remove_file` unlinks the name itself, it does not follow a symlink.
+    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Both files contain local paths; keep them private from the start.
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(body)?;
+    file.sync_all()?;
+    drop(file);
+
+    std::fs::rename(&tmp, path)?;
+
+    // fsync the parent so the rename itself survives a crash, not just the
+    // file contents; best effort, since the sync can fail on some filesystems.
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
+}
+
+/// The legacy JSON index, the one-shot migration's source.
 pub fn store_file(data_dir: &Path) -> PathBuf {
     data_dir.join("projects.json")
 }
 
 pub fn sqlite_file(data_dir: &Path) -> PathBuf {
     data_dir.join("projects.db")
-}
-
-/// The file the active backend reads and writes.
-pub fn index_file(data_dir: &Path, backend: StorageBackend) -> PathBuf {
-    match backend {
-        StorageBackend::Json => store_file(data_dir),
-        StorageBackend::Sqlite => sqlite_file(data_dir),
-    }
 }
 
 #[cfg(test)]

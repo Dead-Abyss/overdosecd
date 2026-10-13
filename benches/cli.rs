@@ -2,11 +2,9 @@
 //!
 //! Every iteration spawns the real binary, so the numbers include process
 //! startup, index load, matching, and rendering — the cost a `ocd` jump
-//! actually pays. Fixtures hand-write `projects.json` directly (mirroring the
-//! version-1 shape in `src/store/json.rs`) instead of calling `add` per
-//! project, because every `add` rewrites the whole index. The SQLite fixture
-//! is built from that JSON by running `migrate` once, so it exercises the
-//! real import path instead of duplicating the schema here.
+//! actually pays. Fixtures hand-write a legacy `projects.json` and build the
+//! database from it by running `migrate` once, so they exercise the real
+//! import path instead of duplicating the schema here.
 //!
 //! Run with `cargo bench`; the recorded numbers live in `plan.md` and
 //! `CHANGELOG.md`.
@@ -23,39 +21,16 @@ use serde::Serialize;
 /// stress case that keeps partial updates honest.
 const SIZES: [usize; 3] = [1_000, 10_000, 100_000];
 
-/// The storage backends, so the numbers contrast the JSON rewrite with the
-/// SQLite row updates.
-const BACKENDS: [Backend; 2] = [Backend::Json, Backend::Sqlite];
-
 /// A query matching a slice of the index, for prefix-ambiguity cost.
 const PREFIX_QUERY: &str = "proj-005";
 
 /// A query that matches nothing at all, forcing a full scan.
 const NO_MATCH_QUERY: &str = "zzzqqq";
 
-/// Which backend a fixture indexes into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
-    Json,
-    Sqlite,
-}
-
-impl Backend {
-    fn label(self) -> &'static str {
-        match self {
-            Backend::Json => "json",
-            Backend::Sqlite => "sqlite",
-        }
-    }
-}
-
 /// A generated index plus the real project directories it points at.
 struct Fixture {
     root: tempfile::TempDir,
     data_dir: PathBuf,
-    /// The config that selects the backend, for everything but JSON (the
-    /// built-in default).
-    config: Option<PathBuf>,
     bin: PathBuf,
     /// The name of the project at `count / 2`, used for exact-match benches.
     exact: String,
@@ -93,7 +68,7 @@ struct FixtureGit {
 }
 
 impl Fixture {
-    fn new(count: usize, backend: Backend) -> Self {
+    fn new(count: usize) -> Self {
         let root = tempfile::tempdir().expect("bench fixture temp dir");
         let data_dir = root.path().join("data");
         fs::create_dir_all(&data_dir).expect("create data dir");
@@ -142,33 +117,20 @@ impl Fixture {
         body.push('\n');
         fs::write(data_dir.join("projects.json"), body).expect("write fixture index");
 
-        let config = match backend {
-            Backend::Json => None,
-            Backend::Sqlite => {
-                let path = root.path().join("overdosecd-config.toml");
-                fs::write(&path, "[storage]\nbackend = \"sqlite\"\n")
-                    .expect("write fixture config");
-                Some(path)
-            }
-        };
-
         let fixture = Self {
             bin: PathBuf::from(env!("CARGO_BIN_EXE_overdosecd")),
             exact: format!("proj-{:05}", count / 2),
-            config,
             data_dir,
             root,
         };
 
-        if backend == Backend::Sqlite {
-            // One real import, outside the measured region.
-            let output = fixture.run(&["migrate"]);
-            assert!(
-                output.status.success(),
-                "fixture migration failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        // One real import, outside the measured region.
+        let output = fixture.run(&["migrate"]);
+        assert!(
+            output.status.success(),
+            "fixture migration failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         fixture.sanity_check();
         fixture
     }
@@ -190,60 +152,55 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(&self.bin);
-        command
+        Command::new(&self.bin)
             .args(args)
             .env("OVERDOSECD_DATA_DIR", &self.data_dir)
             .env("HOME", self.root.path())
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("NO_COLOR", "1")
-            .stdin(Stdio::null());
-        if let Some(config) = &self.config {
-            command.env("OVERDOSECD_CONFIG", config);
-        }
-        command.output().expect("run overdosecd")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run overdosecd")
     }
 }
 
 fn bench_cli(c: &mut Criterion) {
     let largest = *SIZES.last().expect("at least one size");
 
-    for backend in BACKENDS {
-        for count in SIZES {
-            let fixture = Fixture::new(count, backend);
-            let mut group = c.benchmark_group(format!("{}-{count}-projects", backend.label()));
-            if count == largest {
-                // A 100k index takes real time per iteration; keep the
-                // sample budget bounded.
-                group.sample_size(10);
-                group.warm_up_time(std::time::Duration::from_secs(1));
-                group.measurement_time(std::time::Duration::from_secs(5));
-            }
-
-            group.bench_function("list", |b| {
-                b.iter(|| fixture.run(&["list"]));
-            });
-            group.bench_function("goto-exact-no-track", |b| {
-                b.iter(|| fixture.run(&["goto", &fixture.exact, "--no-track"]));
-            });
-            group.bench_function("goto-prefix-no-track", |b| {
-                b.iter(|| fixture.run(&["goto", PREFIX_QUERY, "--no-track"]));
-            });
-            group.bench_function("goto-no-match-no-track", |b| {
-                b.iter(|| fixture.run(&["goto", NO_MATCH_QUERY, "--no-track"]));
-            });
-            // The tracked jump is the mutation budget: JSON rewrites the whole
-            // index under the lock; SQLite updates one row and appends a jump.
-            group.bench_function("goto-exact-tracked", |b| {
-                b.iter(|| fixture.run(&["goto", &fixture.exact]));
-            });
-            // One TAB press: the completion helper stats every project.
-            group.bench_function("complete", |b| {
-                b.iter(|| fixture.run(&["complete", "proj"]));
-            });
-
-            group.finish();
+    for count in SIZES {
+        let fixture = Fixture::new(count);
+        let mut group = c.benchmark_group(format!("sqlite-{count}-projects"));
+        if count == largest {
+            // A 100k index takes real time per iteration; keep the sample
+            // budget bounded.
+            group.sample_size(10);
+            group.warm_up_time(std::time::Duration::from_secs(1));
+            group.measurement_time(std::time::Duration::from_secs(5));
         }
+
+        group.bench_function("list", |b| {
+            b.iter(|| fixture.run(&["list"]));
+        });
+        group.bench_function("goto-exact-no-track", |b| {
+            b.iter(|| fixture.run(&["goto", &fixture.exact, "--no-track"]));
+        });
+        group.bench_function("goto-prefix-no-track", |b| {
+            b.iter(|| fixture.run(&["goto", PREFIX_QUERY, "--no-track"]));
+        });
+        group.bench_function("goto-no-match-no-track", |b| {
+            b.iter(|| fixture.run(&["goto", NO_MATCH_QUERY, "--no-track"]));
+        });
+        // The tracked jump is the mutation budget: one row update plus a
+        // usage row, under the write lock.
+        group.bench_function("goto-exact-tracked", |b| {
+            b.iter(|| fixture.run(&["goto", &fixture.exact]));
+        });
+        // One TAB press: the completion helper stats every project.
+        group.bench_function("complete", |b| {
+            b.iter(|| fixture.run(&["complete", "proj"]));
+        });
+
+        group.finish();
     }
 }
 
@@ -252,7 +209,7 @@ fn bench_cli(c: &mut Criterion) {
 /// each iteration starts from an empty index (the realistic first run).
 fn bench_import(c: &mut Criterion) {
     const COUNT: usize = 1_000;
-    let fixture = Fixture::new(COUNT, Backend::Json);
+    let fixture = Fixture::new(COUNT);
     let store = fixture.root.path().join("autojump-store");
     fs::create_dir_all(&store).expect("create import source");
     let mut body = String::new();
@@ -268,10 +225,15 @@ fn bench_import(c: &mut Criterion) {
     fs::write(store.join("autojump.txt"), body).expect("write autojump fixture");
 
     let mut group = c.benchmark_group("import");
-    group.bench_function("autojump-1k-json", |b| {
+    group.bench_function("autojump-1k", |b| {
         b.iter_batched(
             || {
-                let _ = fs::remove_file(fixture.data_dir.join("projects.json"));
+                // A fresh index per iteration: imports are idempotent.
+                for suffix in ["", "-wal", "-shm", "-journal"] {
+                    let mut name = fixture.data_dir.join("projects.db").into_os_string();
+                    name.push(suffix);
+                    let _ = fs::remove_file(PathBuf::from(name));
+                }
             },
             |()| {
                 let output = Command::new(&fixture.bin)

@@ -1,21 +1,19 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, ErrorCode, TransactionBehavior};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior};
 
 use crate::error::{Error, Result};
 use crate::project::{GitInfo, Kind, Project};
 
-use super::Store;
+const CURRENT_VERSION: u32 = 3;
 
-const CURRENT_VERSION: u32 = 2;
-
-/// How long a writer waits for the database lock before giving up, matching
-/// the JSON backend's `LOCK_TIMEOUT` so both feel alike under contention.
+/// How long a writer waits for the database lock before giving up (the
+/// pre-SQLite JSON backend waited the same for its sidecar lock).
 const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Jumps kept per project in the `usage` log; the oldest rows are pruned with
@@ -40,7 +38,9 @@ CREATE TABLE IF NOT EXISTS projects (
     git             INTEGER NOT NULL DEFAULT 0,
     git_remote_name TEXT,
     git_remote_url  TEXT,
-    kind            TEXT
+    kind            TEXT,
+    env             TEXT,
+    enter_cmd       TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS usage (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,11 +48,26 @@ CREATE TABLE IF NOT EXISTS usage (
     used_at    TEXT NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS usage_project_time ON usage(project_id, used_at);
+CREATE TABLE IF NOT EXISTS notes (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    PRIMARY KEY (project_id, seq)
+) STRICT;
 ";
 
-const SELECT_PROJECTS: &str = "
+const SELECT_PROJECTS_BASE: &str = "
 SELECT id, name, path, aliases, tags, created_at, last_used_at, use_count,
        pinned, git, git_remote_name, git_remote_url, kind
+FROM projects
+ORDER BY rowid
+";
+
+/// The full row, including the profile columns; `SELECT_PROJECTS_BASE` plus
+/// them, so a query path that does not need profiles uses the shorter one.
+const SELECT_PROJECTS: &str = "
+SELECT id, name, path, aliases, tags, created_at, last_used_at, use_count,
+       pinned, git, git_remote_name, git_remote_url, kind, env, enter_cmd
 FROM projects
 ORDER BY rowid
 ";
@@ -64,10 +79,11 @@ ORDER BY rowid
 const UPSERT_PROJECT: &str = "
 INSERT INTO projects (
     id, name, path, aliases, tags, created_at, last_used_at, use_count,
-    pinned, git, git_remote_name, git_remote_url, kind
+    pinned, git, git_remote_name, git_remote_url, kind, env, enter_cmd
 ) VALUES (
     :id, :name, :path, :aliases, :tags, :created_at, :last_used_at,
-    :use_count, :pinned, :git, :git_remote_name, :git_remote_url, :kind
+    :use_count, :pinned, :git, :git_remote_name, :git_remote_url, :kind,
+    :env, :enter_cmd
 )
 ON CONFLICT(id) DO UPDATE SET
     name = excluded.name,
@@ -81,17 +97,9 @@ ON CONFLICT(id) DO UPDATE SET
     git = excluded.git,
     git_remote_name = excluded.git_remote_name,
     git_remote_url = excluded.git_remote_url,
-    kind = excluded.kind
-";
-
-const UPDATE_PROJECT: &str = "
-UPDATE projects SET
-    name = :name, path = :path, aliases = :aliases, tags = :tags,
-    created_at = :created_at, last_used_at = :last_used_at,
-    use_count = :use_count, pinned = :pinned, git = :git,
-    git_remote_name = :git_remote_name, git_remote_url = :git_remote_url,
-    kind = :kind
-WHERE id = :id
+    kind = excluded.kind,
+    env = excluded.env,
+    enter_cmd = excluded.enter_cmd
 ";
 
 /// SQLite storage: WAL journal, one transaction per mutation.
@@ -115,8 +123,9 @@ impl SqliteStore {
     }
 
     /// Reads the project set without creating the schema or taking the write
-    /// lock; `doctor` uses this for an inactive database, so a foreign or
-    /// empty file fails on the SELECT instead of being initialized.
+    /// lock; tests use this to pin that a read-only open reports an old
+    /// schema instead of migrating it.
+    #[cfg(test)]
     pub fn load_readonly(&self) -> Result<Vec<Project>> {
         crate::paths::refuse_symlink(&self.path, "SQLite database")?;
         if !self.path.exists() {
@@ -193,6 +202,10 @@ impl SqliteStore {
             for project in projects {
                 execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
             }
+        }
+        // `save` is a whole-index write: every project's notes are rewritten.
+        for project in projects {
+            write_notes(&transaction, project).map_err(|err| self.map_rusqlite(err))?;
         }
 
         transaction.commit().map_err(|err| self.map_rusqlite(err))?;
@@ -278,20 +291,37 @@ impl SqliteStore {
             .map_err(|err| self.map_rusqlite(err))?;
 
         match from {
-            1 => {
+            1 | 2 => {
                 // The write lock serializes concurrent first opens (the `ocd`
                 // wrapper and the cd hook can race after an upgrade); the
                 // version is re-read under it, so the loser of the race skips
-                // the ALTER instead of failing on the duplicate column. Its
+                // the ALTERs instead of failing on a duplicate column. Its
                 // backup above may then hold the already-migrated database —
                 // redundant, never wrong.
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|err| self.map_rusqlite(err))?;
-                if self.read_schema_version(&tx)? == from {
+                let current = self.read_schema_version(&tx)?;
+                if current == 1 {
+                    // v0.1.0's schema, without the column.
+                    tx.execute_batch("ALTER TABLE projects ADD COLUMN kind TEXT;")
+                        .map_err(|err| self.map_rusqlite(err))?;
+                }
+                if current <= 2 {
+                    // v0.2.0's schema, without the notes table or the profile
+                    // and note columns. `SCHEMA` is all `IF NOT EXISTS`, so
+                    // running it here only adds the notes table.
+                    tx.execute_batch(
+                        "ALTER TABLE projects ADD COLUMN env TEXT;\n\
+                         ALTER TABLE projects ADD COLUMN enter_cmd TEXT;",
+                    )
+                    .map_err(|err| self.map_rusqlite(err))?;
+                    tx.execute_batch(SCHEMA)
+                        .map_err(|err| self.map_rusqlite(err))?;
+                }
+                if current < CURRENT_VERSION {
                     tx.execute_batch(&format!(
-                        "ALTER TABLE projects ADD COLUMN kind TEXT;\n\
-                         UPDATE meta SET value = '{CURRENT_VERSION}' \
+                        "UPDATE meta SET value = '{CURRENT_VERSION}' \
                          WHERE key = 'schema_version';"
                     ))
                     .map_err(|err| self.map_rusqlite(err))?;
@@ -329,6 +359,48 @@ impl SqliteStore {
         for row in rows {
             projects.push(row.map_err(|err| self.map_rusqlite(err))?);
         }
+
+        // The notes ride along in one ordered query; projects without rows
+        // keep their empty list.
+        if !notes_are_empty(conn).map_err(|err| self.map_rusqlite(err))? {
+            let mut statement = conn
+                .prepare("SELECT project_id, text FROM notes ORDER BY project_id, seq")
+                .map_err(|err| self.map_rusqlite(err))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|err| self.map_rusqlite(err))?;
+            let mut notes: HashMap<String, Vec<String>> = HashMap::new();
+            for row in rows {
+                let (id, text) = row.map_err(|err| self.map_rusqlite(err))?;
+                notes.entry(id).or_default().push(text);
+            }
+            for project in &mut projects {
+                if let Some(list) = notes.remove(&project.id) {
+                    project.notes = list;
+                }
+            }
+        }
+
+        Ok(projects)
+    }
+
+    /// [`load_projects`](Self::load_projects) without the profile columns and
+    /// the notes query: `goto`, `complete`, and `list` never read them, and
+    /// the two extra column decodes per row measurably cost at 100k.
+    fn load_projects_lean(&self, conn: &Connection) -> Result<Vec<Project>> {
+        let mut statement = conn
+            .prepare(SELECT_PROJECTS_BASE)
+            .map_err(|err| self.map_rusqlite(err))?;
+        let rows = statement
+            .query_map([], row_to_project_base)
+            .map_err(|err| self.map_rusqlite(err))?;
+
+        let mut projects = Vec::new();
+        for row in rows {
+            projects.push(row.map_err(|err| self.map_rusqlite(err))?);
+        }
         Ok(projects)
     }
 
@@ -352,21 +424,24 @@ impl SqliteStore {
             .iter()
             .map(|project| (project.id.as_str(), project))
             .collect();
-        let mut update = conn
-            .prepare(UPDATE_PROJECT)
-            .map_err(|err| self.map_rusqlite(err))?;
-        let mut insert = conn
+        // One statement serves both cases: `ON CONFLICT` rewrites a row that
+        // is already there and inserts one that is not.
+        let mut upsert = conn
             .prepare(UPSERT_PROJECT)
             .map_err(|err| self.map_rusqlite(err))?;
 
         for project in after {
             match before_ids.get(project.id.as_str()) {
                 Some(old) if *old == project => {}
-                Some(_) => {
-                    execute_project(&mut update, project).map_err(|err| self.map_rusqlite(err))?;
+                Some(old) => {
+                    execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
+                    if old.notes != project.notes {
+                        write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
+                    }
                 }
                 None => {
-                    execute_project(&mut insert, project).map_err(|err| self.map_rusqlite(err))?;
+                    execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
+                    write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
                 }
             }
         }
@@ -390,8 +465,8 @@ impl SqliteStore {
     }
 }
 
-impl Store for SqliteStore {
-    fn load(&self) -> Result<Vec<Project>> {
+impl SqliteStore {
+    pub fn load(&self) -> Result<Vec<Project>> {
         crate::paths::refuse_symlink(&self.path, "SQLite database")?;
         // A missing database is an empty index; reads must not create files.
         if !self.path.exists() {
@@ -401,11 +476,11 @@ impl Store for SqliteStore {
         self.load_projects(&conn)
     }
 
-    fn update<R>(&self, f: impl FnOnce(&mut Vec<Project>) -> Result<R>) -> Result<R> {
+    pub fn update<R>(&self, f: impl FnOnce(&mut Vec<Project>) -> Result<R>) -> Result<R> {
         self.update_with_timeout(BUSY_TIMEOUT, f)
     }
 
-    fn record_use(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
+    pub fn record_use(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
         let mut conn = self.open()?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -443,7 +518,7 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn recent_uses(&self, id: &str, limit: usize) -> Result<Vec<DateTime<Utc>>> {
+    pub fn recent_uses(&self, id: &str, limit: usize) -> Result<Vec<DateTime<Utc>>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -467,13 +542,65 @@ impl Store for SqliteStore {
         Ok(times)
     }
 
-    fn schema_version(&self) -> Result<Option<u32>> {
+    pub fn schema_version(&self) -> Result<Option<u32>> {
         if !self.path.exists() {
             return Ok(None);
         }
         let conn = self.open()?;
         Ok(Some(self.read_schema_version(&conn)?))
     }
+
+    /// [`load`](Self::load) without the notes and profile columns: the
+    /// query-only path (`goto`, `complete`, `list`) that never reads them and
+    /// should not pay for their decodes.
+    pub fn load_lean(&self) -> Result<Vec<Project>> {
+        crate::paths::refuse_symlink(&self.path, "SQLite database")?;
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = self.open()?;
+        self.load_projects_lean(&conn)
+    }
+
+    /// The entry profile for the project at `path`, if any: one indexed
+    /// lookup, the cost `enter` pays on every wrapper jump. A missing
+    /// database or an unknown path is `None`.
+    pub fn profile_for_path(&self, path: &str) -> Result<Option<ProjectProfile>> {
+        crate::paths::refuse_symlink(&self.path, "SQLite database")?;
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let conn = self.open()?;
+        let row = conn
+            .query_row(
+                "SELECT env, enter_cmd FROM projects WHERE path = ?1",
+                [path],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|err| self.map_rusqlite(err))?;
+        let Some((env, enter_cmd)) = row else {
+            return Ok(None);
+        };
+        let env = match env {
+            Some(raw) => serde_json::from_str(&raw)
+                .map_err(|err| self.storage_err(format!("unreadable profile JSON: {err}")))?,
+            None => BTreeMap::new(),
+        };
+        Ok(Some(ProjectProfile { env, enter_cmd }))
+    }
+}
+
+/// A project's entry profile: what `enter` applies on a wrapper jump.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectProfile {
+    pub env: BTreeMap<String, String>,
+    pub enter_cmd: Option<String>,
 }
 
 /// Binds one project to the named parameters every statement shares.
@@ -497,10 +624,32 @@ fn execute_project(
         ":git_remote_name": project.git.as_ref().and_then(|git| git.remote_name.as_deref()),
         ":git_remote_url": project.git.as_ref().and_then(|git| git.remote_url.as_deref()),
         ":kind": project.kind.label(),
+        ":env": serde_json::to_string(&project.env).unwrap_or_else(|_| "{}".to_owned()),
+        ":enter_cmd": project.enter_cmd.as_deref(),
     })
 }
 
-fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+/// Replaces one project's note rows with the in-memory list.
+fn write_notes(conn: &Connection, project: &Project) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM notes WHERE project_id = ?1", [&project.id])?;
+    let mut insert =
+        conn.prepare("INSERT INTO notes (project_id, seq, text) VALUES (?1, ?2, ?3)")?;
+    for (seq, text) in project.notes.iter().enumerate() {
+        insert.execute(rusqlite::params![&project.id, seq as i64, text])?;
+    }
+    Ok(())
+}
+
+/// Whether the notes table has any rows; the cheap index probe that keeps the
+/// full load from attaching notes on the common no-notes index.
+fn notes_are_empty(conn: &Connection) -> rusqlite::Result<bool> {
+    let any: i64 = conn.query_row("SELECT EXISTS (SELECT 1 FROM notes)", [], |row| row.get(0))?;
+    Ok(any == 0)
+}
+
+/// The base row mapper, without the profile columns (positions 13/14) or
+/// notes; [`row_to_project`] overlays both.
+fn row_to_project_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     let aliases: String = row.get(3)?;
     let tags: String = row.get(4)?;
     let created_at: String = row.get(5)?;
@@ -536,7 +685,28 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
             None
         },
         kind: kind.as_deref().map_or(Kind::Unknown, Kind::parse),
+        env: BTreeMap::new(),
+        enter_cmd: None,
+        notes: Vec::new(),
     })
+}
+
+fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    let mut project = row_to_project_base(row)?;
+    let env: Option<String> = row.get(13)?;
+    let enter_cmd: Option<String> = row.get(14)?;
+    project.env = match env {
+        Some(raw) => serde_json::from_str(&raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        None => BTreeMap::new(),
+    };
+    project.enter_cmd = enter_cmd;
+    Ok(project)
 }
 
 fn parse_time(raw: &str, column: usize) -> rusqlite::Result<DateTime<Utc>> {
@@ -678,11 +848,135 @@ mod tests {
             .expect("a pre-migration copy is kept");
         assert!(dir.path().join(backup).exists());
 
-        // The migrated database writes and reads the new column.
+        // The migrated database writes and reads the new columns.
         let mut projects = store.load().unwrap();
         projects[0].kind = Kind::Rust;
+        projects[0].notes.push("survives".into());
         store.save(&projects).unwrap();
-        assert_eq!(store.load().unwrap()[0].kind, Kind::Rust);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].kind, Kind::Rust);
+        assert_eq!(loaded[0].notes, vec!["survives".to_owned()]);
+    }
+
+    /// A schema-2 database, as v0.2.0 wrote it: `kind` present, no notes
+    /// table, no profile columns.
+    fn write_v2_database(path: &Path) {
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;\n\
+             CREATE TABLE projects (\n\
+                 id TEXT PRIMARY KEY,\n\
+                 name TEXT NOT NULL,\n\
+                 path TEXT NOT NULL UNIQUE,\n\
+                 aliases TEXT NOT NULL DEFAULT '[]',\n\
+                 tags TEXT NOT NULL DEFAULT '[]',\n\
+                 created_at TEXT NOT NULL,\n\
+                 last_used_at TEXT,\n\
+                 use_count INTEGER NOT NULL DEFAULT 0,\n\
+                 pinned INTEGER NOT NULL DEFAULT 0,\n\
+                 git INTEGER NOT NULL DEFAULT 0,\n\
+                 git_remote_name TEXT,\n\
+                 git_remote_url TEXT,\n\
+                 kind TEXT\n\
+             ) STRICT;\n\
+             CREATE TABLE usage (\n\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n\
+                 used_at TEXT NOT NULL\n\
+             ) STRICT;\n\
+             CREATE INDEX usage_project_time ON usage(project_id, used_at);\n\
+             INSERT INTO meta VALUES ('schema_version', '2');\n\
+             INSERT INTO projects (id, name, path, created_at, kind) \
+                 VALUES ('a', 'alpha', '/x/alpha', '2026-01-01T00:00:00Z', 'rust');",
+        )
+        .expect("v2 schema");
+    }
+
+    #[test]
+    fn a_v2_database_migrates_to_notes_and_profiles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        write_v2_database(store.path());
+
+        let projects = store.load().expect("a writable open migrates");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].kind, Kind::Rust);
+        assert!(projects[0].notes.is_empty() && projects[0].env.is_empty());
+        assert_eq!(store.schema_version().unwrap(), Some(CURRENT_VERSION));
+
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with("projects.db.v2-"))
+            .expect("a pre-migration copy is kept");
+        assert!(dir.path().join(backup).exists());
+
+        // Notes and the profile survive a write/read cycle.
+        let mut projects = store.load().unwrap();
+        projects[0].notes.push("first".into());
+        projects[0].env.insert("EDITOR".into(), "vim".into());
+        projects[0].enter_cmd = Some("echo hi".into());
+        store.save(&projects).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].notes, vec!["first".to_owned()]);
+        assert_eq!(loaded[0].env.get("EDITOR").map(String::as_str), Some("vim"));
+        assert_eq!(loaded[0].enter_cmd.as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn notes_ride_along_updates_and_cascade_on_removal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        store.save(&[project("alpha")]).unwrap();
+
+        store
+            .update(|projects| {
+                projects[0].notes = vec!["one".into(), "two".into()];
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap()[0].notes,
+            vec!["one".to_owned(), "two".to_owned()]
+        );
+
+        // Removing the project takes its note rows with it.
+        store
+            .update(|projects| {
+                projects.clear();
+                Ok(())
+            })
+            .unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "note rows cascade away with the project");
+    }
+
+    #[test]
+    fn the_by_path_lookup_uses_the_unique_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        store.save(&[project("alpha")]).unwrap();
+
+        // `enter` resolves a project by its canonical path on every wrapper
+        // jump; the UNIQUE column must serve that without a scan.
+        let conn = Connection::open(store.path()).unwrap();
+        let mut statement = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT env, enter_cmd FROM projects WHERE path = ?1")
+            .unwrap();
+        let plans: Vec<String> = statement
+            .query_map(["x"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(
+            plans.iter().any(|plan| plan.contains("INDEX")),
+            "expected an index search, got: {plans:?}"
+        );
     }
 
     #[test]
@@ -757,11 +1051,12 @@ mod tests {
         let now = Utc::now();
         store
             .update(|projects| {
-                projects
+                let project = projects
                     .iter_mut()
                     .find(|project| project.name == "alpha")
-                    .unwrap()
-                    .record_use(now);
+                    .unwrap();
+                project.use_count += 1;
+                project.last_used_at = Some(now);
                 Ok(())
             })
             .unwrap();
@@ -776,11 +1071,11 @@ mod tests {
 
         let err = store
             .update(|projects| {
-                projects
+                let project = projects
                     .iter_mut()
                     .find(|project| project.name == "bravo")
-                    .unwrap()
-                    .record_use(now);
+                    .unwrap();
+                project.use_count += 1;
                 Ok(())
             })
             .unwrap_err();

@@ -9,16 +9,15 @@ the escape sequences the picker emits (no alternate screen, no full-screen
 clear; the exit parks the cursor at the box origin with no cursor query, so
 the next prompt lands where the box was).
 
-    python3 scripts/picker-smoke.py                    # debug build, JSON backend
+    python3 scripts/picker-smoke.py                    # debug build
     python3 scripts/picker-smoke.py --release          # release build
-    python3 scripts/picker-smoke.py --sqlite           # SQLite backend
     python3 scripts/picker-smoke.py --binary path/to/overdosecd
 
 It covers jump, filter, Tab+j/k, pin, add, cancel, mouse scroll/click, the
 palette's remove/rename/tag actions, batched pinning through marks, the detail
 and health views, the help overlay, `ui --query`, the home-directory fallback
-and `scan --home`, both wrappers, and both backends. Needs Linux (ptys),
-python3, bash, and zsh. Not run by CI.
+and `scan --home`, and both wrappers. Needs Linux (ptys), python3, bash, and
+zsh. Not run by CI.
 """
 
 import argparse
@@ -143,9 +142,8 @@ class Screen:
 
 
 class Harness:
-    def __init__(self, binary, sqlite):
+    def __init__(self, binary):
         self.binary = binary
-        self.sqlite = sqlite
         self.root = tempfile.mkdtemp(prefix="overdosecd-picker-")
         self.home = os.path.join(self.root, "home")
         self.data = os.path.join(self.root, "data")
@@ -187,36 +185,28 @@ class Harness:
     def setup(self, names=("alpha", "beta", "gamma")):
         """Fresh index: no usage, no pins, so the order is alphabetical."""
         shutil.rmtree(self.data, ignore_errors=True)
-        if self.sqlite:
-            config_dir = os.path.join(self.config, "overdosecd")
-            os.makedirs(config_dir, exist_ok=True)
-            with open(os.path.join(config_dir, "config.toml"), "w") as handle:
-                handle.write('[storage]\nbackend = "sqlite"\n')
         for name in names:
             os.makedirs(os.path.join(self.projects, name), exist_ok=True)
             self.add(os.path.join(self.projects, name))
 
     def index(self):
-        """The index as a list of dicts, backend-agnostically."""
-        if self.sqlite:
-            import sqlite3
+        """The index as a list of dicts, read from the database."""
+        import sqlite3
 
-            conn = sqlite3.connect(os.path.join(self.data, "projects.db"))
-            conn.row_factory = sqlite3.Row
-            rows = [dict(row) for row in conn.execute("SELECT * FROM projects")]
-            conn.close()
-            for row in rows:
-                row["pinned"] = bool(row["pinned"])
-                for field in ("aliases", "tags"):
-                    value = row.get(field)
-                    if isinstance(value, str):
-                        try:
-                            row[field] = json.loads(value)
-                        except json.JSONDecodeError:
-                            pass
-            return rows
-        with open(os.path.join(self.data, "projects.json")) as handle:
-            return json.load(handle)["projects"]
+        conn = sqlite3.connect(os.path.join(self.data, "projects.db"))
+        conn.row_factory = sqlite3.Row
+        rows = [dict(row) for row in conn.execute("SELECT * FROM projects")]
+        conn.close()
+        for row in rows:
+            row["pinned"] = bool(row["pinned"])
+            for field in ("aliases", "tags"):
+                value = row.get(field)
+                if isinstance(value, str):
+                    try:
+                        row[field] = json.loads(value)
+                    except json.JSONDecodeError:
+                        pass
+        return rows
 
     def by_name(self, name):
         return next(p for p in self.index() if p["name"] == name)
@@ -719,6 +709,62 @@ class Harness:
                 f"code={code} out={out!r}",
             )
 
+        # Entry profiles ([general] hooks): a wrapper jump exports the
+        # profile's variables and runs its command inside this shell. Runs
+        # last: it leaves a config behind that other scenarios must not see.
+        self.setup()
+        config_dir = os.path.join(self.config, "overdosecd")
+        os.makedirs(config_dir, exist_ok=True)
+        with open(os.path.join(config_dir, "config.toml"), "w") as handle:
+            handle.write("[general]\nhooks = true\n")
+        subprocess.run(
+            [binary, "profile", "env", "add", "alpha", "OCD_SMOKE=applied"],
+            env=self.env(),
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [binary, "profile", "run", "set", "alpha", "echo RUN-ON-ENTER"],
+            env=self.env(),
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        code, out, pty = self.run(
+            'eval "$(overdosecd init bash)"; ocd alph; printf "ENV=%s\\n" "$OCD_SMOKE"',
+            [],
+            cwd=self.root,
+            shell="bash",
+        )
+        self.check(
+            "ocd applies the profile environment and command",
+            code == 0 and "ENV=applied" in out and "RUN-ON-ENTER" in out,
+            f"code={code} out={out!r}",
+        )
+        self.check(
+            "the run-on-enter command is shown before it runs",
+            b"running: echo RUN-ON-ENTER" in pty,
+            "the notice was not on the terminal",
+        )
+
+        # Without the switch (fresh config), the wrapper init carries no
+        # enter step at all.
+        self.setup()
+        with open(os.path.join(config_dir, "config.toml"), "w") as handle:
+            handle.write("")
+        code, out, _ = self.run(
+            'eval "$(overdosecd init bash)"; ocd alph; printf "ENV=%s\\n" "${OCD_SMOKE:-unset}"',
+            [],
+            cwd=self.root,
+            shell="bash",
+        )
+        self.check(
+            "hooks off means no profile step",
+            code == 0 and "ENV=unset" in out,
+            f"code={code} out={out!r}",
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -728,7 +774,7 @@ def main():
         help="the overdosecd binary to drive (default: target/debug/overdosecd)",
     )
     parser.add_argument("--release", action="store_true", help="use target/release/overdosecd")
-    parser.add_argument("--sqlite", action="store_true", help="run against the SQLite backend")
+
     args = parser.parse_args()
 
     binary = args.binary
@@ -737,15 +783,14 @@ def main():
     if not os.path.exists(binary):
         parser.error(f"{binary} does not exist; build it first")
 
-    harness = Harness(binary, args.sqlite)
+    harness = Harness(binary)
     harness.smoke()
 
     print()
     if harness.failures:
         print("FAILURES:", ", ".join(harness.failures))
         sys.exit(1)
-    backend = "sqlite" if args.sqlite else "json"
-    print(f"all picker smoke checks passed ({backend}, {binary})")
+    print(f"all picker smoke checks passed (sqlite, {binary})")
 
 
 if __name__ == "__main__":

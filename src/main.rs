@@ -264,7 +264,8 @@ fn cmd_list(store: &SqliteStore, args: ListArgs) -> Result<()> {
         .map(|raw| time::parse_since(raw, Utc::now()))
         .transpose()?;
 
-    let mut projects = store.load()?;
+    // `list` shows no notes or profiles: the lean load skips both columns.
+    let mut projects = store.load_lean()?;
     if let Some(cutoff) = since {
         projects.retain(|project| project.last_used_at.is_some_and(|when| when >= cutoff));
     }
@@ -335,7 +336,7 @@ fn resolve(
 /// Prints completion candidates, one per line; used by the shell completion
 /// functions so `ocd <TAB>` offers the same values a jump would accept.
 fn cmd_complete(store: &SqliteStore, prefix: &str) -> Result<()> {
-    let projects = store.load()?;
+    let projects = store.load_lean()?;
     for candidate in matcher::completion_candidates(&projects, prefix) {
         output::print_line(&candidate)?;
     }
@@ -408,7 +409,7 @@ fn cmd_goto(
     matching: &MatcherConfig,
     debug: bool,
 ) -> Result<()> {
-    let projects = store.load()?;
+    let projects = store.load_lean()?;
     let found = resolve(&projects, query, matching, debug)?;
     if confident && !found.all_confident() {
         // The caller decides what to do; `ocd` opens the picker prefilled.
@@ -527,7 +528,7 @@ fn cmd_remove(
     matching: &MatcherConfig,
     debug: bool,
 ) -> Result<()> {
-    let projects = store.load()?;
+    let projects = store.load_lean()?;
     let query = args.query.join(" ");
     let found = resolve(&projects, &query, matching, debug)?;
     let target = projects[found.index].clone();
@@ -579,7 +580,9 @@ fn resolve_id(
     matching: &MatcherConfig,
     debug: bool,
 ) -> Result<(String, String)> {
-    let projects = store.load()?;
+    // Resolution needs the base fields only; the mutation re-loads (with
+    // notes and profiles) inside `update`.
+    let projects = store.load_lean()?;
     let found = resolve(&projects, query, matching, debug)?;
     Ok((
         projects[found.index].id.clone(),
@@ -888,7 +891,7 @@ fn cmd_import(store: &SqliteStore, args: ImportArgs) -> Result<()> {
     let home = project::home_dir();
     let path = import::resolve_path(args.source)?;
     let parsed = import::parse_at(args.source, &path)?;
-    let projects = store.load()?;
+    let projects = store.load_lean()?;
     let mut plan = import::plan(
         &parsed,
         &projects,

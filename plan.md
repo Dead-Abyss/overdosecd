@@ -283,29 +283,38 @@ Definition of done:
 
 ## Recorded numbers
 
-`cargo bench` medians on Linux x86_64, release binary. These are the floor:
-no later milestone may regress them without recording why.
+`cargo bench` medians on Linux x86_64, release binary, measured 2026-10-12 on
+the machine state of record. These are the floor: no later milestone may
+regress them without recording why.
 
-| metric | json 1k | json 10k | json 100k | sqlite 1k | sqlite 10k | sqlite 100k |
-| ------ | ------- | -------- | --------- | --------- | ---------- | ----------- |
-| `list` | 5.0 ms | 39 ms | 385 ms | 5.5 ms | 39 ms | 379 ms |
-| `goto` exact, untracked | 3.0 ms | 17 ms | 139 ms | 3.4 ms | 17 ms | 135 ms |
-| `goto` exact, tracked | 5.2 ms | 34 ms | 304 ms | 3.7 ms | 17 ms | 131 ms |
-| `complete` | 4.6 ms | 32 ms | 287 ms | 4.8 ms | 32 ms | 281 ms |
+| metric | 1k | 10k | 100k |
+| ------ | -- | --- | ---- |
+| `list` | 5.3 ms | 38 ms | 356 ms |
+| `goto` exact, untracked | 3.4 ms | 17 ms | 140 ms |
+| `goto` exact, tracked | 3.9 ms | 18 ms | 142 ms |
+| `complete` | 4.8 ms | 32 ms | 283 ms |
+
+The 0.2.0 table (json and sqlite columns) predates the single-backend
+retirement and the 0.3.0 measurements; absolute numbers drift with machine
+conditions, so the 0.3.0 floor claims rest on a **same-session A/B against a
+0.2.0 build** (2026-10-12): `list` 356 vs 399 ms, `goto` exact 141 vs 145 ms,
+tracked 142 vs 138 ms, `complete` 275 vs 269 ms at 100k — parity within
+noise except `list`, which is faster (the cached sort keys); the older
+`goto` floor of 135 ms no longer reproduces even for the 0.2.0 baseline on
+this machine state, so it is superseded by the A/B record rather than
+treated as a regression.
 
 Recorded during development:
 
-- Picker: one keystroke re-ranks 100k projects in ~37 ms, empty-query reset
-  ~4 ms.
+- Picker: one keystroke re-ranks 100k projects in ~38 ms, a two-word
+  keystroke ~46 ms, empty-query reset ~7 ms.
 - Home scan: a warm scan (3,361 directories, 344 project-like) takes ~56 ms,
   the first cold scan ~12 s (I/O-bound, hence the background thread), and the
   cache is ~550 KB.
-- Import: 1,000 autojump entries with a git read each take ~84 ms.
+- Import: 1,000 autojump entries with a git read each take ~76 ms.
 - cd hook: ~3.4 ms per recorded jump at 1,000 projects and ~2.9 ms while
   writing visit counters.
-- Multi-word queries: a two-word keystroke re-ranks 100k in ~48.9 ms
-  (single-word ~38.6 ms).
-- Build: the `--release` binary is ~4.4 MB.
+- Build: the `--release` binary is ~4.6 MB.
 
 ## Release process
 

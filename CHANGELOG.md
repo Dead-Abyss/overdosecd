@@ -41,9 +41,11 @@ One storage format, notes to remember projects by, and explicit entry hooks.
 - Picker performance: one shared fuzzy matcher, signal scoring against a
   pre-lowered view built once per query, ranking that never materializes
   names/paths the caller does not need, cached sort keys instead of
-  per-comparison lowercasing, and a redraw only when something changed. A
-  100k-project two-word keystroke measures ~43 ms (was ~49 ms); the idle
-  picker paints nothing.
+  per-comparison lowercasing, a lean load that skips the notes and profile
+  columns on the query paths, and a redraw only when something changed. A
+  100k-project two-word keystroke measures ~46 ms (was ~49 ms) and `list`
+  ~356 ms (was ~399 ms) in a same-session comparison; the idle picker paints
+  nothing.
 - Internals: the `JsonStore`/`AnyStore` layer, the sidecar lock and the
   `fd-lock` dependency are gone and commands talk to `SqliteStore` directly;
   one `UPSERT` serves updates and inserts; `info`/`add` resolve each

@@ -311,7 +311,7 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   picker uses `rank_indices`, which skips materializing `Match` names/paths,
   and `signal_score` compares a per-candidate `Lowered` view built once per
   query; one shared `SkimMatcherV2` serves every path). A keystroke re-ranks
-  100k projects in ~37 ms (36.6 ms one word, 43.3 ms two words as of 0.3.0;
+  100k projects in ~38 ms (37.6 ms one word, 45.9 ms two words as of 0.3.0;
   `ui::picker::tests::rank_latency_at_100k`, `#[ignore]`d, run with
   `--release -- --ignored --nocapture`). If that ever needs fixing, narrowing
   to the previous query's candidate set is provably equivalent when the new

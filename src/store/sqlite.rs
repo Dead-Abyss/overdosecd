@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS notes (
 ) STRICT;
 ";
 
+const SELECT_PROJECTS_BASE: &str = "
+SELECT id, name, path, aliases, tags, created_at, last_used_at, use_count,
+       pinned, git, git_remote_name, git_remote_url, kind
+FROM projects
+ORDER BY rowid
+";
+
+/// The full row, including the profile columns; `SELECT_PROJECTS_BASE` plus
+/// them, so a query path that does not need profiles uses the shorter one.
 const SELECT_PROJECTS: &str = "
 SELECT id, name, path, aliases, tags, created_at, last_used_at, use_count,
        pinned, git, git_remote_name, git_remote_url, kind, env, enter_cmd
@@ -353,25 +362,45 @@ impl SqliteStore {
 
         // The notes ride along in one ordered query; projects without rows
         // keep their empty list.
-        let mut statement = conn
-            .prepare("SELECT project_id, text FROM notes ORDER BY project_id, seq")
-            .map_err(|err| self.map_rusqlite(err))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|err| self.map_rusqlite(err))?;
-        let mut notes: HashMap<String, Vec<String>> = HashMap::new();
-        for row in rows {
-            let (id, text) = row.map_err(|err| self.map_rusqlite(err))?;
-            notes.entry(id).or_default().push(text);
-        }
-        for project in &mut projects {
-            if let Some(list) = notes.remove(&project.id) {
-                project.notes = list;
+        if !notes_are_empty(conn).map_err(|err| self.map_rusqlite(err))? {
+            let mut statement = conn
+                .prepare("SELECT project_id, text FROM notes ORDER BY project_id, seq")
+                .map_err(|err| self.map_rusqlite(err))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|err| self.map_rusqlite(err))?;
+            let mut notes: HashMap<String, Vec<String>> = HashMap::new();
+            for row in rows {
+                let (id, text) = row.map_err(|err| self.map_rusqlite(err))?;
+                notes.entry(id).or_default().push(text);
+            }
+            for project in &mut projects {
+                if let Some(list) = notes.remove(&project.id) {
+                    project.notes = list;
+                }
             }
         }
 
+        Ok(projects)
+    }
+
+    /// [`load_projects`](Self::load_projects) without the profile columns and
+    /// the notes query: `goto`, `complete`, and `list` never read them, and
+    /// the two extra column decodes per row measurably cost at 100k.
+    fn load_projects_lean(&self, conn: &Connection) -> Result<Vec<Project>> {
+        let mut statement = conn
+            .prepare(SELECT_PROJECTS_BASE)
+            .map_err(|err| self.map_rusqlite(err))?;
+        let rows = statement
+            .query_map([], row_to_project_base)
+            .map_err(|err| self.map_rusqlite(err))?;
+
+        let mut projects = Vec::new();
+        for row in rows {
+            projects.push(row.map_err(|err| self.map_rusqlite(err))?);
+        }
         Ok(projects)
     }
 
@@ -521,6 +550,18 @@ impl SqliteStore {
         Ok(Some(self.read_schema_version(&conn)?))
     }
 
+    /// [`load`](Self::load) without the notes and profile columns: the
+    /// query-only path (`goto`, `complete`, `list`) that never reads them and
+    /// should not pay for their decodes.
+    pub fn load_lean(&self) -> Result<Vec<Project>> {
+        crate::paths::refuse_symlink(&self.path, "SQLite database")?;
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = self.open()?;
+        self.load_projects_lean(&conn)
+    }
+
     /// The entry profile for the project at `path`, if any: one indexed
     /// lookup, the cost `enter` pays on every wrapper jump. A missing
     /// database or an unknown path is `None`.
@@ -599,7 +640,16 @@ fn write_notes(conn: &Connection, project: &Project) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+/// Whether the notes table has any rows; the cheap index probe that keeps the
+/// full load from attaching notes on the common no-notes index.
+fn notes_are_empty(conn: &Connection) -> rusqlite::Result<bool> {
+    let any: i64 = conn.query_row("SELECT EXISTS (SELECT 1 FROM notes)", [], |row| row.get(0))?;
+    Ok(any == 0)
+}
+
+/// The base row mapper, without the profile columns (positions 13/14) or
+/// notes; [`row_to_project`] overlays both.
+fn row_to_project_base(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     let aliases: String = row.get(3)?;
     let tags: String = row.get(4)?;
     let created_at: String = row.get(5)?;
@@ -608,8 +658,6 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     let pinned: i64 = row.get(8)?;
     let git: i64 = row.get(9)?;
     let kind: Option<String> = row.get(12)?;
-    let env: Option<String> = row.get(13)?;
-    let enter_cmd: Option<String> = row.get(14)?;
 
     Ok(Project {
         id: row.get(0)?,
@@ -637,19 +685,28 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
             None
         },
         kind: kind.as_deref().map_or(Kind::Unknown, Kind::parse),
-        env: match env {
-            Some(raw) => serde_json::from_str(&raw).map_err(|err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    13,
-                    rusqlite::types::Type::Text,
-                    Box::new(err),
-                )
-            })?,
-            None => BTreeMap::new(),
-        },
-        enter_cmd,
+        env: BTreeMap::new(),
+        enter_cmd: None,
         notes: Vec::new(),
     })
+}
+
+fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
+    let mut project = row_to_project_base(row)?;
+    let env: Option<String> = row.get(13)?;
+    let enter_cmd: Option<String> = row.get(14)?;
+    project.env = match env {
+        Some(raw) => serde_json::from_str(&raw).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                13,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        None => BTreeMap::new(),
+    };
+    project.enter_cmd = enter_cmd;
+    Ok(project)
 }
 
 fn parse_time(raw: &str, column: usize) -> rusqlite::Result<DateTime<Utc>> {

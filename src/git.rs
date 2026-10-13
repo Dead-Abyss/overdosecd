@@ -63,13 +63,8 @@ impl Branch {
     }
 }
 
-/// Returns `true` when `path` looks like a Git working tree or a bare
-/// repository.
-pub fn is_repo(path: &Path) -> bool {
-    git_dir(path).is_some()
-}
-
-/// Resolves the directory holding `HEAD` and friends.
+/// Resolves the directory holding `HEAD` and friends, or `None` when `path`
+/// is not a Git working tree or bare repository.
 ///
 /// Handles `.git` being a directory (normal checkout) or a file containing a
 /// `gitdir:` line (worktrees, submodules), including relative targets, and a
@@ -159,25 +154,21 @@ fn common_dir(git_dir: &Path) -> PathBuf {
     joined.canonicalize().unwrap_or(joined)
 }
 
-/// Reads the preferred remote: `origin` when present, otherwise the first
-/// remote in the config — through `include.path`/`includeIf` files, with
-/// `url.<base>.insteadOf` applied to the URL.
-pub fn read_remote(path: &Path) -> Option<Remote> {
-    read_remote_with(path, crate::project::home_dir().as_deref())
+/// [`read_remote`] for a caller that already resolved the git directory with
+/// [`git_dir`], so one query does not read `.git` twice.
+pub fn read_remote_in(git_dir: &Path) -> Option<Remote> {
+    read_remote_dir_with(git_dir, crate::project::home_dir().as_deref())
 }
 
-/// Testable variant of [`read_remote`] with an explicit home directory for
-/// `~/` expansion in include paths and conditions.
-fn read_remote_with(path: &Path, home: Option<&Path>) -> Option<Remote> {
-    let git_dir = git_dir(path)?;
-    let config_path = common_dir(&git_dir).join("config");
+fn read_remote_dir_with(git_dir: &Path, home: Option<&Path>) -> Option<Remote> {
+    let config_path = common_dir(git_dir).join("config");
     let mut includes = Includes {
         home,
         files_left: MAX_INCLUDE_FILES,
         bytes_left: MAX_CONFIG_TOTAL,
         seen: Vec::new(),
     };
-    let contents = read_config(&config_path, &git_dir, &mut includes)?;
+    let contents = read_config(&config_path, git_dir, &mut includes)?;
     let parsed = parse_config(&contents);
     let mut remote = parsed.remote?;
     remote.url = rewrite_instead_of(&remote.url, &parsed.instead_of);
@@ -441,7 +432,13 @@ fn wildmatch(pattern: &str, text: &str, icase: bool) -> bool {
 
 /// The current branch, or a short hash when detached.
 pub fn current_branch(path: &Path) -> Option<Branch> {
-    let head = read_small(&git_dir(path)?.join("HEAD"), MAX_HEAD_BYTES)?;
+    current_branch_in(&git_dir(path)?)
+}
+
+/// [`current_branch`] for a caller that already resolved the git directory
+/// with [`git_dir`].
+pub fn current_branch_in(git_dir: &Path) -> Option<Branch> {
+    let head = read_small(&git_dir.join("HEAD"), MAX_HEAD_BYTES)?;
     let head = head.trim();
 
     if let Some(reference) = head.strip_prefix("ref:") {
@@ -624,6 +621,16 @@ fn parse_section_header(line: &str) -> Option<(String, Option<String>)> {
 mod tests {
     use super::*;
 
+    /// Path-based spellings of the read paths, so the tests keep exercising
+    /// the `.git` resolution too.
+    fn read_remote(path: &Path) -> Option<Remote> {
+        read_remote_in(&git_dir(path)?)
+    }
+
+    fn read_remote_with(path: &Path, home: Option<&Path>) -> Option<Remote> {
+        read_remote_dir_with(&git_dir(path)?, home)
+    }
+
     fn write(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create parent");
@@ -641,17 +648,17 @@ mod tests {
     #[test]
     fn detects_git_directories() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(!is_repo(dir.path()));
+        assert!(git_dir(dir.path()).is_none());
 
         std::fs::create_dir(dir.path().join(".git")).expect("create .git");
-        assert!(is_repo(dir.path()));
+        assert!(git_dir(dir.path()).is_some());
     }
 
     #[test]
     fn malformed_dot_git_file_is_not_a_repo() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".git"), "not a gitdir line").expect("write");
-        assert!(!is_repo(dir.path()));
+        assert!(git_dir(dir.path()).is_none());
     }
 
     #[test]
@@ -663,7 +670,7 @@ mod tests {
             "[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = git@github.com:Dead-Abyss/overdosecd.git\n",
         );
 
-        assert!(is_repo(&checkout));
+        assert!(git_dir(&checkout).is_some());
         assert_eq!(
             current_branch(&checkout),
             Some(Branch::Named("main".to_owned()))
@@ -760,7 +767,7 @@ mod tests {
         write(&worktree_gitdir.join("HEAD"), "ref: refs/heads/feature\n");
         write(&worktree_gitdir.join("commondir"), "../..\n");
 
-        assert!(is_repo(&worktree));
+        assert!(git_dir(&worktree).is_some());
         assert_eq!(
             current_branch(&worktree),
             Some(Branch::Named("feature".to_owned()))
@@ -1055,7 +1062,7 @@ mod tests {
         std::fs::create_dir_all(bare.join("objects")).expect("create objects");
         std::fs::create_dir_all(bare.join("refs")).expect("create refs");
 
-        assert!(is_repo(&bare));
+        assert!(git_dir(&bare).is_some());
         assert_eq!(
             current_branch(&bare),
             Some(Branch::Named("trunk".to_owned()))
@@ -1068,7 +1075,7 @@ mod tests {
         // `core.bare = true` alone is git's own signal.
         let configured = dir.path().join("configured");
         write(&configured.join("config"), "[core]\n\tbare = true\n");
-        assert!(is_repo(&configured));
+        assert!(git_dir(&configured).is_some());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -27,42 +27,38 @@ fn guard(text: &str) -> Result<()> {
     }
 }
 
+/// The one writer behind every stdout/stderr funnel: the guard runs first, so
+/// a missed renderer fails closed instead of leaking an escape.
+fn write_to(mut stream: impl std::io::Write, text: &str, newline: bool) -> Result<()> {
+    guard(text)?;
+    if newline {
+        writeln!(stream, "{text}")?;
+    } else {
+        stream.write_all(text.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// Writes a line to stdout, turning broken pipes into an error that `main`
 /// can exit quietly on.
 pub fn print_line(text: &str) -> Result<()> {
-    guard(text)?;
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    writeln!(handle, "{text}")?;
-    Ok(())
+    write_to(std::io::stdout().lock(), text, true)
 }
 
 /// Writes raw text (no trailing newline added) to stdout.
 pub fn print(text: &str) -> Result<()> {
-    guard(text)?;
-    let stdout = std::io::stdout();
-    let mut handle = stdout.lock();
-    handle.write_all(text.as_bytes())?;
-    Ok(())
+    write_to(std::io::stdout().lock(), text, false)
 }
 
 /// Writes raw text (no trailing newline added) to stderr through the same
 /// guard as stdout.
 pub fn print_stderr(text: &str) -> Result<()> {
-    guard(text)?;
-    let stderr = std::io::stderr();
-    let mut handle = stderr.lock();
-    handle.write_all(text.as_bytes())?;
-    Ok(())
+    write_to(std::io::stderr().lock(), text, false)
 }
 
 /// Writes a line to stderr through the same guard as stdout.
 pub fn print_stderr_line(text: &str) -> Result<()> {
-    guard(text)?;
-    let stderr = std::io::stderr();
-    let mut handle = stderr.lock();
-    writeln!(handle, "{text}")?;
-    Ok(())
+    write_to(std::io::stderr().lock(), text, true)
 }
 
 /// The terminal's width in columns, or `None` when stdout is not a tty (or the
@@ -109,8 +105,8 @@ impl HookSettings {
 pub fn init_script(shell: Shell, hooks: HookSettings) -> String {
     let commands = passthrough_commands();
     match shell {
-        Shell::Bash => bash_zsh_script(&commands, &bash_completion(&commands), hooks),
-        Shell::Zsh => bash_zsh_script(&commands, &zsh_completion(&commands), hooks),
+        Shell::Bash => bash_zsh_script(&commands, &embed(BASH_COMPLETION, &commands), hooks),
+        Shell::Zsh => bash_zsh_script(&commands, &embed(ZSH_COMPLETION, &commands), hooks),
         Shell::Fish => fish_script(&commands, hooks),
     }
 }
@@ -276,8 +272,8 @@ _ocd() {
 complete -F _ocd ocd
 "#;
 
-fn bash_completion(commands: &[String]) -> String {
-    BASH_COMPLETION.replace("%COMMANDS%", &commands.join(" "))
+fn embed(template: &str, commands: &[String]) -> String {
+    template.replace("%COMMANDS%", &commands.join(" "))
 }
 
 /// Zsh completion for `ocd`, registered only after `compinit` has run so
@@ -308,13 +304,9 @@ if (( $+functions[compdef] )); then
 fi
 "#;
 
-fn zsh_completion(commands: &[String]) -> String {
-    ZSH_COMPLETION.replace("%COMMANDS%", &commands.join(" "))
-}
-
 fn fish_script(commands: &[String], hooks: HookSettings) -> String {
+    let completion = embed(FISH_COMPLETION, commands);
     let commands = commands.join(" ");
-    let completion = fish_completion(&commands);
     let hook = if hooks.any() { FISH_HOOK_SCRIPT } else { "" };
     format!(
         r#"# overdosecd shell integration (fish)
@@ -389,10 +381,6 @@ complete -c ocd -f -n 'test (count (commandline -opc)) -eq 1' -a '(command overd
 complete -c ocd -f -n 'set -l opc (commandline -opc); test (count $opc) -eq 1; and string match -q -- "-*" (commandline -ct)' -a '--cmd --no-track'
 complete -c ocd -f -n 'set -l opc (commandline -opc); test (count $opc) -eq 2; and test $opc[2] = --cmd' -a '%COMMANDS%'
 "#;
-
-fn fish_completion(commands: &str) -> String {
-    FISH_COMPLETION.replace("%COMMANDS%", commands)
-}
 
 /// Replaces a home prefix with `~` for display, escaping anything a terminal
 /// would interpret (paths can arrive from a planted index).
@@ -528,16 +516,16 @@ fn take_prefix(text: &str, budget: usize) -> String {
 /// The longest suffix of `text` that fits in `budget` display columns.
 fn take_suffix(text: &str, budget: usize) -> String {
     let mut used = 0;
-    let mut characters = Vec::new();
-    for character in text.chars().rev() {
+    let mut start = text.len();
+    for (index, character) in text.char_indices().rev() {
         let width = UnicodeWidthChar::width(character).unwrap_or(0);
         if used + width > budget {
             break;
         }
         used += width;
-        characters.push(character);
+        start = index;
     }
-    characters.into_iter().rev().collect()
+    text[start..].to_owned()
 }
 
 /// Shrinks `widths` until the table fits `budget`, giving space up in

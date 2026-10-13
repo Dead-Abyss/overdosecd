@@ -3227,22 +3227,6 @@ fn ui_on_an_empty_index_opens_with_discovery() {
         .stderr(predicate::str::contains("needs a terminal"));
 }
 
-#[cfg(unix)]
-#[test]
-fn ui_refuses_without_a_terminal() {
-    let sandbox = Sandbox::new();
-    sandbox.add(&sandbox.project("alpha"));
-
-    sandbox
-        .ttyless_cmd()
-        .timeout(std::time::Duration::from_secs(30))
-        .arg("ui")
-        .assert()
-        .code(1)
-        .stdout("")
-        .stderr(predicate::str::contains("needs a terminal"));
-}
-
 // Display invariant: no command's stdout or stderr carries a terminal
 // control byte for any stored or live value. The sandbox sets `NO_COLOR=1`,
 // so even the colour path stays silent and any 0x1b byte is a defect.

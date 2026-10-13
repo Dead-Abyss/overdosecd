@@ -355,9 +355,14 @@ impl Picker {
 
     /// Whether the project at display position `position` is missing.
     pub fn is_missing(&self, position: usize) -> bool {
-        self.entries
-            .get(position)
-            .is_some_and(|&index| !self.projects[index].path.exists())
+        self.entries.get(position).is_some_and(|&index| {
+            // The cached flags cover every project once `hide missing` asks
+            // for them; the stat is the fallback until then.
+            self.missing
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| !self.projects[index].path.exists())
+        })
     }
 
     pub fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -439,13 +444,10 @@ impl Picker {
                 entries.retain(|&index| !missing[index]);
             }
             let sort = self.sort;
-            entries.sort_by(|&a, &b| project::sort_key(&self.projects[a], &self.projects[b], sort));
+            entries.sort_by_cached_key(|&index| project::sort_key(&self.projects[index], sort));
             self.entries = entries;
         } else {
-            self.entries = matcher::rank(&query, &self.projects, &self.matching)
-                .into_iter()
-                .map(|found| found.index)
-                .collect();
+            self.entries = matcher::rank_indices(&query, &self.projects, &self.matching);
         }
 
         // Home matches only when the index has nothing (or when the user
@@ -630,6 +632,9 @@ impl Picker {
     }
 
     fn handle_search(&mut self, key: KeyEvent, ctrl: bool) -> Outcome {
+        if let Some(outcome) = self.handle_chord(&key, ctrl) {
+            return outcome;
+        }
         match key.code {
             KeyCode::Esc => Outcome::Cancel,
             KeyCode::Tab => {
@@ -637,12 +642,6 @@ impl Picker {
                 Outcome::Continue
             }
             KeyCode::Enter => self.jump(),
-            KeyCode::Char('p') if ctrl => self.ask_pin(),
-            KeyCode::Char('a') if ctrl => {
-                self.enter_add();
-                Outcome::Continue
-            }
-            KeyCode::Char('x') if ctrl => self.ask_remove(),
             KeyCode::Char(' ') | KeyCode::Null if ctrl || key.code == KeyCode::Null => {
                 self.open_palette();
                 Outcome::Continue
@@ -666,6 +665,9 @@ impl Picker {
     }
 
     fn handle_nav(&mut self, key: KeyEvent, ctrl: bool) -> Outcome {
+        if let Some(outcome) = self.handle_chord(&key, ctrl) {
+            return outcome;
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
@@ -673,12 +675,6 @@ impl Picker {
             KeyCode::Char('G') | KeyCode::End => self.select(usize::MAX),
             KeyCode::Char('u') | KeyCode::PageUp => self.move_selection(-self.page()),
             KeyCode::Char('d') | KeyCode::PageDown => self.move_selection(self.page()),
-            KeyCode::Char('p') if ctrl => self.ask_pin(),
-            KeyCode::Char('a') if ctrl => {
-                self.enter_add();
-                Outcome::Continue
-            }
-            KeyCode::Char('x') if ctrl => self.ask_remove(),
             KeyCode::Char('m') => {
                 if let Some(project) = self.selected_project() {
                     let id = project.id.clone();
@@ -708,6 +704,20 @@ impl Picker {
             KeyCode::Enter => self.jump(),
             KeyCode::Esc => Outcome::Cancel,
             _ => Outcome::Continue,
+        }
+    }
+
+    /// The ctrl chords `Search` and `Nav` share, handled before either mode's
+    /// own match so the two keymaps cannot drift.
+    fn handle_chord(&mut self, key: &KeyEvent, ctrl: bool) -> Option<Outcome> {
+        match key.code {
+            KeyCode::Char('p') if ctrl => Some(self.ask_pin()),
+            KeyCode::Char('a') if ctrl => {
+                self.enter_add();
+                Some(Outcome::Continue)
+            }
+            KeyCode::Char('x') if ctrl => Some(self.ask_remove()),
+            _ => None,
         }
     }
 
@@ -1018,7 +1028,7 @@ impl Picker {
 
     /// The ids a mutation applies to: the marked rows when any are marked,
     /// otherwise the highlighted project. A highlighted *home* row has no id.
-    pub fn targets(&self) -> Vec<String> {
+    pub(crate) fn targets(&self) -> Vec<String> {
         if self.selected_home().is_some() {
             return Vec::new();
         }

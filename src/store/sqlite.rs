@@ -84,16 +84,6 @@ ON CONFLICT(id) DO UPDATE SET
     kind = excluded.kind
 ";
 
-const UPDATE_PROJECT: &str = "
-UPDATE projects SET
-    name = :name, path = :path, aliases = :aliases, tags = :tags,
-    created_at = :created_at, last_used_at = :last_used_at,
-    use_count = :use_count, pinned = :pinned, git = :git,
-    git_remote_name = :git_remote_name, git_remote_url = :git_remote_url,
-    kind = :kind
-WHERE id = :id
-";
-
 /// SQLite storage: WAL journal, one transaction per mutation.
 ///
 /// `update` diffs the in-memory snapshot against the closure's result and
@@ -352,21 +342,17 @@ impl SqliteStore {
             .iter()
             .map(|project| (project.id.as_str(), project))
             .collect();
-        let mut update = conn
-            .prepare(UPDATE_PROJECT)
-            .map_err(|err| self.map_rusqlite(err))?;
-        let mut insert = conn
+        // One statement serves both cases: `ON CONFLICT` rewrites a row that
+        // is already there and inserts one that is not.
+        let mut upsert = conn
             .prepare(UPSERT_PROJECT)
             .map_err(|err| self.map_rusqlite(err))?;
 
         for project in after {
             match before_ids.get(project.id.as_str()) {
                 Some(old) if *old == project => {}
-                Some(_) => {
-                    execute_project(&mut update, project).map_err(|err| self.map_rusqlite(err))?;
-                }
-                None => {
-                    execute_project(&mut insert, project).map_err(|err| self.map_rusqlite(err))?;
+                _ => {
+                    execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
                 }
             }
         }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -133,15 +133,18 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
         }
     }
 
-    let mut names: Vec<(String, String, usize)> = Vec::new();
+    let mut order: HashMap<String, usize> = HashMap::new();
+    let mut names: Vec<(String, usize)> = Vec::new();
     for project in projects {
         let key = project.name.to_lowercase();
-        match names.iter().position(|(seen, _, _)| *seen == key) {
-            Some(index) => names[index].2 += 1,
-            None => names.push((key, project.name.clone(), 1)),
+        if let Some(&index) = order.get(&key) {
+            names[index].1 += 1;
+        } else {
+            order.insert(key, names.len());
+            names.push((project.name.clone(), 1));
         }
     }
-    for (_, name, count) in names {
+    for (name, count) in names {
         if count > 1 {
             issues.push(Issue::DuplicateName { name, count });
         }
@@ -242,15 +245,13 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
         }
     }
 
-    if let Ok(metadata) = fs::metadata(&index_path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            issues.push(Issue::IndexPermissions {
-                path: index_path,
-                mode,
-            });
-        }
+    if let Some(mode) = owner_rw_mode(&index_path)
+        && mode != 0o600
+    {
+        issues.push(Issue::IndexPermissions {
+            path: index_path,
+            mode,
+        });
     }
     if let Ok(metadata) = fs::metadata(data_dir) {
         if metadata.permissions().readonly() {
@@ -266,18 +267,24 @@ pub fn inspect(data_dir: &Path, backend: StorageBackend, projects: &[Project]) -
         }
     }
     let cache_path = crate::discovery::cache_path(data_dir);
-    if let Ok(metadata) = fs::metadata(&cache_path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            issues.push(Issue::CachePermissions {
-                path: cache_path,
-                mode,
-            });
-        }
+    if let Some(mode) = owner_rw_mode(&cache_path)
+        && mode != 0o600
+    {
+        issues.push(Issue::CachePermissions {
+            path: cache_path,
+            mode,
+        });
     }
 
     Report { issues }
+}
+
+/// The `0600`-style permission bits of a file, when it can be read.
+fn owner_rw_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o777)
 }
 
 /// Parses a `projects.json` without the quarantine side effect `JsonStore`

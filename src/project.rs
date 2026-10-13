@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -108,8 +109,8 @@ pub struct GitInfo {
 
 impl GitInfo {
     pub fn detect(path: &Path) -> Option<Self> {
-        crate::git::git_dir(path)?;
-        let remote = crate::git::read_remote(path);
+        let git_dir = crate::git::git_dir(path)?;
+        let remote = crate::git::read_remote_in(&git_dir);
         Some(Self {
             remote_name: remote.as_ref().map(|remote| remote.name.clone()),
             remote_url: remote.map(|remote| remote.url),
@@ -205,31 +206,29 @@ pub fn default_name(path: &Path) -> Result<String> {
 
 /// The default display order: pinned first, then most recently used, then
 /// name (case-insensitively). Shared by `list` and the picker so both agree.
-fn display_order(a: &Project, b: &Project) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    b.pinned
-        .cmp(&a.pinned)
-        .then_with(|| match (a.last_used_at, b.last_used_at) {
-            (Some(a_time), Some(b_time)) => b_time.cmp(&a_time),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        })
-        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+///
+/// Returned as a key rather than a comparator so `sort_by_cached_key`
+/// lowercases each name once per sort instead of once per comparison.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SortKey {
+    Used(Reverse<bool>, Reverse<Option<DateTime<Utc>>>, String),
+    Name(String),
+    Created(Reverse<DateTime<Utc>>, String),
 }
 
-/// The comparator behind every sort order `list --sort` and the picker's sort
-/// cycle offer. [`SortBy::Used`] is [`display_order`]; the explicit orders
-/// ignore pinning.
-pub fn sort_key(a: &Project, b: &Project, sort: crate::cli::SortBy) -> std::cmp::Ordering {
+/// The key behind every sort order `list --sort` and the picker's sort cycle
+/// offer. [`SortBy::Used`] keeps pinning; the explicit orders ignore it.
+pub fn sort_key(project: &Project, sort: crate::cli::SortBy) -> SortKey {
     match sort {
-        crate::cli::SortBy::Used => display_order(a, b),
-        crate::cli::SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        crate::cli::SortBy::Created => b
-            .created_at
-            .cmp(&a.created_at)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        crate::cli::SortBy::Used => SortKey::Used(
+            Reverse(project.pinned),
+            Reverse(project.last_used_at),
+            project.name.to_lowercase(),
+        ),
+        crate::cli::SortBy::Name => SortKey::Name(project.name.to_lowercase()),
+        crate::cli::SortBy::Created => {
+            SortKey::Created(Reverse(project.created_at), project.name.to_lowercase())
+        }
     }
 }
 

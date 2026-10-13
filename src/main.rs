@@ -199,22 +199,24 @@ fn cmd_add(store: &impl Store, args: AddArgs) -> Result<()> {
         None => None,
     };
 
-    let mut aliases = Vec::new();
-    for alias in &args.alias {
-        project::reject_control_chars("alias", alias)?;
-        project::push_unique(&mut aliases, alias);
-    }
-    let mut tags = Vec::new();
-    for tag in &args.tag {
-        project::reject_control_chars("tag", tag)?;
-        project::push_unique(&mut tags, tag);
-    }
+    let aliases = sanitize_terms("alias", &args.alias)?;
+    let tags = sanitize_terms("tag", &args.tag)?;
     let force = args.force;
 
     let message = store.update(move |projects| {
         project::insert(projects, canonical, provided_name, aliases, tags, force)
     })?;
     output::print_line(&message)
+}
+
+/// Validates and deduplicates repeated `--alias`/`--tag` values.
+fn sanitize_terms(kind: &'static str, values: &[String]) -> Result<Vec<String>> {
+    let mut terms = Vec::new();
+    for value in values {
+        project::reject_control_chars(kind, value)?;
+        project::push_unique(&mut terms, value);
+    }
+    Ok(terms)
 }
 
 fn cmd_list(store: &impl Store, args: ListArgs) -> Result<()> {
@@ -269,22 +271,28 @@ fn cmd_list(store: &impl Store, args: ListArgs) -> Result<()> {
 }
 
 /// Resolves a query to its best match. Under `--debug`, every ranked
-/// candidate is printed to stderr first, so stdout stays untouched.
+/// candidate is printed to stderr first, so stdout stays untouched; the
+/// ranking is computed once and reused for the winner.
 fn resolve(
     projects: &[Project],
     query: &str,
     matching: &MatcherConfig,
     debug: bool,
 ) -> Result<matcher::Match> {
-    if debug {
-        let ranked = matcher::rank(query, projects, matching);
-        output::print_stderr(&output::format_debug(
-            query,
-            &ranked,
-            project::home_dir().as_deref(),
-        ))?;
+    if !debug {
+        return matcher::best(query, projects, matching);
     }
-    matcher::best(query, projects, matching)
+
+    let ranked = matcher::rank(query, projects, matching);
+    output::print_stderr(&output::format_debug(
+        query,
+        &ranked,
+        project::home_dir().as_deref(),
+    ))?;
+    if projects.is_empty() {
+        return Err(Error::EmptyIndex);
+    }
+    matcher::best_of_ranked(query, ranked, matching.ambiguity_margin)
 }
 
 /// Prints completion candidates, one per line; used by the shell completion
@@ -444,13 +452,13 @@ fn cmd_info(store: &impl Store, query: &str, matching: &MatcherConfig, debug: bo
             "no".to_owned()
         },
     ));
-    if git::is_repo(&project.path) {
+    if let Some(git_dir) = git::git_dir(&project.path) {
         rows.push(("git:", "yes".green().to_string()));
-        let branch = git::current_branch(&project.path)
+        let branch = git::current_branch_in(&git_dir)
             .map(git::Branch::label)
             .unwrap_or_else(|| dash.clone());
         rows.push(("branch:", sanitize::text(&branch)));
-        let remote = git::read_remote(&project.path)
+        let remote = git::read_remote_in(&git_dir)
             .map(|remote| format!("{} {}", remote.name, remote.url))
             .unwrap_or_else(|| dash.clone());
         rows.push(("remote:", sanitize::text(&remote)));
@@ -748,7 +756,7 @@ fn cmd_scan(data_dir: &Path, settings: &config::Discovery, args: ScanArgs) -> Re
             "could not determine the home directory".to_owned(),
         ));
     };
-    let home_display = output::shorten_home(&home, project::home_dir().as_deref());
+    let home_display = "~";
     let cache_path = discovery::cache_path(data_dir);
 
     if !args.refresh
@@ -904,7 +912,7 @@ fn cmd_doctor(
 
 fn sort_projects(projects: &mut [Project], sort: Option<SortBy>) {
     let sort = sort.unwrap_or(SortBy::Used);
-    projects.sort_by(|a, b| project::sort_key(a, b, sort));
+    projects.sort_by_cached_key(|project| project::sort_key(project, sort));
 }
 
 #[cfg(test)]

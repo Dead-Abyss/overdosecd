@@ -71,18 +71,14 @@ pub fn resolve_path(source: ImportSource) -> Result<PathBuf> {
             Ok(dir.join("db.zo"))
         }
         ImportSource::Autojump => {
-            let dir = match std::env::var_os("AUTOJUMP_DATA_DIR") {
-                Some(value) if !value.is_empty() => PathBuf::from(value),
-                _ => {
-                    let base = std::env::var_os("XDG_DATA_HOME")
-                        .filter(|value| !value.is_empty())
-                        .map(PathBuf::from)
-                        .or_else(|| project::home_dir().map(|home| home.join(".local/share")))
-                        .ok_or_else(|| {
-                            Error::Storage("could not determine the data directory".into())
-                        })?;
-                    base.join("autojump")
-                }
+            // The tool's own override names the directory directly; the
+            // fallback is the XDG data directory, where a relative
+            // `XDG_DATA_HOME` is ignored, per the specification.
+            let dir = match crate::dirs::os_env("AUTOJUMP_DATA_DIR") {
+                Some(value) => PathBuf::from(value),
+                None => crate::dirs::data_local_dir()
+                    .ok_or_else(|| Error::Storage("could not determine the data directory".into()))?
+                    .join("autojump"),
             };
             Ok(dir.join("autojump.txt"))
         }
@@ -286,6 +282,12 @@ pub fn plan(
     };
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut candidates: Vec<NewProject> = Vec::new();
+    // Membership in the index, checked once per record instead of scanning
+    // the whole project list per record.
+    let indexed: HashSet<&Path> = projects
+        .iter()
+        .map(|project| project.path.as_path())
+        .collect();
 
     for record in &parsed.records {
         let use_count = use_count_for(record.score);
@@ -313,7 +315,7 @@ pub fn plan(
             plan.malformed += 1;
             continue;
         }
-        if projects.iter().any(|project| project.path == canonical) {
+        if indexed.contains(canonical.as_path()) {
             plan.existing += 1;
             continue;
         }
@@ -425,10 +427,8 @@ pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usiz
             raced += 1;
             continue;
         }
-        if let Some(project) = projects
-            .iter_mut()
-            .find(|project| project.path == entry.path)
-        {
+        // `insert` pushed the new entry last.
+        if let Some(project) = projects.last_mut() {
             project.use_count = entry.use_count;
             project.last_used_at = entry.last_used_at;
         }

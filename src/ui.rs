@@ -182,15 +182,22 @@ fn pick(
         signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
     }
 
+    let mut dirty = true;
     loop {
         if interrupted.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        session
-            .terminal
-            .draw(|frame| render::draw(frame, picker, home, color, options.border))?;
-        refresh_details(store, picker);
-        load_home(context, picker, &mut scanner);
+        // Redraw only when something visible changed: the pane/status updates
+        // below report whether they touched the picker, and every event
+        // marks the screen dirty. Poll timeouts alone repaint nothing.
+        dirty |= refresh_details(store, picker);
+        dirty |= load_home(context, picker, &mut scanner);
+        if dirty {
+            session
+                .terminal
+                .draw(|frame| render::draw(frame, picker, home, color, options.border))?;
+            dirty = false;
+        }
 
         // Wake up to pick up a finished scan or a signal; otherwise block
         // until there is input.
@@ -202,6 +209,7 @@ fn pick(
         if !event::poll(timeout)? {
             continue;
         }
+        dirty = true;
 
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => match picker.handle_key(key) {
@@ -223,12 +231,13 @@ fn pick(
 }
 
 /// Loads the home-directory cache when the picker needs it, and refreshes it
-/// in the background when it is older than the configured TTL.
+/// in the background when it is older than the configured TTL. Returns
+/// whether the picker changed and the screen must be redrawn.
 fn load_home(
     context: &Context,
     picker: &mut Picker,
     scanner: &mut Option<mpsc::Receiver<Vec<Dir>>>,
-) {
+) -> bool {
     // A finished background scan wins over anything else.
     if let Some(receiver) = scanner {
         match receiver.try_recv() {
@@ -245,17 +254,17 @@ fn load_home(
                     picker.set_status("home search updated", false);
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Empty) => return false,
             Err(mpsc::TryRecvError::Disconnected) => {
                 *scanner = None;
                 picker.set_status("home scan failed", true);
             }
         }
-        return;
+        return true;
     }
 
     if !picker.needs_home() {
-        return;
+        return false;
     }
 
     let cache_path = discovery::cache_path(context.data_dir);
@@ -275,6 +284,7 @@ fn load_home(
             start_scan(context, picker, scanner);
         }
     }
+    true
 }
 
 /// Starts a background scan; the result is picked up by [`load_home`].
@@ -304,10 +314,10 @@ fn drop_data_dir(dirs: Vec<Dir>, data_dir: &Path) -> Vec<Dir> {
 }
 
 /// Fetches the live data the detail pane shows (branch, recent jumps) when
-/// the highlighted project changed.
-fn refresh_details(store: &impl Store, picker: &mut Picker) {
+/// the highlighted project changed; returns whether it did.
+fn refresh_details(store: &impl Store, picker: &mut Picker) -> bool {
     let Some(id) = picker.details_request() else {
-        return;
+        return false;
     };
     let branch = picker
         .projects()
@@ -316,6 +326,7 @@ fn refresh_details(store: &impl Store, picker: &mut Picker) {
         .and_then(|project| git::current_branch(&project.path).map(git::Branch::label));
     let history = store.recent_uses(&id, 5).unwrap_or_default();
     picker.set_details_info(id, branch, history);
+    true
 }
 
 /// Executes one run action; `Ok(Some(selected))` means the picker should exit
@@ -434,16 +445,11 @@ fn pin(store: &impl Store, picker: &mut Picker, ids: &[String], pinned: bool) {
 
 /// Removes every id in one update.
 fn remove(store: &impl Store, picker: &mut Picker, ids: &[String]) {
-    let result = store.update(|projects| {
-        let mut applied = 0;
-        for id in ids {
-            if let Some(position) = projects.iter().position(|project| &project.id == id) {
-                projects.remove(position);
-                applied += 1;
-            }
-        }
-        Ok(applied)
-    });
+    let repairs: Vec<Repair> = ids
+        .iter()
+        .map(|id| Repair::Remove { id: id.clone() })
+        .collect();
+    let result = store.update(move |projects| Ok(doctor::apply_repairs(projects, &repairs)));
 
     match result {
         Ok(applied) => {

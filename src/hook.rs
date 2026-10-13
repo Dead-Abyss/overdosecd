@@ -33,7 +33,6 @@ const MAX_VISITS_BYTES: u64 = 4 << 20;
 pub(crate) struct Visit {
     pub path: PathBuf,
     pub count: u32,
-    pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub last_hint: Option<DateTime<Utc>>,
 }
@@ -47,7 +46,10 @@ pub struct Visits {
 
 impl Default for Visits {
     fn default() -> Self {
-        Self::new()
+        Self {
+            version: VISITS_VERSION,
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -57,13 +59,6 @@ pub fn file_path(data_dir: &Path) -> PathBuf {
 }
 
 impl Visits {
-    pub fn new() -> Self {
-        Self {
-            version: VISITS_VERSION,
-            entries: Vec::new(),
-        }
-    }
-
     /// Reads the file; a broken or differently-versioned file is ignored
     /// (rebuildable, like the home cache — never quarantined).
     pub fn load(path: &Path) -> Option<Self> {
@@ -87,7 +82,6 @@ impl Visits {
         self.entries.push(Visit {
             path: path.to_path_buf(),
             count: 1,
-            first_seen: now,
             last_seen: now,
             last_hint: None,
         });
@@ -142,21 +136,20 @@ mod tests {
     }
 
     #[test]
-    fn counts_visits_and_keeps_first_seen() {
-        let mut visits = Visits::new();
+    fn counts_visits_and_stamps_the_time() {
+        let mut visits = Visits::default();
         let dir = Path::new("/code/alpha");
         assert_eq!(visits.record_visit(dir, now()), 1);
         assert_eq!(visits.record_visit(dir, now() + Duration::hours(1)), 2);
         let entry = &visits.entries[0];
         assert_eq!(entry.count, 2);
-        assert_eq!(entry.first_seen, now());
         assert_eq!(entry.last_seen, now() + Duration::hours(1));
         assert_eq!(entry.last_hint, None);
     }
 
     #[test]
     fn hints_need_three_visits_and_respect_the_cooldown() {
-        let mut visits = Visits::new();
+        let mut visits = Visits::default();
         let dir = Path::new("/code/alpha");
         visits.record_visit(dir, now());
         visits.record_visit(dir, now());
@@ -173,14 +166,14 @@ mod tests {
 
     #[test]
     fn prune_drops_old_entries_and_caps_the_file() {
-        let mut visits = Visits::new();
+        let mut visits = Visits::default();
         visits.record_visit(Path::new("/code/fresh"), now());
         visits.record_visit(Path::new("/code/stale"), now() - Duration::days(31));
         visits.prune(now());
         assert_eq!(visits.len(), 1);
         assert_eq!(visits.entries[0].path, PathBuf::from("/code/fresh"));
 
-        let mut visits = Visits::new();
+        let mut visits = Visits::default();
         for index in 0..(MAX_ENTRIES + 5) {
             let path = PathBuf::from(format!("/code/{index:04}"));
             let when = now() + Duration::seconds(index as i64);
@@ -209,7 +202,7 @@ mod tests {
         std::fs::write(&path, r#"{"version":0,"entries":[]}"#).expect("write");
         assert!(Visits::load(&path).is_none(), "other versions are ignored");
 
-        let mut visits = Visits::new();
+        let mut visits = Visits::default();
         visits.record_visit(Path::new("/code/alpha"), now());
         visits.save(&path).expect("save");
         let loaded = Visits::load(&path).expect("load");

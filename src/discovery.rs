@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -196,7 +195,7 @@ pub fn rank(query: &str, dirs: &[Dir], limit: usize) -> Vec<HomeMatch> {
     }
     let terms: Vec<&str> = query.split_whitespace().collect();
 
-    let matcher = SkimMatcherV2::default().smart_case();
+    let matcher = crate::matcher::skim();
     let mut matches: Vec<HomeMatch> = dirs
         .iter()
         .filter_map(|dir| {

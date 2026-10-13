@@ -193,7 +193,7 @@ impl Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Renders ambiguous-match candidates as an indented list.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Candidates(pub Vec<Match>);
 
 impl fmt::Display for Candidates {

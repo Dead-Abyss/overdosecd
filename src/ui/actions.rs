@@ -2,7 +2,6 @@
 //! any) each action needs.
 
 use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::cli::SortBy;
 
@@ -157,7 +156,7 @@ pub fn palette_matches(query: &str) -> Vec<Action> {
         return Action::ALL.to_vec();
     }
 
-    let matcher = SkimMatcherV2::default().smart_case();
+    let matcher = crate::matcher::skim();
     let mut scored: Vec<(i64, Action)> = Action::ALL
         .iter()
         .filter_map(|&action| {

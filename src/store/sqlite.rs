@@ -10,12 +10,10 @@ use rusqlite::{Connection, ErrorCode, TransactionBehavior};
 use crate::error::{Error, Result};
 use crate::project::{GitInfo, Kind, Project};
 
-use super::Store;
-
 const CURRENT_VERSION: u32 = 2;
 
-/// How long a writer waits for the database lock before giving up, matching
-/// the JSON backend's `LOCK_TIMEOUT` so both feel alike under contention.
+/// How long a writer waits for the database lock before giving up (the
+/// pre-SQLite JSON backend waited the same for its sidecar lock).
 const BUSY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Jumps kept per project in the `usage` log; the oldest rows are pruned with
@@ -105,8 +103,9 @@ impl SqliteStore {
     }
 
     /// Reads the project set without creating the schema or taking the write
-    /// lock; `doctor` uses this for an inactive database, so a foreign or
-    /// empty file fails on the SELECT instead of being initialized.
+    /// lock; tests use this to pin that a read-only open reports an old
+    /// schema instead of migrating it.
+    #[cfg(test)]
     pub fn load_readonly(&self) -> Result<Vec<Project>> {
         crate::paths::refuse_symlink(&self.path, "SQLite database")?;
         if !self.path.exists() {
@@ -376,8 +375,8 @@ impl SqliteStore {
     }
 }
 
-impl Store for SqliteStore {
-    fn load(&self) -> Result<Vec<Project>> {
+impl SqliteStore {
+    pub fn load(&self) -> Result<Vec<Project>> {
         crate::paths::refuse_symlink(&self.path, "SQLite database")?;
         // A missing database is an empty index; reads must not create files.
         if !self.path.exists() {
@@ -387,11 +386,11 @@ impl Store for SqliteStore {
         self.load_projects(&conn)
     }
 
-    fn update<R>(&self, f: impl FnOnce(&mut Vec<Project>) -> Result<R>) -> Result<R> {
+    pub fn update<R>(&self, f: impl FnOnce(&mut Vec<Project>) -> Result<R>) -> Result<R> {
         self.update_with_timeout(BUSY_TIMEOUT, f)
     }
 
-    fn record_use(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
+    pub fn record_use(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
         let mut conn = self.open()?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -429,7 +428,7 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn recent_uses(&self, id: &str, limit: usize) -> Result<Vec<DateTime<Utc>>> {
+    pub fn recent_uses(&self, id: &str, limit: usize) -> Result<Vec<DateTime<Utc>>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -453,7 +452,7 @@ impl Store for SqliteStore {
         Ok(times)
     }
 
-    fn schema_version(&self) -> Result<Option<u32>> {
+    pub fn schema_version(&self) -> Result<Option<u32>> {
         if !self.path.exists() {
             return Ok(None);
         }
@@ -743,11 +742,12 @@ mod tests {
         let now = Utc::now();
         store
             .update(|projects| {
-                projects
+                let project = projects
                     .iter_mut()
                     .find(|project| project.name == "alpha")
-                    .unwrap()
-                    .record_use(now);
+                    .unwrap();
+                project.use_count += 1;
+                project.last_used_at = Some(now);
                 Ok(())
             })
             .unwrap();
@@ -762,11 +762,11 @@ mod tests {
 
         let err = store
             .update(|projects| {
-                projects
+                let project = projects
                     .iter_mut()
                     .find(|project| project.name == "bravo")
-                    .unwrap()
-                    .record_use(now);
+                    .unwrap();
+                project.use_count += 1;
                 Ok(())
             })
             .unwrap_err();

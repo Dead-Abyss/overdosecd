@@ -49,21 +49,24 @@ pub(crate) struct General {
     pub hint: bool,
 }
 
-/// Which storage backend holds the index.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+/// The retired storage selector.
+///
+/// Parsed and ignored since 0.3.0 — SQLite is the only backend — but kept so
+/// a 0.2.0 config keeps loading (`deny_unknown_fields` would reject the whole
+/// file otherwise) and `doctor` can point at the stale key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
     /// `projects.json`, the pre-SQLite format.
-    #[default]
     Json,
-    /// `projects.db` (SQLite); `overdosecd migrate` moves an index over.
+    /// `projects.db` (SQLite), now the only format.
     Sqlite,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Storage {
-    pub backend: StorageBackend,
+    pub backend: Option<StorageBackend>,
 }
 
 /// How the interactive picker renders and behaves.
@@ -459,12 +462,16 @@ mod tests {
     }
 
     #[test]
-    fn storage_backend_defaults_to_json_and_parses_sqlite() {
+    fn the_retired_storage_key_still_parses() {
         let config = parse("").expect("empty config parses");
-        assert_eq!(config.storage.backend, StorageBackend::Json);
+        assert_eq!(config.storage.backend, None);
 
+        // A 0.2.0 config keeps loading; the value is remembered only so
+        // `doctor` can point at the stale key.
         let config = parse("[storage]\nbackend = \"sqlite\"\n").expect("storage parses");
-        assert_eq!(config.storage.backend, StorageBackend::Sqlite);
+        assert_eq!(config.storage.backend, Some(StorageBackend::Sqlite));
+        let config = parse("[storage]\nbackend = \"json\"\n").expect("storage parses");
+        assert_eq!(config.storage.backend, Some(StorageBackend::Json));
     }
 
     #[test]

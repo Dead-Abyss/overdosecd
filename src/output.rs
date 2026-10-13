@@ -870,22 +870,14 @@ pub fn format_doctor(
                 "stray:".red(),
                 shorten_home(path, home)
             )),
-            Issue::BackendDisagreement {
-                json,
-                db,
-                differing,
-            } => {
-                let json_noun = plural(*json, "project", "projects");
-                let db_noun = plural(*db, "project", "projects");
-                out.push_str(&format!(
-                    "  - {} projects.json ({json} {json_noun}) and projects.db ({db} {db_noun}) disagree ({differing} ids differ); `overdosecd migrate` or remove the inactive file\n",
-                    "mismatch:".yellow()
-                ));
-            }
-            Issue::InactiveIndexUnreadable { path, message } => out.push_str(&format!(
-                "  - {} {} cannot be read: {message}\n",
-                "unreadable:".red(),
+            Issue::LegacyJson { path } => out.push_str(&format!(
+                "  - {} {} was not migrated (the database already holds projects); `overdosecd migrate` reports why\n",
+                "legacy:".yellow(),
                 shorten_home(path, home)
+            )),
+            Issue::DeprecatedStorageKey => out.push_str(&format!(
+                "  - {} the `[storage] backend` setting is ignored; SQLite is the only backend\n",
+                "config:".dimmed()
             )),
             Issue::IndexPermissions { path, mode } => out.push_str(&format!(
                 "  - {} {} is mode {mode:04o} (expected 0600)\n",
@@ -1231,13 +1223,13 @@ mod tests {
         };
         let rendered = format_doctor(
             &report,
-            Path::new("/data/projects.json"),
+            Path::new("/data/projects.db"),
             2,
             None,
             &config::Status::Defaults { path: None },
-            "json",
+            "sqlite (schema v2)",
         );
-        assert!(rendered.contains("index: /data/projects.json (2 projects)"));
+        assert!(rendered.contains("index: /data/projects.db (2 projects)"));
         assert!(rendered.contains("issues (2):"));
         assert!(rendered.contains("stale: `gone` -> /tmp/gone"));
         assert!(rendered.contains("quarantine: /data/projects.json.corrupt-1"));

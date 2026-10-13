@@ -119,12 +119,6 @@ impl GitInfo {
 }
 
 impl Project {
-    /// Records a successful jump: bumps the count and stamps the time.
-    pub fn record_use(&mut self, now: DateTime<Utc>) {
-        self.last_used_at = Some(now);
-        self.use_count = self.use_count.saturating_add(1);
-    }
-
     /// Creates a fresh, unpinned project with no aliases or tags.
     #[cfg(test)]
     pub(crate) fn for_test(name: &str, path: &str) -> Self {
@@ -503,23 +497,6 @@ mod tests {
         assert_eq!(default_name(Path::new("/a/b/c")).unwrap(), "c");
         assert_eq!(default_name(Path::new("relative")).unwrap(), "relative");
         assert!(default_name(Path::new("/")).is_err());
-    }
-
-    #[test]
-    fn record_use_stamps_time_and_counts() {
-        let mut project = Project::for_test("alpha", "/tmp/alpha");
-        let now = Utc::now();
-
-        project.record_use(now);
-        assert_eq!(project.last_used_at, Some(now));
-        assert_eq!(project.use_count, 1);
-
-        project.record_use(now);
-        assert_eq!(project.use_count, 2);
-
-        project.use_count = u64::MAX;
-        project.record_use(now);
-        assert_eq!(project.use_count, u64::MAX, "the count must saturate");
     }
 
     #[test]

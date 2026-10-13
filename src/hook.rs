@@ -69,7 +69,7 @@ impl Visits {
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut body = serde_json::to_vec_pretty(self)?;
         body.push(b'\n');
-        crate::store::json::write_private(path, &body)
+        crate::paths::write_private(path, &body)
     }
 
     /// Bumps the counter for `path` and returns the new count.

@@ -33,13 +33,12 @@ use crate::cli::{
     AddArgs, Cli, Command, DoctorArgs, ImportArgs, ListArgs, RemoveArgs, ScanArgs, SortBy,
     TermCommand,
 };
-use crate::config::{ColorMode, StorageBackend};
+use crate::config::ColorMode;
 use crate::error::{Error, Result};
 use crate::matcher::MatcherConfig;
 use crate::project::{Project, TermKind};
-use crate::store::json::{JsonStore, StoreFile};
+use crate::store::json::StoreFile;
 use crate::store::sqlite::SqliteStore;
-use crate::store::{AnyStore, Store};
 
 fn main() {
     let cli = Cli::parse();
@@ -69,17 +68,33 @@ fn run(cli: Cli) -> Result<i32> {
     let location = config::locate(config::env_path(), config::platform_path());
     let config = config::load(&location);
 
-    // `doctor` and tab completion run before the strict config load, so a
-    // broken config falls back to the default backend for them instead of
-    // failing. Every other command stops at `config?` below anyway.
-    let backend = config.as_ref().map_or_else(
-        |_| StorageBackend::default(),
-        |config| config.storage.backend,
+    // The one-shot migration of a 0.2.0 `projects.json` runs before anything
+    // touches the index. `doctor` and the shell-integration commands keep
+    // going when it refuses (they must not break setup or a `cd`); every
+    // other command stops with the reason.
+    let lenient = matches!(
+        cli.command,
+        Command::Doctor(_) | Command::Complete { .. } | Command::Hook | Command::Init { .. }
     );
-    let store = match backend {
-        StorageBackend::Json => AnyStore::Json(JsonStore::new(paths::store_file(&data_dir))),
-        StorageBackend::Sqlite => AnyStore::Sqlite(SqliteStore::new(paths::sqlite_file(&data_dir))),
-    };
+    match migrate::auto(&data_dir) {
+        Ok(Some(migrate::Outcome::Migrated { projects, backup })) => {
+            let noun = output::plural(projects, "project", "projects");
+            let _ = output::print_stderr_line(&format!(
+                "note: migrated {projects} {noun} from projects.json into projects.db \
+                 (the original is kept as {})",
+                sanitize::path(&backup)
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if lenient => {
+            let _ = output::print_stderr_line(&format!(
+                "warning: could not migrate projects.json: {err}"
+            ));
+        }
+        Err(err) => return Err(err),
+    }
+
+    let store = SqliteStore::new(paths::sqlite_file(&data_dir));
 
     // `doctor` reports an unreadable config instead of failing on it; every
     // other command stops at `config?` below. Either way the color mode follows
@@ -103,13 +118,19 @@ fn run(cli: Cli) -> Result<i32> {
         });
 
     match cli.command {
-        Command::Doctor(args) => cmd_doctor(
-            &store,
-            &data_dir,
-            backend,
-            args,
-            config::status(&location, config),
-        ),
+        Command::Doctor(args) => {
+            let retired_storage = config
+                .as_ref()
+                .ok()
+                .is_some_and(|config| config.storage.backend.is_some());
+            cmd_doctor(
+                &store,
+                &data_dir,
+                args,
+                config::status(&location, config),
+                retired_storage,
+            )
+        }
         // Completion runs on every TAB press and uses no matcher knobs, so it
         // deliberately does not fail on a broken config.
         Command::Complete { prefix } => cmd_complete(&store, &prefix).map(|()| 0),
@@ -147,7 +168,6 @@ fn run(cli: Cli) -> Result<i32> {
                     let options = ui::Options::resolve(&config.ui, args.query, args.no_track);
                     let context = ui::Context {
                         data_dir: &data_dir,
-                        backend,
                         discovery: &config.discovery,
                     };
                     return ui::run(&store, &context, &matching, color_mode, &options);
@@ -169,7 +189,7 @@ fn run(cli: Cli) -> Result<i32> {
                 Command::Tag { action } => {
                     cmd_term(&store, action, TermKind::Tag, &matching, debug)?
                 }
-                Command::Migrate => cmd_migrate(&data_dir, backend, &location)?,
+                Command::Migrate => cmd_migrate(&data_dir)?,
                 Command::Import(args) => cmd_import(&store, args)?,
                 Command::Scan(args) => cmd_scan(&data_dir, &config.discovery, args)?,
                 Command::Completions { shell } => output::print(&output::completion_script(shell))?,
@@ -187,7 +207,7 @@ fn run(cli: Cli) -> Result<i32> {
     }
 }
 
-fn cmd_add(store: &impl Store, args: AddArgs) -> Result<()> {
+fn cmd_add(store: &SqliteStore, args: AddArgs) -> Result<()> {
     let input = match args.path {
         Some(path) => path,
         None => std::env::current_dir()?,
@@ -219,7 +239,7 @@ fn sanitize_terms(kind: &'static str, values: &[String]) -> Result<Vec<String>> 
     Ok(terms)
 }
 
-fn cmd_list(store: &impl Store, args: ListArgs) -> Result<()> {
+fn cmd_list(store: &SqliteStore, args: ListArgs) -> Result<()> {
     // Fail fast on a bad window, before touching the index.
     let since = args
         .since
@@ -297,7 +317,7 @@ fn resolve(
 
 /// Prints completion candidates, one per line; used by the shell completion
 /// functions so `ocd <TAB>` offers the same values a jump would accept.
-fn cmd_complete(store: &impl Store, prefix: &str) -> Result<()> {
+fn cmd_complete(store: &SqliteStore, prefix: &str) -> Result<()> {
     let projects = store.load()?;
     for candidate in matcher::completion_candidates(&projects, prefix) {
         output::print_line(&candidate)?;
@@ -308,7 +328,7 @@ fn cmd_complete(store: &impl Store, prefix: &str) -> Result<()> {
 /// The optional `cd` hook. Silent on success, at most one stderr line, and it
 /// returns nothing so the caller always exits 0: it must never change what
 /// the user's `cd` does.
-fn cmd_hook(store: &impl Store, data_dir: &Path, hooks: output::HookSettings) {
+fn cmd_hook(store: &SqliteStore, data_dir: &Path, hooks: output::HookSettings) {
     // A wrapper can linger in a shell after the config was turned off again.
     if !hooks.any() {
         return;
@@ -364,7 +384,7 @@ fn cmd_hook(store: &impl Store, data_dir: &Path, hooks: output::HookSettings) {
 }
 
 fn cmd_goto(
-    store: &impl Store,
+    store: &SqliteStore,
     query: &str,
     confident: bool,
     no_track: bool,
@@ -409,7 +429,7 @@ fn cmd_goto(
     Ok(())
 }
 
-fn cmd_info(store: &impl Store, query: &str, matching: &MatcherConfig, debug: bool) -> Result<()> {
+fn cmd_info(store: &SqliteStore, query: &str, matching: &MatcherConfig, debug: bool) -> Result<()> {
     let projects = store.load()?;
     let found = resolve(&projects, query, matching, debug)?;
     let project = &projects[found.index];
@@ -477,7 +497,7 @@ fn cmd_info(store: &impl Store, query: &str, matching: &MatcherConfig, debug: bo
 }
 
 fn cmd_remove(
-    store: &impl Store,
+    store: &SqliteStore,
     args: RemoveArgs,
     matching: &MatcherConfig,
     debug: bool,
@@ -529,7 +549,7 @@ fn cmd_remove(
 /// Resolves a query to `(id, name)` without locking; callers must re-verify
 /// the id inside [`Store::update`] before mutating.
 fn resolve_id(
-    store: &impl Store,
+    store: &SqliteStore,
     query: &str,
     matching: &MatcherConfig,
     debug: bool,
@@ -543,7 +563,7 @@ fn resolve_id(
 }
 
 fn cmd_pin(
-    store: &impl Store,
+    store: &SqliteStore,
     query: &str,
     pinned: bool,
     matching: &MatcherConfig,
@@ -568,7 +588,7 @@ fn cmd_pin(
 }
 
 fn cmd_rename(
-    store: &impl Store,
+    store: &SqliteStore,
     old: &str,
     new: &str,
     force: bool,
@@ -612,7 +632,7 @@ fn cmd_rename(
 }
 
 fn cmd_term(
-    store: &impl Store,
+    store: &SqliteStore,
     action: TermCommand,
     kind: TermKind,
     matching: &MatcherConfig,
@@ -633,13 +653,9 @@ fn cmd_term(
     output::print_line(&message)
 }
 
-/// Imports `projects.json` into `projects.db`; the JSON original is kept as a
-/// `projects.json.migrated-<timestamp>` sibling.
-fn cmd_migrate(
-    data_dir: &Path,
-    backend: StorageBackend,
-    location: &config::Location,
-) -> Result<()> {
+/// Imports a legacy `projects.json` into `projects.db` on request; startup
+/// does this automatically, so the command is for seeing the outcome by hand.
+fn cmd_migrate(data_dir: &Path) -> Result<()> {
     match migrate::run(data_dir)? {
         migrate::Outcome::Migrated { projects, backup } => {
             let noun = output::plural(projects, "project", "projects");
@@ -651,18 +667,7 @@ fn cmd_migrate(
                 "migrated {projects} {noun} to {} (projects.json kept as {})",
                 sanitize::path(&paths::sqlite_file(data_dir)),
                 sanitize::text(&backup_name)
-            ))?;
-
-            if backend == StorageBackend::Json {
-                let target = location
-                    .path
-                    .as_deref()
-                    .map_or_else(|| "your config file".to_owned(), sanitize::path);
-                output::print_line(&format!(
-                    "note: set `[storage] backend = \"sqlite\"` in {target} to use the database"
-                ))?;
-            }
-            Ok(())
+            ))
         }
         migrate::Outcome::AlreadyMigrated { db } => output::print_line(&format!(
             "already migrated: {} is present",
@@ -674,7 +679,7 @@ fn cmd_migrate(
 /// Imports another jumper's store: one planning pass against a snapshot, then
 /// one locked update that re-verifies every path (vanished or racy entries are
 /// reported, never resurrected).
-fn cmd_import(store: &impl Store, args: ImportArgs) -> Result<()> {
+fn cmd_import(store: &SqliteStore, args: ImportArgs) -> Result<()> {
     let home = project::home_dir();
     let path = import::resolve_path(args.source)?;
     let parsed = import::parse_at(args.source, &path)?;
@@ -798,13 +803,13 @@ fn cmd_scan(data_dir: &Path, settings: &config::Discovery, args: ScanArgs) -> Re
 }
 
 fn cmd_doctor(
-    store: &impl Store,
+    store: &SqliteStore,
     data_dir: &Path,
-    backend: StorageBackend,
     args: DoctorArgs,
     config_status: config::Status,
+    retired_storage: bool,
 ) -> Result<i32> {
-    let index_path = paths::index_file(data_dir, backend);
+    let index_path = paths::sqlite_file(data_dir);
 
     if args.refresh {
         let (total, changed) = store.update(|projects| {
@@ -874,22 +879,27 @@ fn cmd_doctor(
         }
     }
 
-    let schema = store.schema_version()?;
-    let storage = match backend {
-        StorageBackend::Json => "json".to_owned(),
-        StorageBackend::Sqlite => match schema {
-            Some(version) => format!("sqlite (schema v{version})"),
-            None => "sqlite (no database yet)".to_owned(),
-        },
+    // The link was already reported by the load above; keep diagnosing.
+    let schema = match store.schema_version() {
+        Ok(schema) => schema,
+        Err(Error::SymlinkedPath { .. }) => None,
+        Err(err) => return Err(err),
+    };
+    let storage = match schema {
+        Some(version) => format!("sqlite (schema v{version})"),
+        None => "sqlite (no database yet)".to_owned(),
     };
 
-    let mut report = doctor::inspect(data_dir, backend, &projects);
+    let mut report = doctor::inspect(data_dir, &projects);
     report.issues.extend(link_issues);
     if let config::Status::Invalid { path, message } = &config_status {
         report.issues.push(doctor::Issue::ConfigProblem {
             path: path.clone(),
             message: message.clone(),
         });
+    }
+    if retired_storage {
+        report.issues.push(doctor::Issue::DeprecatedStorageKey);
     }
     if let Some(cache) = discovery::load_cache(&discovery::cache_path(data_dir)) {
         output::print_line(&format!(

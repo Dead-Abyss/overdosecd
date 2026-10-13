@@ -5,26 +5,6 @@ use assert_cmd::Command as Cmd;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-/// The storage backends every behavior test runs against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
-    Json,
-    Sqlite,
-}
-
-/// Runs a test body once per backend, binding the sandbox to `$sandbox`.
-///
-/// JSON is the default and needs no config file; SQLite is selected by
-/// writing `[storage] backend = "sqlite"` into the sandbox config.
-macro_rules! dual {
-    ($sandbox:ident, $body:block) => {
-        for backend in [Backend::Json, Backend::Sqlite] {
-            let $sandbox = Sandbox::with_backend(backend);
-            $body
-        }
-    };
-}
-
 struct Sandbox {
     /// Keeps the temporary directory alive; build paths from `root` instead.
     _tempdir: TempDir,
@@ -33,34 +13,24 @@ struct Sandbox {
     root: PathBuf,
     projects: PathBuf,
     data: PathBuf,
-    backend: Backend,
     config_path: PathBuf,
 }
 
 impl Sandbox {
     fn new() -> Self {
-        Self::with_backend(Backend::Json)
-    }
-
-    fn with_backend(backend: Backend) -> Self {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let root = canonical_path(tempdir.path());
         let projects = root.join("projects");
         fs::create_dir_all(&projects).expect("create projects dir");
         let data = root.join("data");
         let config_path = root.join("overdosecd-config.toml");
-        let sandbox = Self {
+        Self {
             _tempdir: tempdir,
             root,
             projects,
             data,
-            backend,
             config_path,
-        };
-        if backend == Backend::Sqlite {
-            sandbox.write_config("");
         }
-        sandbox
     }
 
     fn project(&self, name: &str) -> PathBuf {
@@ -69,22 +39,9 @@ impl Sandbox {
         path
     }
 
-    /// The index file for this backend.
+    /// The index file: SQLite is the only backend since 0.3.0.
     fn index_file(&self) -> PathBuf {
-        self.data.join(self.index_name())
-    }
-
-    fn index_name(&self) -> &'static str {
-        match self.backend {
-            Backend::Json => "projects.json",
-            Backend::Sqlite => "projects.db",
-        }
-    }
-
-    /// The config file the CLI should read, when the sandbox needs one:
-    /// JSON is the built-in default, so only SQLite writes a config file.
-    fn storage_config(&self) -> Option<&Path> {
-        (self.backend == Backend::Sqlite).then_some(self.config_path.as_path())
+        self.data.join("projects.db")
     }
 
     fn cmd(&self) -> Cmd {
@@ -116,23 +73,19 @@ impl Sandbox {
             .env("HOME", &self.root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("NO_COLOR", "1");
-        if let Some(config) = self.storage_config() {
-            command.env("OVERDOSECD_CONFIG", config);
+        // Once a test writes a config file, every command reads it through
+        // `OVERDOSECD_CONFIG` so the platform path is never consulted.
+        if self.config_path.exists() {
+            command.env("OVERDOSECD_CONFIG", &self.config_path);
         }
         command
     }
 
-    /// Writes a config file and returns its path, meant to be passed via
-    /// `OVERDOSECD_CONFIG` so the test does not depend on platform config paths.
-    /// The sandbox's storage backend is kept, so a test body only supplies
-    /// its own settings.
+    /// Writes the sandbox config file and returns its path, meant to be passed
+    /// via `OVERDOSECD_CONFIG` so the test does not depend on platform config
+    /// paths.
     fn write_config(&self, body: &str) -> PathBuf {
-        let mut content = String::new();
-        if self.backend == Backend::Sqlite {
-            content.push_str("[storage]\nbackend = \"sqlite\"\n");
-        }
-        content.push_str(body);
-        fs::write(&self.config_path, content).expect("write config file");
+        fs::write(&self.config_path, body).expect("write config file");
         self.config_path.clone()
     }
 
@@ -145,34 +98,17 @@ impl Sandbox {
         canonical_path(path).display().to_string()
     }
 
-    /// Backdates a project's `last_used_at` on either backend, so `--since`
+    /// Backdates a project's `last_used_at` in the database, so `--since`
     /// windows can be tested without waiting.
     fn age_last_used(&self, name: &str, ago: chrono::Duration) {
         let when = chrono::Utc::now() - ago;
         let when = when.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
-        match self.backend {
-            Backend::Json => {
-                let path = self.index_file();
-                let raw = fs::read_to_string(&path).expect("read json index");
-                let mut value: serde_json::Value =
-                    serde_json::from_str(&raw).expect("parse json index");
-                for project in value["projects"].as_array_mut().expect("projects array") {
-                    if project["name"] == name {
-                        project["last_used_at"] = serde_json::Value::String(when.clone());
-                    }
-                }
-                let body = serde_json::to_string_pretty(&value).expect("encode json index");
-                fs::write(&path, body).expect("write json index");
-            }
-            Backend::Sqlite => {
-                let conn = rusqlite::Connection::open(self.index_file()).expect("open database");
-                conn.execute(
-                    "UPDATE projects SET last_used_at = ?1 WHERE name = ?2",
-                    rusqlite::params![when, name],
-                )
-                .expect("age the project");
-            }
-        }
+        let conn = rusqlite::Connection::open(self.index_file()).expect("open database");
+        conn.execute(
+            "UPDATE projects SET last_used_at = ?1 WHERE name = ?2",
+            rusqlite::params![when, name],
+        )
+        .expect("age the project");
     }
 }
 
@@ -191,7 +127,9 @@ fn shortened(relative: &str) -> String {
 
 #[test]
 fn add_list_goto_info_remove_round_trip() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("overdosecd");
         let canonical = sandbox.canonical(&project);
 
@@ -235,12 +173,14 @@ fn add_list_goto_info_remove_round_trip() {
             .assert()
             .success()
             .stdout(predicate::str::contains("no projects yet"));
-    });
+    }
 }
 
 #[test]
 fn add_without_path_uses_current_directory() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("cwd-project");
 
         sandbox
@@ -256,12 +196,14 @@ fn add_without_path_uses_current_directory() {
             .assert()
             .success()
             .stdout(format!("{}\n", sandbox.canonical(&project)));
-    });
+    }
 }
 
 #[test]
 fn add_expands_tilde_and_defaults_name() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("tilde-project");
 
         sandbox
@@ -277,12 +219,14 @@ fn add_expands_tilde_and_defaults_name() {
             .assert()
             .success()
             .stdout(format!("{}\n", sandbox.canonical(&project)));
-    });
+    }
 }
 
 #[test]
 fn add_accepts_name_alias_and_tag() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("real-directory");
 
         sandbox
@@ -316,12 +260,14 @@ fn add_accepts_name_alias_and_tag() {
                 predicate::str::contains("aliases:   w")
                     .and(predicate::str::contains("tags:      rust")),
             );
-    });
+    }
 }
 
 #[test]
 fn adding_a_missing_directory_fails() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let missing = sandbox.root.join("not-here");
 
         sandbox
@@ -332,12 +278,14 @@ fn adding_a_missing_directory_fails() {
             .failure()
             .code(1)
             .stderr(predicate::str::contains("directory does not exist"));
-    });
+    }
 }
 
 #[test]
 fn duplicate_path_is_rejected_unless_forced() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("overdosecd");
         sandbox.add(&project);
 
@@ -364,12 +312,14 @@ fn duplicate_path_is_rejected_unless_forced() {
             .args(["goto", "over-renamed"])
             .assert()
             .success();
-    });
+    }
 }
 
 #[test]
 fn ambiguous_query_lists_candidates_with_exit_1() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("app-one"));
         sandbox.add(&sandbox.project("app-two"));
 
@@ -386,12 +336,14 @@ fn ambiguous_query_lists_candidates_with_exit_1() {
                     .and(predicate::str::contains("name prefix"))
                     .and(predicate::str::contains(shortened("projects/app-one"))),
             );
-    });
+    }
 }
 
 #[test]
 fn unknown_query_fails_with_exit_1() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
 
         sandbox
@@ -401,12 +353,14 @@ fn unknown_query_fails_with_exit_1() {
             .failure()
             .code(1)
             .stderr(predicate::str::contains("no project matched query: qqqqzz"));
-    });
+    }
 }
 
 #[test]
 fn exact_name_wins_over_prefix() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let exact = sandbox.project("over");
         sandbox.add(&exact);
         sandbox.add(&sandbox.project("overdosecd"));
@@ -417,12 +371,14 @@ fn exact_name_wins_over_prefix() {
             .assert()
             .success()
             .stdout(format!("{}\n", sandbox.canonical(&exact)));
-    });
+    }
 }
 
 #[test]
 fn goto_reports_missing_directory() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("vanishing");
         sandbox.add(&project);
         fs::remove_dir_all(&project).expect("remove project dir");
@@ -434,12 +390,14 @@ fn goto_reports_missing_directory() {
             .failure()
             .code(1)
             .stderr(predicate::str::contains("directory no longer exists"));
-    });
+    }
 }
 
 #[test]
 fn list_hides_missing_directories_unless_all() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("vanishing");
         sandbox.add(&project);
         fs::remove_dir_all(&project).expect("remove project dir");
@@ -460,12 +418,14 @@ fn list_hides_missing_directories_unless_all() {
                 predicate::str::contains("vanishing")
                     .and(predicate::str::contains("directory missing")),
             );
-    });
+    }
 }
 
 #[test]
 fn list_json_contains_version_and_projects() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
 
         let output = sandbox.cmd().args(["list", "--json"]).output().unwrap();
@@ -478,7 +438,7 @@ fn list_json_contains_version_and_projects() {
         assert_eq!(projects[0]["name"], "overdosecd");
         assert!(projects[0]["path"].is_string());
         assert!(projects[0]["aliases"].is_array());
-    });
+    }
 }
 
 #[test]
@@ -498,7 +458,9 @@ fn piped_list_is_never_truncated() {
 
 #[test]
 fn list_since_filters_by_last_used() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("ancient"));
         sandbox.add(&sandbox.project("fresh"));
         sandbox.cmd().args(["goto", "ancient"]).assert().success();
@@ -528,12 +490,14 @@ fn list_since_filters_by_last_used() {
             .assert()
             .success()
             .stdout(predicate::str::contains("ancient"));
-    });
+    }
 }
 
 #[test]
 fn list_since_without_matches_prints_its_own_message() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         // Indexed but never jumped to: excluded by any window.
         sandbox.add(&sandbox.project("overdosecd"));
 
@@ -546,7 +510,7 @@ fn list_since_without_matches_prints_its_own_message() {
                 predicate::str::contains("no projects jumped to since 7d")
                     .and(predicate::str::contains("overdosecd").not()),
             );
-    });
+    }
 }
 
 #[test]
@@ -738,7 +702,9 @@ fn debug_flag_explains_no_matches_and_ambiguity() {
 
 #[test]
 fn completions_prints_a_script_for_every_shell() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox
             .cmd()
             .args(["completions", "bash"])
@@ -766,12 +732,14 @@ fn completions_prints_a_script_for_every_shell() {
             .assert()
             .failure()
             .code(2);
-    });
+    }
 }
 
 #[test]
 fn complete_lists_jump_candidates() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let overdosecd = sandbox.project("overdosecd");
         let notes = sandbox.project("notes");
         sandbox
@@ -810,7 +778,7 @@ fn complete_lists_jump_candidates() {
             predicate::str::contains("completions")
                 .and(predicate::str::contains("\n  complete ").not()),
         );
-    });
+    }
 }
 
 #[test]
@@ -864,7 +832,9 @@ fn corrupt_index_is_quarantined_with_exit_3() {
 
 #[test]
 fn paths_with_spaces_and_unicode_work() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("spacey café");
 
         sandbox.add(&project);
@@ -875,13 +845,15 @@ fn paths_with_spaces_and_unicode_work() {
             .assert()
             .success()
             .stdout(format!("{}\n", sandbox.canonical(&project)));
-    });
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn symlinked_directory_is_stored_canonically() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let real = sandbox.project("real-project");
         let link = sandbox.root.join("link-project");
         std::os::unix::fs::symlink(&real, &link).expect("create symlink");
@@ -894,7 +866,7 @@ fn symlinked_directory_is_stored_canonically() {
             .assert()
             .success()
             .stdout(format!("{}\n", sandbox.canonical(&real)));
-    });
+    }
 }
 
 #[test]
@@ -920,7 +892,9 @@ fn init_prints_a_wrapper_for_every_shell() {
 
 #[test]
 fn data_dir_flag_overrides_the_environment() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("overdosecd");
         let other_data = sandbox.root.join("flag-data");
 
@@ -934,19 +908,21 @@ fn data_dir_flag_overrides_the_environment() {
             .success();
 
         assert!(
-            other_data.join(sandbox.index_name()).exists(),
+            other_data.join("projects.db").exists(),
             "the flagged data directory should hold the index"
         );
         assert!(
-            !sandbox.data.join(sandbox.index_name()).exists(),
+            !sandbox.data.join("projects.db").exists(),
             "the environment path should not be written"
         );
-    });
+    }
 }
 
 #[test]
 fn goto_records_usage() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
 
         sandbox
@@ -975,12 +951,14 @@ fn goto_records_usage() {
                 predicate::str::contains("last used: just now")
                     .and(predicate::str::contains("uses:      2")),
             );
-    });
+    }
 }
 
 #[test]
 fn goto_no_track_leaves_stats_alone() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
 
         sandbox
@@ -993,12 +971,14 @@ fn goto_no_track_leaves_stats_alone() {
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["projects"][0]["use_count"], 0);
         assert!(value["projects"][0]["last_used_at"].is_null());
-    });
+    }
 }
 
 #[test]
 fn jumps_reorder_the_default_list_view() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("alpha"));
         sandbox.add(&sandbox.project("bravo"));
 
@@ -1012,12 +992,14 @@ fn jumps_reorder_the_default_list_view() {
             bravo < alpha,
             "bravo should sort first after a jump:\n{text}"
         );
-    });
+    }
 }
 
 #[test]
 fn empty_index_points_at_add() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox
             .cmd()
             .args(["goto", "anything"])
@@ -1028,45 +1010,24 @@ fn empty_index_points_at_add() {
                 predicate::str::contains("no projects indexed yet")
                     .and(predicate::str::contains("overdosecd add")),
             );
-    });
+    }
 }
 
-/// A held write lock allows reads (a jump still prints its path) but blocks
-/// writers for the same ~500 ms window before the timeout, on both backends:
-/// the JSON sidecar lock and a SQLite write transaction.
+/// A held write transaction allows reads (a jump still prints its path) but
+/// blocks writers for the same ~500 ms window before the timeout.
 #[test]
 fn a_held_lock_allows_a_jump_but_blocks_writes() {
-    {
-        let sandbox = Sandbox::new();
-        let project = sandbox.project("overdosecd");
-        sandbox.add(&project);
+    let sandbox = Sandbox::new();
+    let project = sandbox.project("overdosecd");
+    sandbox.add(&project);
 
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(sandbox.data.join("projects.lock"))
-            .expect("open lock file");
-        let mut held = fd_lock::RwLock::new(file);
-        let _guard = held.try_write().expect("test should hold the lock");
+    let held = rusqlite::Connection::open(sandbox.index_file()).expect("open database");
+    held.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold the write lock");
 
-        assert_reads_pass_writes_time_out(&sandbox, &project);
-    }
+    assert_reads_pass_writes_time_out(&sandbox, &project);
 
-    {
-        let sandbox = Sandbox::with_backend(Backend::Sqlite);
-        let project = sandbox.project("overdosecd");
-        sandbox.add(&project);
-
-        let held = rusqlite::Connection::open(sandbox.index_file()).expect("open database");
-        held.execute_batch("BEGIN IMMEDIATE")
-            .expect("hold the write lock");
-
-        assert_reads_pass_writes_time_out(&sandbox, &project);
-
-        held.execute_batch("ROLLBACK").expect("release the lock");
-    }
+    held.execute_batch("ROLLBACK").expect("release the lock");
 }
 
 /// The shared expectation of the lock tests: the jump passes and warns about
@@ -1096,7 +1057,7 @@ fn assert_reads_pass_writes_time_out(sandbox: &Sandbox, project: &Path) {
 /// empty index.
 #[test]
 fn sqlite_corrupt_database_fails_with_exit_3() {
-    let sandbox = Sandbox::with_backend(Backend::Sqlite);
+    let sandbox = Sandbox::new();
     fs::create_dir_all(&sandbox.data).expect("create data dir");
     fs::write(sandbox.index_file(), "definitely not a database").expect("write corrupt file");
 
@@ -1118,7 +1079,7 @@ fn sqlite_corrupt_database_fails_with_exit_3() {
 
 #[test]
 fn sqlite_info_shows_jump_history() {
-    let sandbox = Sandbox::with_backend(Backend::Sqlite);
+    let sandbox = Sandbox::new();
     sandbox.add(&sandbox.project("overdosecd"));
     sandbox
         .cmd()
@@ -1144,7 +1105,7 @@ fn sqlite_info_shows_jump_history() {
 
 #[test]
 fn sqlite_goto_no_track_records_no_history() {
-    let sandbox = Sandbox::with_backend(Backend::Sqlite);
+    let sandbox = Sandbox::new();
     sandbox.add(&sandbox.project("overdosecd"));
 
     sandbox
@@ -1165,33 +1126,9 @@ fn sqlite_goto_no_track_records_no_history() {
         );
 }
 
-/// The JSON backend keeps counters only, so `info` must not grow a history
-/// line there.
-#[test]
-fn json_info_never_shows_history() {
-    let sandbox = Sandbox::new();
-    sandbox.add(&sandbox.project("overdosecd"));
-    sandbox
-        .cmd()
-        .args(["goto", "overdosecd"])
-        .assert()
-        .success();
-
-    sandbox
-        .cmd()
-        .args(["info", "overdosecd"])
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("history:")
-                .not()
-                .and(predicate::str::contains("uses:      1")),
-        );
-}
-
 #[test]
 fn doctor_reports_the_sqlite_schema() {
-    let sandbox = Sandbox::with_backend(Backend::Sqlite);
+    let sandbox = Sandbox::new();
 
     sandbox
         .cmd()
@@ -1214,7 +1151,9 @@ fn doctor_reports_the_sqlite_schema() {
 
 #[test]
 fn project_kind_is_detected_and_filtered() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let rust = sandbox.project("engine");
         fs::write(rust.join("Cargo.toml"), "[package]").unwrap();
         let node = sandbox.project("website");
@@ -1262,12 +1201,12 @@ fn project_kind_is_detected_and_filtered() {
             .assert()
             .success()
             .stdout(predicate::str::contains("website"));
-    });
+    }
 }
 
 #[test]
 fn doctor_reports_stray_sqlite_files() {
-    let sandbox = Sandbox::with_backend(Backend::Sqlite);
+    let sandbox = Sandbox::new();
     fs::create_dir_all(&sandbox.data).expect("create data dir");
     fs::write(sandbox.data.join("projects.db-wal"), "leftover").expect("write stray wal");
 
@@ -1277,71 +1216,52 @@ fn doctor_reports_stray_sqlite_files() {
 }
 
 #[test]
-fn doctor_reports_a_disagreeing_json_and_sqlite_pair() {
-    let sandbox = Sandbox::with_backend(Backend::Sqlite);
+fn doctor_reports_a_legacy_json_that_was_not_migrated() {
+    let sandbox = Sandbox::new();
     sandbox.add(&sandbox.project("alpha"));
 
-    // A stale JSON copy with a different id appears next to the database.
+    // A planted legacy index appears next to the populated database: the
+    // startup migration refuses it and leaves the file in place.
     let beta = sandbox.project("beta");
-    let beta_json = serde_json::to_string(&sandbox.canonical(&beta)).expect("encode path");
-    fs::write(
-        sandbox.data.join("projects.json"),
-        format!(
-            r#"{{"version":1,"projects":[{{"id":"deadbeef","name":"beta","path":{beta_json},"aliases":[],"tags":[],"created_at":"2026-09-28T00:00:00Z","last_used_at":null,"use_count":0,"pinned":false}}]}}"#
-        ),
-    )
-    .expect("write stale json");
+    write_json_index(
+        &sandbox,
+        serde_json::json!([{
+            "id": "deadbeef",
+            "name": "beta",
+            "path": sandbox.canonical(&beta),
+            "aliases": [],
+            "tags": [],
+            "created_at": "2026-09-28T00:00:00Z",
+            "last_used_at": null,
+            "use_count": 0,
+            "pinned": false,
+        }]),
+    );
 
     sandbox
         .cmd()
         .arg("doctor")
         .assert()
         .code(1)
-        .stdout(predicate::str::contains("mismatch:").and(predicate::str::contains("disagree")));
-
+        .stdout(predicate::str::contains("legacy:").and(predicate::str::contains("not migrated")));
     assert!(
         sandbox.data.join("projects.json").exists(),
-        "doctor must not quarantine or rewrite the inactive index"
+        "doctor must not rewrite the refused legacy file"
     );
-}
 
-#[test]
-fn doctor_accepts_an_agreeing_pair() {
-    let sandbox = Sandbox::new();
-    sandbox.add(&sandbox.project("alpha"));
-    let config = sandbox.write_config("[storage]\nbackend = \"sqlite\"\n");
+    // A strict command surfaces the clash instead of silently ignoring it.
     sandbox
         .cmd()
-        .env("OVERDOSECD_CONFIG", &config)
-        .arg("migrate")
+        .arg("list")
         .assert()
-        .success();
-
-    // Restore the backup as the live JSON file: same ids as the database.
-    let backup = fs::read_dir(&sandbox.data)
-        .expect("read data dir")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("projects.json.migrated-"))
-        })
-        .expect("backup exists");
-    fs::rename(&backup, sandbox.data.join("projects.json")).expect("restore backup");
-
-    sandbox
-        .cmd()
-        .env("OVERDOSECD_CONFIG", &config)
-        .arg("doctor")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("no problems found"));
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("refusing to overwrite"));
 }
 
 #[test]
 fn doctor_reports_json_quarantine_files_with_sqlite_active() {
-    let sandbox = Sandbox::with_backend(Backend::Sqlite);
+    let sandbox = Sandbox::new();
     sandbox.add(&sandbox.project("overdosecd"));
     let quarantined = sandbox.data.join("projects.json.corrupt-20260101000000");
     fs::write(&quarantined, "{ not json").expect("write quarantine file");
@@ -1360,7 +1280,7 @@ fn doctor_reports_json_quarantine_files_with_sqlite_active() {
 #[cfg(unix)]
 #[test]
 fn doctor_reports_loose_sqlite_permissions() {
-    let sandbox = Sandbox::with_backend(Backend::Sqlite);
+    let sandbox = Sandbox::new();
     sandbox.add(&sandbox.project("overdosecd"));
     let index = sandbox.data.join("projects.db");
 
@@ -1417,7 +1337,9 @@ fn write_zoxide_fixture(dir: &Path, entries: &[(&Path, f64, u64)]) {
 
 #[test]
 fn import_zoxide_lands_counters_and_timestamps() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let store = sandbox.root.join("zoxide-store");
         let one = PathBuf::from(sandbox.canonical(&sandbox.project("one")));
         let two = PathBuf::from(sandbox.canonical(&sandbox.project("two")));
@@ -1440,12 +1362,14 @@ fn import_zoxide_lands_counters_and_timestamps() {
                 predicate::str::contains("\"use_count\": 12")
                     .and(predicate::str::contains("2023-11-14")),
             );
-    });
+    }
 }
 
 #[test]
 fn import_is_idempotent() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let store = sandbox.root.join("zoxide-store");
         let one = PathBuf::from(sandbox.canonical(&sandbox.project("one")));
         write_zoxide_fixture(&store, &[(&one, 5.0, 0)]);
@@ -1474,12 +1398,14 @@ fn import_is_idempotent() {
             .assert()
             .success()
             .stdout(predicate::str::contains("\"use_count\": 5"));
-    });
+    }
 }
 
 #[test]
 fn import_dry_run_matches_the_list_it_would_produce() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let store = sandbox.root.join("zoxide-store");
         let one = PathBuf::from(sandbox.canonical(&sandbox.project("one")));
         let two = PathBuf::from(sandbox.canonical(&sandbox.project("two")));
@@ -1517,12 +1443,14 @@ fn import_dry_run_matches_the_list_it_would_produce() {
             dry_stdout.starts_with(&list_stdout),
             "dry run:\n{dry_stdout}\nlist:\n{list_stdout}"
         );
-    });
+    }
 }
 
 #[test]
 fn import_autojump_reports_blacklist_missing_and_malformed() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let store = sandbox.root.join("autojump-store");
         fs::create_dir_all(&store).expect("create store dir");
         let one = PathBuf::from(sandbox.canonical(&sandbox.project("one")));
@@ -1545,13 +1473,15 @@ fn import_autojump_reports_blacklist_missing_and_malformed() {
                     .and(predicate::str::contains("1 excluded"))
                     .and(predicate::str::contains("1 malformed")),
             );
-    });
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn import_zshz_keeps_pipes_in_paths() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let dir = sandbox.projects.join("we|ird");
         fs::create_dir_all(&dir).expect("create project dir");
         let canonical = PathBuf::from(sandbox.canonical(&dir));
@@ -1572,7 +1502,7 @@ fn import_zshz_keeps_pipes_in_paths() {
             .assert()
             .success()
             .stdout(predicate::str::contains("we|ird"));
-    });
+    }
 }
 
 #[test]
@@ -1594,7 +1524,9 @@ fn import_missing_source_names_the_path() {
 
 #[test]
 fn hook_records_a_cd_into_an_indexed_project() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let config = sandbox.write_config("[general]\nhook = true\n");
         let project = sandbox.project("alpha");
         sandbox.add(&project);
@@ -1617,12 +1549,14 @@ fn hook_records_a_cd_into_an_indexed_project() {
             .stdout(predicate::str::contains("\"use_count\": 1"));
         // No hint state is written when the directory is indexed.
         assert!(!sandbox.data.join("hook-visits.json").exists());
-    });
+    }
 }
 
 #[test]
 fn hook_is_silent_when_disabled() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("alpha");
         sandbox.add(&project);
 
@@ -1635,12 +1569,14 @@ fn hook_is_silent_when_disabled() {
             .stdout("")
             .stderr("");
         assert!(!sandbox.data.join("hook-visits.json").exists());
-    });
+    }
 }
 
 #[test]
 fn hook_hints_after_three_visits_and_then_cools_down() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let config = sandbox.write_config("[general]\nhook = true\nhint = true\n");
         let dir = sandbox.root.join("frequented");
         fs::create_dir_all(&dir).expect("create dir");
@@ -1677,17 +1613,17 @@ fn hook_hints_after_three_visits_and_then_cools_down() {
             .success()
             .stderr("");
         assert!(sandbox.data.join("hook-visits.json").exists());
-    });
+    }
 }
 
 #[test]
 fn hook_never_fails_a_cd() {
-    // JSON-only on purpose: the index is hand-broken to prove the hook stays
-    // successful; the store quarantines it as on any other read.
+    // The index is hand-broken to prove the hook stays successful when it
+    // cannot be read.
     let sandbox = Sandbox::new();
     let config = sandbox.write_config("[general]\nhook = true\n");
     fs::create_dir_all(&sandbox.data).expect("create data dir");
-    fs::write(sandbox.data.join("projects.json"), "{ not json").expect("write");
+    fs::write(sandbox.index_file(), "definitely not a database").expect("write");
     let dir = sandbox.project("alpha");
 
     sandbox
@@ -1768,7 +1704,9 @@ fn debug_multi_term_lists_each_word() {
 
 #[test]
 fn mutations_accept_multiple_words() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("rust-web-app");
         sandbox.add(&project);
 
@@ -1784,7 +1722,7 @@ fn mutations_accept_multiple_words() {
             .assert()
             .success()
             .stdout(predicate::str::contains("name:      rust-web-app"));
-    });
+    }
 }
 
 #[test]
@@ -1863,30 +1801,33 @@ fn scan_reports_a_missing_root() {
 }
 
 #[test]
-fn migrate_moves_projects_and_keeps_the_original() {
+fn a_legacy_index_migrates_on_the_next_command() {
     let sandbox = Sandbox::new();
     let project = sandbox.project("overdosecd");
-    sandbox
-        .cmd()
-        .arg("add")
-        .arg(&project)
-        .args(["--alias", "w", "--tag", "rust"])
-        .assert()
-        .success();
-    sandbox
-        .cmd()
-        .args(["goto", "overdosecd"])
-        .assert()
-        .success();
+    write_json_index(
+        &sandbox,
+        serde_json::json!([{
+            "id": "abc12345",
+            "name": "overdosecd",
+            "path": sandbox.canonical(&project),
+            "aliases": ["w"],
+            "tags": ["rust"],
+            "created_at": "2026-09-28T00:00:00Z",
+            "last_used_at": "2026-09-29T00:00:00Z",
+            "use_count": 2,
+            "pinned": false,
+        }]),
+    );
 
-    let config = sandbox.write_config("[storage]\nbackend = \"sqlite\"\n");
+    // The very first command migrates, then serves the query from the
+    // database; counters come along, the jump log starts empty.
     sandbox
         .cmd()
-        .env("OVERDOSECD_CONFIG", &config)
-        .arg("migrate")
+        .args(["goto", "w"])
         .assert()
         .success()
-        .stdout(
+        .stdout(format!("{}\n", sandbox.canonical(&project)))
+        .stderr(
             predicate::str::contains("migrated 1 project")
                 .and(predicate::str::contains("projects.json.migrated-")),
         );
@@ -1896,41 +1837,77 @@ fn migrate_moves_projects_and_keeps_the_original() {
 
     sandbox
         .cmd()
-        .env("OVERDOSECD_CONFIG", &config)
-        .args(["goto", "w"])
-        .assert()
-        .success()
-        .stdout(format!("{}\n", sandbox.canonical(&project)));
-    sandbox
-        .cmd()
-        .env("OVERDOSECD_CONFIG", &config)
         .args(["info", "overdosecd"])
         .assert()
         .success()
         .stdout(
-            // One jump before the migration, one after: the usage carried over.
             predicate::str::contains("tags:      rust")
-                .and(predicate::str::contains("uses:      2")),
+                .and(predicate::str::contains("uses:      3")),
+        );
+}
+
+#[test]
+fn an_empty_command_does_not_mention_migration() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .cmd()
+        .args(["list"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("migrated").not());
+}
+
+#[test]
+fn a_retired_storage_key_is_reported_and_ignored() {
+    let sandbox = Sandbox::new();
+    sandbox.add(&sandbox.project("overdosecd"));
+    // A 0.2.0 config keeps loading; doctor points at the stale key.
+    let config = sandbox.write_config("[storage]\nbackend = \"sqlite\"\n");
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_CONFIG", &config)
+        .args(["goto", "overdosecd"])
+        .assert()
+        .success();
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_CONFIG", &config)
+        .arg("doctor")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("[storage] backend").and(predicate::str::contains("ignored")),
         );
 }
 
 #[test]
 fn migrate_is_idempotent() {
     let sandbox = Sandbox::new();
-    sandbox.add(&sandbox.project("overdosecd"));
-    let config = sandbox.write_config("[storage]\nbackend = \"sqlite\"\n");
+    let project = sandbox.project("overdosecd");
+    write_json_index(
+        &sandbox,
+        serde_json::json!([{
+            "id": "abc12345",
+            "name": "overdosecd",
+            "path": sandbox.canonical(&project),
+            "aliases": [],
+            "tags": [],
+            "created_at": "2026-09-28T00:00:00Z",
+            "last_used_at": null,
+            "use_count": 0,
+            "pinned": false,
+        }]),
+    );
 
     sandbox
         .cmd()
-        .env("OVERDOSECD_CONFIG", &config)
-        .arg("migrate")
+        .args(["list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("migrated 1 project"));
+        .stderr(predicate::str::contains("migrated 1 project"));
 
     sandbox
         .cmd()
-        .env("OVERDOSECD_CONFIG", &config)
         .arg("migrate")
         .assert()
         .success()
@@ -1941,20 +1918,26 @@ fn migrate_is_idempotent() {
 fn migrate_refuses_to_clobber_an_existing_database() {
     let sandbox = Sandbox::new();
     sandbox.add(&sandbox.project("alpha"));
-    let config = sandbox.write_config("[storage]\nbackend = \"sqlite\"\n");
+
+    // A planted legacy index appears while the database already holds data.
+    let beta = sandbox.project("beta");
+    write_json_index(
+        &sandbox,
+        serde_json::json!([{
+            "id": "deadbeef",
+            "name": "beta",
+            "path": sandbox.canonical(&beta),
+            "aliases": [],
+            "tags": [],
+            "created_at": "2026-09-28T00:00:00Z",
+            "last_used_at": null,
+            "use_count": 0,
+            "pinned": false,
+        }]),
+    );
+
     sandbox
         .cmd()
-        .env("OVERDOSECD_CONFIG", &config)
-        .arg("migrate")
-        .assert()
-        .success();
-
-    // A fresh JSON index appears while the database already holds data.
-    sandbox.add(&sandbox.project("beta"));
-
-    sandbox
-        .cmd()
-        .env("OVERDOSECD_CONFIG", &config)
         .arg("migrate")
         .assert()
         .failure()
@@ -1965,7 +1948,6 @@ fn migrate_refuses_to_clobber_an_existing_database() {
         sandbox.data.join("projects.json").exists(),
         "a refused migration must leave the json in place"
     );
-    assert_eq!(migrate_backups(&sandbox).len(), 1);
 }
 
 #[test]
@@ -1979,17 +1961,6 @@ fn migrate_without_an_index_fails() {
         .failure()
         .code(1)
         .stderr(predicate::str::contains("nothing to migrate"));
-}
-
-#[test]
-fn migrate_hints_when_the_backend_still_points_at_json() {
-    let sandbox = Sandbox::new();
-    sandbox.add(&sandbox.project("overdosecd"));
-
-    sandbox.cmd().arg("migrate").assert().success().stdout(
-        predicate::str::contains("migrated 1 project")
-            .and(predicate::str::contains("backend = \"sqlite\"")),
-    );
 }
 
 #[test]
@@ -2028,23 +1999,17 @@ fn permissions_are_ignored(path: &Path) -> bool {
 
 #[cfg(unix)]
 #[test]
-fn read_only_data_dir_still_jumps() {
+fn read_only_data_dir_fails_loudly() {
     let sandbox = Sandbox::new();
     let project = sandbox.project("overdosecd");
     sandbox.add(&project);
 
     set_mode(&sandbox.data, 0o500);
 
-    sandbox
-        .cmd()
-        .args(["goto", "overdosecd"])
-        .assert()
-        .success()
-        .stdout(format!("{}\n", sandbox.canonical(&project)))
-        .stderr(predicate::str::contains("could not record usage"));
+    // SQLite's WAL needs write access next to the database, so a read-only
+    // data directory now fails reads too instead of degrading to a warning.
+    sandbox.cmd().args(["goto", "overdosecd"]).assert().code(3);
 
-    // The jump degrades to a warning, but `add` needs the write lock and the
-    // atomic save, so it must fail as a storage error instead.
     let other = sandbox.project("other");
     sandbox
         .cmd()
@@ -2061,7 +2026,9 @@ fn read_only_data_dir_still_jumps() {
 #[cfg(unix)]
 #[test]
 fn unreadable_parent_directory_marks_the_project_missing() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let parent = sandbox.root.join("unreadable");
         let project = parent.join("hidden-project");
         fs::create_dir_all(&project).expect("create nested project dir");
@@ -2109,7 +2076,7 @@ fn unreadable_parent_directory_marks_the_project_missing() {
             .stdout(predicate::str::contains("directory no longer exists"));
 
         set_mode(&parent, 0o700);
-    });
+    }
 }
 
 #[cfg(unix)]
@@ -2117,7 +2084,7 @@ fn unreadable_parent_directory_marks_the_project_missing() {
 fn unreadable_index_fails_with_exit_3() {
     let sandbox = Sandbox::new();
     sandbox.add(&sandbox.project("overdosecd"));
-    let index = sandbox.data.join("projects.json");
+    let index = sandbox.data.join("projects.db");
 
     set_mode(&index, 0o000);
     if permissions_are_ignored(&index) {
@@ -2156,7 +2123,9 @@ fn unreadable_data_dir_fails_reads_with_exit_3() {
 
 #[test]
 fn concurrent_adds_do_not_lose_entries() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let mut children = Vec::new();
         for index in 0..5 {
             let path = sandbox.project(&format!("concurrent-{index}"));
@@ -2200,12 +2169,14 @@ fn concurrent_adds_do_not_lose_entries() {
             5,
             "concurrent adds lost entries"
         );
-    });
+    }
 }
 
 #[test]
 fn pin_floats_a_project_to_the_top() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("alpha"));
         sandbox.add(&sandbox.project("bravo"));
 
@@ -2232,12 +2203,14 @@ fn pin_floats_a_project_to_the_top() {
             .assert()
             .success()
             .stdout(predicate::str::contains("pinned:    yes"));
-    });
+    }
 }
 
 #[test]
 fn pin_and_unpin_are_idempotent() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("alpha"));
 
         sandbox
@@ -2262,12 +2235,14 @@ fn pin_and_unpin_are_idempotent() {
             .assert()
             .success()
             .stdout(predicate::str::contains("unpinned `alpha`"));
-    });
+    }
 }
 
 #[test]
 fn rename_changes_the_name_and_goto_follows() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("real-directory");
         sandbox.add(&project);
 
@@ -2293,12 +2268,14 @@ fn rename_changes_the_name_and_goto_follows() {
             .assert()
             .success()
             .stdout(predicate::str::contains("name:      over"));
-    });
+    }
 }
 
 #[test]
 fn rename_collision_requires_force() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("alpha"));
         sandbox.add(&sandbox.project("beta"));
 
@@ -2319,12 +2296,14 @@ fn rename_collision_requires_force() {
                 predicate::str::contains("renamed `alpha` -> `beta`")
                     .and(predicate::str::contains("another project is already named")),
             );
-    });
+    }
 }
 
 #[test]
 fn alias_add_and_remove_round_trip() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("overdosecd");
         sandbox.add(&project);
 
@@ -2367,12 +2346,14 @@ fn alias_add_and_remove_round_trip() {
             .stderr(predicate::str::contains(
                 "alias `w` is not set on `overdosecd`",
             ));
-    });
+    }
 }
 
 #[test]
 fn tag_add_and_remove_round_trip() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
 
         sandbox
@@ -2414,12 +2395,14 @@ fn tag_add_and_remove_round_trip() {
             .stderr(predicate::str::contains(
                 "tag `rust` is not set on `overdosecd`",
             ));
-    });
+    }
 }
 
 #[test]
 fn mutations_report_ambiguous_targets() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("app-one"));
         sandbox.add(&sandbox.project("app-two"));
 
@@ -2440,12 +2423,14 @@ fn mutations_report_ambiguous_targets() {
                     "multiple projects matched query: app",
                 ));
         }
-    });
+    }
 }
 
 #[test]
 fn mutations_report_unknown_targets() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
 
         sandbox
@@ -2455,7 +2440,7 @@ fn mutations_report_unknown_targets() {
             .failure()
             .code(1)
             .stderr(predicate::str::contains("no project matched query: qqqqzz"));
-    });
+    }
 }
 
 #[test]
@@ -2506,7 +2491,9 @@ fn make_repo(dir: &Path, head: &str, remote: Option<(&str, &str)>) {
 
 #[test]
 fn info_shows_branch_and_remote_for_repositories() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("overdosecd");
         make_repo(
             &project,
@@ -2527,12 +2514,14 @@ fn info_shows_branch_and_remote_for_repositories() {
                         "remote:    origin git@github.com:Dead-Abyss/overdosecd.git",
                     )),
             );
-    });
+    }
 }
 
 #[test]
 fn included_git_config_is_honored_and_sanitized() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("included");
         make_repo(&project, "ref: refs/heads/main\n", None);
         let git = project.join(".git");
@@ -2583,12 +2572,14 @@ fn included_git_config_is_honored_and_sanitized() {
                 predicate::str::contains("remote:    -")
                     .and(predicate::str::contains("\u{1b}").not()),
             );
-    });
+    }
 }
 
 #[test]
 fn goto_finds_a_project_by_repository_name() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("local-name");
         make_repo(
             &project,
@@ -2611,12 +2602,14 @@ fn goto_finds_a_project_by_repository_name() {
             .assert()
             .success()
             .stdout(expected);
-    });
+    }
 }
 
 #[test]
 fn detached_head_is_reported() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("overdosecd");
         make_repo(&project, "0123456789abcdef0123456789abcdef01234567\n", None);
         sandbox.add(&project);
@@ -2630,7 +2623,7 @@ fn detached_head_is_reported() {
                 predicate::str::contains("branch:    detached (0123456)")
                     .and(predicate::str::contains("remote:    -")),
             );
-    });
+    }
 }
 
 #[test]
@@ -2666,7 +2659,9 @@ fn index_files_without_git_metadata_still_load() {
 
 #[test]
 fn add_force_refreshes_git_metadata() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("notes");
         sandbox.add(&project);
 
@@ -2691,12 +2686,14 @@ fn add_force_refreshes_git_metadata() {
             .assert()
             .success()
             .stdout(format!("{}\n", sandbox.canonical(&project)));
-    });
+    }
 }
 
 #[test]
 fn doctor_reports_a_clean_index() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
 
         sandbox.cmd().arg("doctor").assert().success().stdout(
@@ -2704,12 +2701,14 @@ fn doctor_reports_a_clean_index() {
                 .and(predicate::str::contains("storage: "))
                 .and(predicate::str::contains("no problems found")),
         );
-    });
+    }
 }
 
 #[test]
 fn doctor_reports_stale_paths_with_exit_1() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("gone");
         sandbox.add(&project);
         fs::remove_dir_all(&project).expect("remove project dir");
@@ -2718,12 +2717,14 @@ fn doctor_reports_stale_paths_with_exit_1() {
             predicate::str::contains("stale: `gone`")
                 .and(predicate::str::contains("directory no longer exists")),
         );
-    });
+    }
 }
 
 #[test]
 fn doctor_reports_duplicate_names() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let one = sandbox.project("one");
         let two = sandbox.project("two");
         sandbox
@@ -2749,7 +2750,7 @@ fn doctor_reports_duplicate_names() {
             .stdout(predicate::str::contains(
                 "duplicate name: `App` is used by 2 projects",
             ));
-    });
+    }
 }
 
 #[test]
@@ -2816,7 +2817,9 @@ fn doctor_fix_refuses_without_a_terminal() {
 
 #[test]
 fn doctor_refresh_updates_stored_git_remotes() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("checkout");
         make_repo(
             &project,
@@ -2855,7 +2858,7 @@ fn doctor_refresh_updates_stored_git_remotes() {
             .assert()
             .success()
             .stdout(predicate::str::contains("metadata is up to date"));
-    });
+    }
 }
 
 #[cfg(unix)]
@@ -2865,7 +2868,7 @@ fn doctor_reports_loose_index_permissions() {
 
     let sandbox = Sandbox::new();
     sandbox.add(&sandbox.project("overdosecd"));
-    let index = sandbox.data.join("projects.json");
+    let index = sandbox.data.join("projects.db");
 
     fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
     sandbox
@@ -2884,7 +2887,9 @@ fn doctor_reports_loose_index_permissions() {
 fn doctor_reports_a_loose_data_directory() {
     use std::os::unix::fs::PermissionsExt;
 
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
         fs::set_permissions(&sandbox.data, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
 
@@ -2898,7 +2903,7 @@ fn doctor_reports_a_loose_data_directory() {
         fs::set_permissions(&sandbox.data, fs::Permissions::from_mode(0o700))
             .expect("restore 0700");
         sandbox.cmd().arg("doctor").assert().success();
-    });
+    }
 }
 
 #[cfg(unix)]
@@ -2907,7 +2912,8 @@ fn doctor_reports_an_unwritable_data_dir() {
     use std::os::unix::fs::PermissionsExt;
 
     let sandbox = Sandbox::new();
-    sandbox.add(&sandbox.project("overdosecd"));
+    // No index: with one, the writable open SQLite needs would fail first.
+    fs::create_dir_all(&sandbox.data).expect("create data dir");
 
     fs::set_permissions(&sandbox.data, fs::Permissions::from_mode(0o500)).expect("chmod 0500");
     sandbox.cmd().arg("doctor").assert().code(1).stdout(
@@ -2920,7 +2926,9 @@ fn doctor_reports_an_unwritable_data_dir() {
 
 #[test]
 fn config_file_tightens_the_ambiguity_margin() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let shallow = sandbox.project("app-one");
         let deep = sandbox.project("deep/nested/app-two");
         sandbox.add(&shallow);
@@ -2944,12 +2952,14 @@ fn config_file_tightens_the_ambiguity_margin() {
             .assert()
             .success()
             .stdout(format!("{}\n", sandbox.canonical(&shallow)));
-    });
+    }
 }
 
 #[test]
 fn broken_config_fails_with_exit_3() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
         let config = sandbox.write_config("[matching]\ndepth_penalty = -3\n");
 
@@ -2965,12 +2975,14 @@ fn broken_config_fails_with_exit_3() {
                     .and(predicate::str::contains("overdosecd-config.toml"))
                     .and(predicate::str::contains("matching.depth_penalty")),
             );
-    });
+    }
 }
 
 #[test]
 fn missing_config_override_fails_with_exit_3() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox
             .cmd()
             .env(
@@ -2982,7 +2994,7 @@ fn missing_config_override_fails_with_exit_3() {
             .failure()
             .code(3)
             .stderr(predicate::str::contains("config file not found"));
-    });
+    }
 }
 
 #[test]
@@ -3098,7 +3110,9 @@ fn platform_config_file_is_picked_up() {
 
 #[test]
 fn doctor_reports_the_config_file() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
 
         let config = sandbox.write_config("[general]\ncolor = \"never\"\n");
@@ -3125,12 +3139,14 @@ fn doctor_reports_the_config_file() {
             .stdout(predicate::str::contains(
                 "(not found; built-in defaults apply)",
             ));
-    });
+    }
 }
 
 #[test]
 fn doctor_reports_config_problems_as_issues() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         sandbox.add(&sandbox.project("overdosecd"));
         let config = sandbox.write_config("this is not toml =");
 
@@ -3145,7 +3161,7 @@ fn doctor_reports_config_problems_as_issues() {
                     .and(predicate::str::contains("overdosecd-config.toml"))
                     .and(predicate::str::contains("issues (1)")),
             );
-    });
+    }
 }
 
 #[test]
@@ -3231,13 +3247,14 @@ fn ui_on_an_empty_index_opens_with_discovery() {
 // control byte for any stored or live value. The sandbox sets `NO_COLOR=1`,
 // so even the colour path stays silent and any 0x1b byte is a defect.
 
-/// Writes a hand-built JSON index. The entry guards refuse these values, so a
-/// planted file is the only way to exercise the load path.
+/// Writes a hand-built legacy JSON index (the migration's input; the entry
+/// guards refuse hostile values, so a planted file is the only way to
+/// exercise the load path).
 fn write_json_index(sandbox: &Sandbox, projects: serde_json::Value) {
     fs::create_dir_all(&sandbox.data).expect("create data dir");
     let body = serde_json::json!({ "version": 1, "projects": projects });
     fs::write(
-        sandbox.index_file(),
+        sandbox.data.join("projects.json"),
         serde_json::to_string_pretty(&body).expect("encode index"),
     )
     .expect("write index");
@@ -3250,40 +3267,22 @@ fn plant_hostile_values(sandbox: &Sandbox, canonical_path: &str) -> String {
     let alias = "alias\u{202e}bidi";
     let tag = "tag\u{2066}iso";
     let url = "git@github.com:x/\u{1b}[31mevil.git";
-    match sandbox.backend {
-        Backend::Json => write_json_index(
-            sandbox,
-            serde_json::json!([{
-                "id": "abc12345",
-                "name": name,
-                "path": canonical_path,
-                "aliases": [alias],
-                "tags": [tag],
-                "created_at": "2026-09-28T00:00:00Z",
-                "last_used_at": null,
-                "use_count": 0,
-                "pinned": false,
-                "git": { "remote_name": "origin", "remote_url": url },
-            }]),
-        ),
-        Backend::Sqlite => {
-            sandbox.add(Path::new(canonical_path));
-            let connection =
-                rusqlite::Connection::open(sandbox.index_file()).expect("open database");
-            connection
-                .execute(
-                    "UPDATE projects SET name = ?1, aliases = ?2, tags = ?3, \
-                     git = 1, git_remote_name = 'origin', git_remote_url = ?4",
-                    rusqlite::params![
-                        name,
-                        serde_json::json!([alias]).to_string(),
-                        serde_json::json!([tag]).to_string(),
-                        url
-                    ],
-                )
-                .expect("plant hostile values");
-        }
-    }
+    // Enter through `add` (the only path that refuses nothing hostile in a
+    // path), then plant the hostile values in the database.
+    sandbox.add(Path::new(canonical_path));
+    let connection = rusqlite::Connection::open(sandbox.index_file()).expect("open database");
+    connection
+        .execute(
+            "UPDATE projects SET name = ?1, aliases = ?2, tags = ?3, \
+             git = 1, git_remote_name = 'origin', git_remote_url = ?4",
+            rusqlite::params![
+                name,
+                serde_json::json!([alias]).to_string(),
+                serde_json::json!([tag]).to_string(),
+                url
+            ],
+        )
+        .expect("plant hostile values");
     name.to_owned()
 }
 
@@ -3300,7 +3299,9 @@ fn assert_no_control_bytes(output: &std::process::Output, what: &str) {
 
 #[test]
 fn planted_index_values_never_reach_the_terminal_raw() {
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let project = sandbox.project("hostile");
         let canonical = sandbox.canonical(&project);
         let _name = plant_hostile_values(&sandbox, &canonical);
@@ -3341,7 +3342,7 @@ fn planted_index_values_never_reach_the_terminal_raw() {
             let output = sandbox.cmd().args(&args).output().expect("run");
             assert_no_control_bytes(&output, &format!("{args:?}"));
         }
-    });
+    }
 }
 
 /// The renderer invariant as a property: for *arbitrary* stored values, no
@@ -3547,15 +3548,15 @@ fn relative_data_dir_and_config_are_refused() {
         .stderr(predicate::str::contains("must be an absolute path"));
 }
 
-/// JSON-only on purpose: the check is backend-independent, but the fixture
-/// needs the JSON file name.
+/// A planted symlink where the database belongs is refused (never written
+/// through) and reported by `doctor`.
 #[cfg(unix)]
 #[test]
 fn a_symlinked_index_is_refused_and_reported() {
     let sandbox = Sandbox::new();
     sandbox.add(&sandbox.project("overdosecd"));
 
-    let real = sandbox.data.join("real-index.json");
+    let real = sandbox.data.join("real-index.db");
     fs::rename(sandbox.index_file(), &real).expect("move index aside");
     std::os::unix::fs::symlink(&real, sandbox.index_file()).expect("plant symlink");
 
@@ -3568,39 +3569,23 @@ fn a_symlinked_index_is_refused_and_reported() {
         .stderr(predicate::str::contains("symbolic link"));
 
     // `doctor` is the diagnostic: it reports the link and keeps going.
-    sandbox.cmd().arg("doctor").assert().code(1).stdout(
-        predicate::str::contains("symlink:").and(predicate::str::contains("projects.json")),
-    );
-}
-
-/// SQLite-only: the planted database used to be written through the link.
-#[cfg(unix)]
-#[test]
-fn a_symlinked_sqlite_database_is_refused() {
-    let sandbox = Sandbox::with_backend(Backend::Sqlite);
-    sandbox.add(&sandbox.project("overdosecd"));
-
-    let real = sandbox.data.join("real-index.db");
-    fs::rename(sandbox.index_file(), &real).expect("move database aside");
-    std::os::unix::fs::symlink(&real, sandbox.index_file()).expect("plant symlink");
-
     sandbox
         .cmd()
-        .arg("list")
+        .arg("doctor")
         .assert()
-        .failure()
-        .code(3)
-        .stderr(predicate::str::contains("symbolic link"));
+        .code(1)
+        .stdout(predicate::str::contains("symlink:").and(predicate::str::contains("projects.db")));
 }
 
-/// JSON-only: the quarantine name is a JSON-file concern.
+/// The legacy file is the one quarantine exists for; each corruption keeps
+/// its own copy.
 #[test]
 fn two_corruptions_keep_both_forensic_copies() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(&sandbox.data).expect("create data dir");
 
     for body in ["GARBAGE-FIRST", "GARBAGE-SECOND"] {
-        fs::write(sandbox.index_file(), body).expect("write garbage index");
+        fs::write(sandbox.data.join("projects.json"), body).expect("write garbage index");
         sandbox.cmd().arg("list").assert().code(3);
     }
 
@@ -3621,29 +3606,15 @@ fn two_corruptions_keep_both_forensic_copies() {
     assert!(bodies.iter().any(|body| body == "GARBAGE-SECOND"));
 }
 
-/// JSON-only on purpose: the sidecar lock exists only on this backend.
-#[cfg(unix)]
-#[test]
-fn the_json_lock_file_is_private() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let sandbox = Sandbox::new();
-    sandbox.add(&sandbox.project("overdosecd"));
-    let mode = fs::metadata(sandbox.data.join("projects.lock"))
-        .expect("lock file")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(mode, 0o600, "the lock file is private");
-}
-
 /// Unix-only: paths are arbitrary byte strings.
 #[cfg(unix)]
 #[test]
 fn non_utf8_paths_are_refused_on_both_backends() {
     use std::os::unix::ffi::OsStringExt;
 
-    dual!(sandbox, {
+    {
+        let sandbox = Sandbox::new();
+
         let name = std::ffi::OsString::from_vec(b"latin\xffbyte".to_vec());
         let dir = sandbox.projects.join(&name);
         fs::create_dir_all(&dir).expect("create a non-UTF-8 directory");
@@ -3663,7 +3634,7 @@ fn non_utf8_paths_are_refused_on_both_backends() {
             .assert()
             .success()
             .stdout(predicate::str::contains("no projects yet"));
-    });
+    }
 }
 
 // Parser and walk bounds: third-party stores and repository metadata

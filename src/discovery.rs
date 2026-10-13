@@ -272,7 +272,7 @@ const MAX_CACHE_BYTES: u64 = 64 << 20;
 pub fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(cache)?;
     body.push(b'\n');
-    crate::store::json::write_private(path, &body)
+    crate::paths::write_private(path, &body)
 }
 
 #[cfg(test)]

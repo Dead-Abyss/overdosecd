@@ -111,6 +111,9 @@ pub fn inspect(data_dir: &Path, projects: &[Project]) -> Report {
         for tag in &project.tags {
             report("tag", tag);
         }
+        for note in &project.notes {
+            report("note", note);
+        }
         let path = project.path.to_string_lossy();
         report("path", &path);
         // Git metadata is read from a repository's own `.git` files, so it is

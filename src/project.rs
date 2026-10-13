@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,6 +34,18 @@ pub struct Project {
     /// a matcher signal. Detected once at `add`.
     #[serde(default)]
     pub kind: Kind,
+    /// Environment variables exported on entering the project, keyed by name.
+    /// User-authored through `overdosecd profile`; never imported or
+    /// detected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// A command run on entering the project. User-authored through
+    /// `overdosecd profile`; never imported or detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enter_cmd: Option<String>,
+    /// Single-line notes, in display order (`overdosecd note`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// What kind of project a directory is, from its marker files.
@@ -134,6 +147,9 @@ impl Project {
             pinned: false,
             git: None,
             kind: Kind::Unknown,
+            env: BTreeMap::new(),
+            enter_cmd: None,
+            notes: Vec::new(),
         }
     }
 }
@@ -278,6 +294,9 @@ pub fn insert(
         pinned: false,
         git: GitInfo::detect(&path),
         kind: kind_of(&path),
+        env: BTreeMap::new(),
+        enter_cmd: None,
+        notes: Vec::new(),
     };
     let name = project.name.clone();
     projects.push(project);

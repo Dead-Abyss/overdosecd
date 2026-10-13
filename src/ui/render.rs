@@ -371,14 +371,22 @@ fn draw_details(
     let mut lines = vec![
         Line::from(Span::styled(path, palette.dim())),
         Line::from(Span::styled(parts.join("  ·  "), palette.dim())),
-        Line::from(Span::styled(
-            match branch {
-                Some(branch) => format!("branch: {}", crate::sanitize::text(&branch)),
-                None => String::new(),
-            },
-            palette.dim(),
-        )),
     ];
+    // The pane keeps its fixed height: only the two newest notes fit.
+    let shown_from = project.notes.len().saturating_sub(2);
+    for (index, note) in project.notes.iter().enumerate().skip(shown_from) {
+        lines.push(Line::from(Span::styled(
+            format!("note {}: {}", index + 1, crate::sanitize::text(note)),
+            palette.dim(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        match branch {
+            Some(branch) => format!("branch: {}", crate::sanitize::text(&branch)),
+            None => String::new(),
+        },
+        palette.dim(),
+    )));
     if !history.is_empty() {
         let rendered = output::format_times(&history, Utc::now());
         lines.push(Line::from(Span::styled(

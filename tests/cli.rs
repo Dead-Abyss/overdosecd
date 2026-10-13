@@ -1146,7 +1146,7 @@ fn doctor_reports_the_sqlite_schema() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("storage: sqlite (schema v2)"));
+        .stdout(predicate::str::contains("storage: sqlite (schema v3)"));
 }
 
 #[test]
@@ -3777,4 +3777,110 @@ fn add_survives_an_oversized_git_config() {
             predicate::str::contains("branch:    main")
                 .and(predicate::str::contains("remote:    -")),
         );
+}
+
+#[test]
+fn notes_round_trip_through_the_cli() {
+    let sandbox = Sandbox::new();
+    sandbox.add(&sandbox.project("overdosecd"));
+
+    sandbox
+        .cmd()
+        .args(["note", "add", "overdosecd", "first line"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added note 1"));
+    sandbox
+        .cmd()
+        .args(["note", "add", "overdosecd", "second"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added note 2"));
+
+    sandbox
+        .cmd()
+        .args(["note", "list", "overdosecd"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("1. first line").and(predicate::str::contains("2. second")),
+        );
+    sandbox
+        .cmd()
+        .args(["info", "overdosecd"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("notes:").and(predicate::str::contains("1. first line")));
+
+    sandbox
+        .cmd()
+        .args(["note", "remove", "overdosecd", "1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed note 1"));
+    sandbox
+        .cmd()
+        .args(["note", "list", "overdosecd"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1. second"));
+}
+
+#[test]
+fn note_guards_refuse_multiline_empty_and_missing() {
+    let sandbox = Sandbox::new();
+    sandbox.add(&sandbox.project("overdosecd"));
+
+    // A newline cannot reach the line-oriented output.
+    sandbox
+        .cmd()
+        .args(["note", "add", "overdosecd", "bad\nline"])
+        .assert()
+        .failure()
+        .code(1);
+    sandbox
+        .cmd()
+        .args(["note", "add", "overdosecd", "   "])
+        .assert()
+        .failure()
+        .code(1);
+    sandbox
+        .cmd()
+        .args(["note", "remove", "overdosecd", "9"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("does not exist"));
+    sandbox
+        .cmd()
+        .args(["note", "list", "overdosecd"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no notes"));
+}
+
+#[test]
+fn doctor_reports_planted_notes_with_control_characters() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project("guarded");
+    sandbox.add(&project);
+
+    // The entry guards refuse control characters, so the row is planted.
+    let connection = rusqlite::Connection::open(sandbox.index_file()).expect("open database");
+    let id: String = connection
+        .query_row("SELECT id FROM projects LIMIT 1", [], |row| row.get(0))
+        .expect("read id");
+    connection
+        .execute(
+            "INSERT INTO notes (project_id, seq, text) VALUES (?1, 0, ?2)",
+            rusqlite::params![id, "bad\u{1b}note"],
+        )
+        .expect("plant note");
+    drop(connection);
+
+    sandbox.cmd().arg("doctor").assert().code(1).stdout(
+        predicate::str::contains("unsafe:")
+            .and(predicate::str::contains("note"))
+            .and(predicate::str::contains(r"\u{1b}")),
+    );
 }

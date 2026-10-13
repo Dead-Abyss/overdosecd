@@ -111,6 +111,12 @@ pub enum Command {
         action: TermCommand,
     },
 
+    /// Manage a project's notes: one-line memory aids shown by `info`
+    Note {
+        #[command(subcommand)]
+        action: NoteCommand,
+    },
+
     /// Check the index for problems and repair stale projects
     Doctor(DoctorArgs),
 
@@ -162,6 +168,32 @@ pub enum TermCommand {
         project: String,
         /// Alias or tag to remove
         term: String,
+    },
+}
+
+/// The `note` sub-actions; notes are single lines, shown in order.
+#[derive(Debug, Subcommand)]
+pub enum NoteCommand {
+    /// Append a note to a project
+    Add {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+        /// The note text (one line)
+        text: String,
+    },
+
+    /// List a project's notes, numbered
+    List {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+    },
+
+    /// Remove a note by its number in `note list`
+    Remove {
+        /// Project name, alias, tag, or fuzzy query
+        project: String,
+        /// The note's number (1-based), as shown by `note list`
+        index: usize,
     },
 }
 

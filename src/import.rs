@@ -399,6 +399,9 @@ pub fn preview(plan: &Plan) -> Result<Vec<Project>> {
                 git: None,
                 // `--dry-run` promises no filesystem work, so no marker scan.
                 kind: project::Kind::Unknown,
+                env: Default::default(),
+                enter_cmd: None,
+                notes: Vec::new(),
             })
         })
         .collect()

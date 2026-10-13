@@ -30,8 +30,8 @@ use clap::Parser;
 use colored::Colorize;
 
 use crate::cli::{
-    AddArgs, Cli, Command, DoctorArgs, ImportArgs, ListArgs, RemoveArgs, ScanArgs, SortBy,
-    TermCommand,
+    AddArgs, Cli, Command, DoctorArgs, ImportArgs, ListArgs, NoteCommand, RemoveArgs, ScanArgs,
+    SortBy, TermCommand,
 };
 use crate::config::ColorMode;
 use crate::error::{Error, Result};
@@ -189,6 +189,7 @@ fn run(cli: Cli) -> Result<i32> {
                 Command::Tag { action } => {
                     cmd_term(&store, action, TermKind::Tag, &matching, debug)?
                 }
+                Command::Note { action } => cmd_note(&store, action, &matching, debug)?,
                 Command::Migrate => cmd_migrate(&data_dir)?,
                 Command::Import(args) => cmd_import(&store, args)?,
                 Command::Scan(args) => cmd_scan(&data_dir, &config.discovery, args)?,
@@ -455,11 +456,19 @@ fn cmd_info(store: &SqliteStore, query: &str, matching: &MatcherConfig, debug: b
         ("path:", sanitize::path(&project.path)),
         ("aliases:", output::join_or_dash(&project.aliases)),
         ("tags:", output::join_or_dash(&project.tags)),
+    ];
+    for (index, note) in project.notes.iter().enumerate() {
+        rows.push((
+            if index == 0 { "notes:" } else { "" },
+            format!("{}. {}", index + 1, sanitize::text(note)),
+        ));
+    }
+    rows.extend([
         ("type:", project.kind.label().to_owned()),
         ("created:", created.to_string()),
         ("last used:", last_used),
         ("uses:", project.use_count.to_string()),
-    ];
+    ]);
     let history = store.recent_uses(&project.id, 5)?;
     if !history.is_empty() {
         rows.push(("history:", output::format_times(&history, Utc::now())));
@@ -651,6 +660,70 @@ fn cmd_term(
         project::set_term(project, kind, &value, add)
     })?;
     output::print_line(&message)
+}
+
+/// The `note` subcommands: single-line memories attached to a project, on the
+/// resolve-outside-the-lock → re-verify-by-id pattern the other mutations use.
+fn cmd_note(
+    store: &SqliteStore,
+    action: NoteCommand,
+    matching: &MatcherConfig,
+    debug: bool,
+) -> Result<()> {
+    match action {
+        NoteCommand::List { project } => {
+            let (id, name) = resolve_id(store, &project, matching, debug)?;
+            let projects = store.load()?;
+            let found = projects
+                .iter()
+                .find(|project| project.id == id)
+                .ok_or(Error::NoLongerIndexed(name))?;
+            if found.notes.is_empty() {
+                return output::print_line(&format!(
+                    "no notes on `{}`",
+                    sanitize::text(&found.name)
+                ));
+            }
+            let mut out = String::new();
+            for (index, note) in found.notes.iter().enumerate() {
+                out.push_str(&format!("{}. {}\n", index + 1, sanitize::text(note)));
+            }
+            output::print(&out)
+        }
+        NoteCommand::Add { project, text } => {
+            let text = project::sanitize_value("note", &text)?;
+            let (id, name) = resolve_id(store, &project, matching, debug)?;
+            let message = store.update(move |projects| {
+                let found = project::revalidate(projects, &id, name)?;
+                found.notes.push(text);
+                Ok(format!(
+                    "added note {} to `{}`",
+                    found.notes.len(),
+                    sanitize::text(&found.name)
+                ))
+            })?;
+            output::print_line(&message)
+        }
+        NoteCommand::Remove { project, index } => {
+            let (id, name) = resolve_id(store, &project, matching, debug)?;
+            let message = store.update(move |projects| {
+                let found = project::revalidate(projects, &id, name)?;
+                let count = found.notes.len();
+                if index == 0 || index > count {
+                    return Err(Error::InvalidValue(format!(
+                        "note {index} does not exist (`{}` has {count})",
+                        sanitize::text(&found.name)
+                    )));
+                }
+                found.notes.remove(index - 1);
+                Ok(format!(
+                    "removed note {index} from `{}`",
+                    sanitize::text(&found.name)
+                ))
+            })?;
+            output::print_line(&message)
+        }
+    }
 }
 
 /// Imports a legacy `projects.json` into `projects.db` on request; startup

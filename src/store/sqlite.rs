@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use rusqlite::{Connection, ErrorCode, TransactionBehavior};
 use crate::error::{Error, Result};
 use crate::project::{GitInfo, Kind, Project};
 
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
 
 /// How long a writer waits for the database lock before giving up (the
 /// pre-SQLite JSON backend waited the same for its sidecar lock).
@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS projects (
     git             INTEGER NOT NULL DEFAULT 0,
     git_remote_name TEXT,
     git_remote_url  TEXT,
-    kind            TEXT
+    kind            TEXT,
+    env             TEXT,
+    enter_cmd       TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS usage (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,11 +48,17 @@ CREATE TABLE IF NOT EXISTS usage (
     used_at    TEXT NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS usage_project_time ON usage(project_id, used_at);
+CREATE TABLE IF NOT EXISTS notes (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    PRIMARY KEY (project_id, seq)
+) STRICT;
 ";
 
 const SELECT_PROJECTS: &str = "
 SELECT id, name, path, aliases, tags, created_at, last_used_at, use_count,
-       pinned, git, git_remote_name, git_remote_url, kind
+       pinned, git, git_remote_name, git_remote_url, kind, env, enter_cmd
 FROM projects
 ORDER BY rowid
 ";
@@ -62,10 +70,11 @@ ORDER BY rowid
 const UPSERT_PROJECT: &str = "
 INSERT INTO projects (
     id, name, path, aliases, tags, created_at, last_used_at, use_count,
-    pinned, git, git_remote_name, git_remote_url, kind
+    pinned, git, git_remote_name, git_remote_url, kind, env, enter_cmd
 ) VALUES (
     :id, :name, :path, :aliases, :tags, :created_at, :last_used_at,
-    :use_count, :pinned, :git, :git_remote_name, :git_remote_url, :kind
+    :use_count, :pinned, :git, :git_remote_name, :git_remote_url, :kind,
+    :env, :enter_cmd
 )
 ON CONFLICT(id) DO UPDATE SET
     name = excluded.name,
@@ -79,7 +88,9 @@ ON CONFLICT(id) DO UPDATE SET
     git = excluded.git,
     git_remote_name = excluded.git_remote_name,
     git_remote_url = excluded.git_remote_url,
-    kind = excluded.kind
+    kind = excluded.kind,
+    env = excluded.env,
+    enter_cmd = excluded.enter_cmd
 ";
 
 /// SQLite storage: WAL journal, one transaction per mutation.
@@ -183,6 +194,10 @@ impl SqliteStore {
                 execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
             }
         }
+        // `save` is a whole-index write: every project's notes are rewritten.
+        for project in projects {
+            write_notes(&transaction, project).map_err(|err| self.map_rusqlite(err))?;
+        }
 
         transaction.commit().map_err(|err| self.map_rusqlite(err))?;
         Ok(())
@@ -267,20 +282,37 @@ impl SqliteStore {
             .map_err(|err| self.map_rusqlite(err))?;
 
         match from {
-            1 => {
+            1 | 2 => {
                 // The write lock serializes concurrent first opens (the `ocd`
                 // wrapper and the cd hook can race after an upgrade); the
                 // version is re-read under it, so the loser of the race skips
-                // the ALTER instead of failing on the duplicate column. Its
+                // the ALTERs instead of failing on a duplicate column. Its
                 // backup above may then hold the already-migrated database —
                 // redundant, never wrong.
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|err| self.map_rusqlite(err))?;
-                if self.read_schema_version(&tx)? == from {
+                let current = self.read_schema_version(&tx)?;
+                if current == 1 {
+                    // v0.1.0's schema, without the column.
+                    tx.execute_batch("ALTER TABLE projects ADD COLUMN kind TEXT;")
+                        .map_err(|err| self.map_rusqlite(err))?;
+                }
+                if current <= 2 {
+                    // v0.2.0's schema, without the notes table or the profile
+                    // and note columns. `SCHEMA` is all `IF NOT EXISTS`, so
+                    // running it here only adds the notes table.
+                    tx.execute_batch(
+                        "ALTER TABLE projects ADD COLUMN env TEXT;\n\
+                         ALTER TABLE projects ADD COLUMN enter_cmd TEXT;",
+                    )
+                    .map_err(|err| self.map_rusqlite(err))?;
+                    tx.execute_batch(SCHEMA)
+                        .map_err(|err| self.map_rusqlite(err))?;
+                }
+                if current < CURRENT_VERSION {
                     tx.execute_batch(&format!(
-                        "ALTER TABLE projects ADD COLUMN kind TEXT;\n\
-                         UPDATE meta SET value = '{CURRENT_VERSION}' \
+                        "UPDATE meta SET value = '{CURRENT_VERSION}' \
                          WHERE key = 'schema_version';"
                     ))
                     .map_err(|err| self.map_rusqlite(err))?;
@@ -318,6 +350,28 @@ impl SqliteStore {
         for row in rows {
             projects.push(row.map_err(|err| self.map_rusqlite(err))?);
         }
+
+        // The notes ride along in one ordered query; projects without rows
+        // keep their empty list.
+        let mut statement = conn
+            .prepare("SELECT project_id, text FROM notes ORDER BY project_id, seq")
+            .map_err(|err| self.map_rusqlite(err))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| self.map_rusqlite(err))?;
+        let mut notes: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (id, text) = row.map_err(|err| self.map_rusqlite(err))?;
+            notes.entry(id).or_default().push(text);
+        }
+        for project in &mut projects {
+            if let Some(list) = notes.remove(&project.id) {
+                project.notes = list;
+            }
+        }
+
         Ok(projects)
     }
 
@@ -350,8 +404,15 @@ impl SqliteStore {
         for project in after {
             match before_ids.get(project.id.as_str()) {
                 Some(old) if *old == project => {}
-                _ => {
+                Some(old) => {
                     execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
+                    if old.notes != project.notes {
+                        write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
+                    }
+                }
+                None => {
+                    execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
+                    write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
                 }
             }
         }
@@ -482,7 +543,20 @@ fn execute_project(
         ":git_remote_name": project.git.as_ref().and_then(|git| git.remote_name.as_deref()),
         ":git_remote_url": project.git.as_ref().and_then(|git| git.remote_url.as_deref()),
         ":kind": project.kind.label(),
+        ":env": serde_json::to_string(&project.env).unwrap_or_else(|_| "{}".to_owned()),
+        ":enter_cmd": project.enter_cmd.as_deref(),
     })
+}
+
+/// Replaces one project's note rows with the in-memory list.
+fn write_notes(conn: &Connection, project: &Project) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM notes WHERE project_id = ?1", [&project.id])?;
+    let mut insert =
+        conn.prepare("INSERT INTO notes (project_id, seq, text) VALUES (?1, ?2, ?3)")?;
+    for (seq, text) in project.notes.iter().enumerate() {
+        insert.execute(rusqlite::params![&project.id, seq as i64, text])?;
+    }
+    Ok(())
 }
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
@@ -494,6 +568,8 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     let pinned: i64 = row.get(8)?;
     let git: i64 = row.get(9)?;
     let kind: Option<String> = row.get(12)?;
+    let env: Option<String> = row.get(13)?;
+    let enter_cmd: Option<String> = row.get(14)?;
 
     Ok(Project {
         id: row.get(0)?,
@@ -521,6 +597,18 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
             None
         },
         kind: kind.as_deref().map_or(Kind::Unknown, Kind::parse),
+        env: match env {
+            Some(raw) => serde_json::from_str(&raw).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    13,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?,
+            None => BTreeMap::new(),
+        },
+        enter_cmd,
+        notes: Vec::new(),
     })
 }
 
@@ -663,11 +751,135 @@ mod tests {
             .expect("a pre-migration copy is kept");
         assert!(dir.path().join(backup).exists());
 
-        // The migrated database writes and reads the new column.
+        // The migrated database writes and reads the new columns.
         let mut projects = store.load().unwrap();
         projects[0].kind = Kind::Rust;
+        projects[0].notes.push("survives".into());
         store.save(&projects).unwrap();
-        assert_eq!(store.load().unwrap()[0].kind, Kind::Rust);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].kind, Kind::Rust);
+        assert_eq!(loaded[0].notes, vec!["survives".to_owned()]);
+    }
+
+    /// A schema-2 database, as v0.2.0 wrote it: `kind` present, no notes
+    /// table, no profile columns.
+    fn write_v2_database(path: &Path) {
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;\n\
+             CREATE TABLE projects (\n\
+                 id TEXT PRIMARY KEY,\n\
+                 name TEXT NOT NULL,\n\
+                 path TEXT NOT NULL UNIQUE,\n\
+                 aliases TEXT NOT NULL DEFAULT '[]',\n\
+                 tags TEXT NOT NULL DEFAULT '[]',\n\
+                 created_at TEXT NOT NULL,\n\
+                 last_used_at TEXT,\n\
+                 use_count INTEGER NOT NULL DEFAULT 0,\n\
+                 pinned INTEGER NOT NULL DEFAULT 0,\n\
+                 git INTEGER NOT NULL DEFAULT 0,\n\
+                 git_remote_name TEXT,\n\
+                 git_remote_url TEXT,\n\
+                 kind TEXT\n\
+             ) STRICT;\n\
+             CREATE TABLE usage (\n\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n\
+                 used_at TEXT NOT NULL\n\
+             ) STRICT;\n\
+             CREATE INDEX usage_project_time ON usage(project_id, used_at);\n\
+             INSERT INTO meta VALUES ('schema_version', '2');\n\
+             INSERT INTO projects (id, name, path, created_at, kind) \
+                 VALUES ('a', 'alpha', '/x/alpha', '2026-01-01T00:00:00Z', 'rust');",
+        )
+        .expect("v2 schema");
+    }
+
+    #[test]
+    fn a_v2_database_migrates_to_notes_and_profiles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        write_v2_database(store.path());
+
+        let projects = store.load().expect("a writable open migrates");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].kind, Kind::Rust);
+        assert!(projects[0].notes.is_empty() && projects[0].env.is_empty());
+        assert_eq!(store.schema_version().unwrap(), Some(CURRENT_VERSION));
+
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with("projects.db.v2-"))
+            .expect("a pre-migration copy is kept");
+        assert!(dir.path().join(backup).exists());
+
+        // Notes and the profile survive a write/read cycle.
+        let mut projects = store.load().unwrap();
+        projects[0].notes.push("first".into());
+        projects[0].env.insert("EDITOR".into(), "vim".into());
+        projects[0].enter_cmd = Some("echo hi".into());
+        store.save(&projects).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].notes, vec!["first".to_owned()]);
+        assert_eq!(loaded[0].env.get("EDITOR").map(String::as_str), Some("vim"));
+        assert_eq!(loaded[0].enter_cmd.as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn notes_ride_along_updates_and_cascade_on_removal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        store.save(&[project("alpha")]).unwrap();
+
+        store
+            .update(|projects| {
+                projects[0].notes = vec!["one".into(), "two".into()];
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap()[0].notes,
+            vec!["one".to_owned(), "two".to_owned()]
+        );
+
+        // Removing the project takes its note rows with it.
+        store
+            .update(|projects| {
+                projects.clear();
+                Ok(())
+            })
+            .unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "note rows cascade away with the project");
+    }
+
+    #[test]
+    fn the_by_path_lookup_uses_the_unique_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        store.save(&[project("alpha")]).unwrap();
+
+        // `enter` resolves a project by its canonical path on every wrapper
+        // jump; the UNIQUE column must serve that without a scan.
+        let conn = Connection::open(store.path()).unwrap();
+        let mut statement = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT env, enter_cmd FROM projects WHERE path = ?1")
+            .unwrap();
+        let plans: Vec<String> = statement
+            .query_map(["x"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(
+            plans.iter().any(|plan| plan.contains("INDEX")),
+            "expected an index search, got: {plans:?}"
+        );
     }
 
     #[test]

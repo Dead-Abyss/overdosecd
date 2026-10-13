@@ -12,7 +12,7 @@ instead of:
 cd ~/code/projects/rust/overdosecd
 ```
 
-Local-first: no cloud, no account, no telemetry. Your index is a plain file you can read, edit, and back up.
+Local-first: no cloud, no account, no telemetry. Your index is a local SQLite database you own.
 
 ## Install
 
@@ -44,7 +44,7 @@ overdosecd init fish | source
 | `ocd --cmd <anything>` | runs the CLI and nothing else: no picker, never a `cd` |
 | `ocd goto <name>` | jumps to a project whose name collides with a subcommand |
 
-Subcommand names are reserved by the wrapper, so a project actually named `tag`, `list`, or `ui` needs `ocd goto <name>`.
+Subcommand names are reserved by the wrapper, so a project actually named `tag`, `list`, `ui`, `note`, or `profile` needs `ocd goto <name>`.
 
 `init` also registers `ocd <TAB>` completion: subcommands first, then indexed names, aliases, and tags; `--no-track` completes after a query. Missing projects are not offered. On zsh, the `eval` line should come after `compinit` — before that, registration is skipped silently.
 
@@ -69,11 +69,13 @@ overdosecd completions fish > ~/.config/fish/completions/overdosecd.fish
 | `rename <query> <name> [--force]` | rename a project |
 | `alias add\|remove <query> <alias>` | add or remove another name to match |
 | `tag add\|remove <query> <tag>` | add or remove a tag |
+| `note add\|list\|remove <query> <text>\|<n>` | one-line notes shown by `info` and the picker's details |
+| `profile env add\|remove <query> KEY=VALUE\|KEY`, `profile run set\|clear <query> [CMD]`, `profile show <query>` | the entry profile applied on a wrapper jump (see [Notes and profiles](#notes-and-profiles)) |
 | `scan <roots>…` / `scan --home [--refresh] [--dry-run] [--max-depth N]` | preview directories with the discovery walk, writing nothing to the index |
 | `import zoxide\|autojump\|zsh-z [--dry-run] [--min-score N] [--limit N]` | bring another jumper's history over |
 | `ui [--query TEXT] [--no-track]` | the interactive picker (see below); `ocd` and `ocd --ui` run this |
 | `doctor [--fix] [--refresh]` | check the index; `--fix` repairs stale projects interactively |
-| `migrate` | move a JSON index to the SQLite backend |
+| `migrate` | move a leftover `projects.json` into `projects.db` by hand (0.2.0 indexes migrate automatically on the first command) |
 | `init bash\|zsh\|fish` | print the `ocd` wrapper and completion setup |
 | `completions bash\|zsh\|fish` | print a completion script for the `overdosecd` command itself |
 
@@ -114,7 +116,7 @@ Ranking adds bonuses for pinned, recently used, and frequently used projects, Gi
 
 Type more words to narrow a query: every word must match the project, each contributes its own best signal to the score (bonuses apply once), and a name containing spaces still matches the whole query exactly. For `ocd`, a multi-word query only jumps without asking when *every* word lands in the confident classes above — one fuzzy word and the picker opens with the words prefilled.
 
-Every successful jump records `last_used_at` and `use_count`, which feed the recency and frequency bonuses; on SQLite each jump also appends to the `usage` log behind `info` and `list --since`. `--no-track` skips recording.
+Every successful jump records `last_used_at` and `use_count`, which feed the recency and frequency bonuses, and appends to the `usage` log behind `info` and `list --since`. `--no-track` skips recording.
 
 `--debug` prints every ranked candidate to stderr with its match reason and score; stdout is untouched, so `goto` stays safe for `cd "$(…)"`. It only says anything for the commands that resolve a query: `goto`, `info`, `remove`, and the index mutations.
 
@@ -146,14 +148,16 @@ The picker draws a compact box inline, right where the cursor was: it never take
 | `Esc` / `Ctrl+c` | cancel (exit `1`, nothing on stdout), or close whatever is open |
 | wheel / click | move the highlight / select the row under the pointer |
 
+The detail pane (palette: **toggle details**) shows the path, aliases, tags, use count, the live branch, recent jumps, and the two newest notes.
+
 In list mode `j` and `k` only move the highlight; `Tab` (or `i` / `/`) returns to the search box. `*` marks pinned projects, `!` marks missing ones (Enter refuses those), and every row shows the path and, once used, how long ago.
 
 The action palette is the rest of the CLI inside the picker. Type to filter, `j`/`k` to choose, `Enter` to run:
 
 - **pin / unpin**, **add**, **remove** — the chords above
 - **rename**, **alias ±**, **tag ±** — one-line prompts
-- **toggle details** — path, aliases, tags, remote, use count, live branch, recent jumps
-- **sort**, **hide or show missing projects**, **health** (`Enter` relocates, `x` removes, `r` re-checks), **migrate to SQLite**, **help**, **quit**
+- **toggle details** — path, aliases, tags, notes, remote, use count, live branch, recent jumps
+- **sort**, **hide or show missing projects**, **health** (`Enter` relocates, `x` removes, `r` re-checks), **migrate**, **help**, **quit**
 
 `m` marks rows and turns pin/remove/tag/alias into batches: one prompt per batch, and a fully pinned batch unpins. The picker writes only the chosen path to stdout, so `cd "$(overdosecd ui)"` works exactly like `goto`. It needs a controlling terminal — stdout may be the wrapper's pipe — and exits `1` with a clear error without one. Colors follow the usual flags, except that `auto` keys off the terminal rather than stdout. The mouse is captured in a plain terminal and left alone inside a multiplexer (tmux, zellij, screen), where it would suspend the pane's own UI — `[ui] mouse = "always"` forces it on.
 
@@ -193,6 +197,7 @@ overdosecd works with zero configuration. To tune it, write `~/.config/overdosec
 color = "auto"          # auto | always | never
 hook = false            # install a cd wrapper that records jumps into indexed projects
 hint = false            # ...and one-line hints to `ocd add` directories you visit often
+hooks = false           # apply entry profiles on wrapper jumps (see Notes and profiles)
 
 [matching]
 fuzzy = true            # subsequence matching on names, aliases, paths, remotes
@@ -215,7 +220,7 @@ ttl_hours = 24          # background refresh once the cache is older
 skip = ["my-scratch-dir"]  # extra directory names to skip, on top of the defaults
 
 [storage]
-backend = "json"        # json | sqlite
+backend = "sqlite"      # retired in 0.3.0; ignored, and `doctor` points at it
 ```
 
 Every key is optional and the defaults above are the built-in behavior. Unknown keys and negative numbers are rejected with a clear error (exit `3`) rather than silently ignored.
@@ -224,13 +229,17 @@ Every key is optional and the defaults above are the built-in behavior. Unknown 
 
 The color mode resolves in this order: `--color WHEN`, then `OVERDOSECD_COLOR`, then `color` in the file, then `auto` (colorize on a terminal, honoring `NO_COLOR`). Point overdosecd at a different config file with `OVERDOSECD_CONFIG=/path/to/config.toml`; that file must exist, and `doctor` reports an unreadable one as an issue.
 
+## Notes and profiles
+
+`ocd note add <project> "<text>"` attaches a one-line memory to a project ("the branch with the old API"); `ocd note list` numbers them and `ocd note remove <project> <n>` drops one. They show up in `info` and in the picker's detail pane, and they never affect matching.
+
+Profiles are what a jump *does* besides `cd`. `ocd profile env add <project> EDITOR=vim` exports a variable when the wrapper enters the project, `ocd profile run set <project> "echo back to work"` runs one command, and `ocd profile show` prints the lot. Both are off until you set `[general] hooks = true` **and** re-run the `init` line, so nothing is evaluated by default; the command is announced on stderr before it runs, a failing command only warns, and values that are not safely quotable are refused. Notes and profiles are always author-written: no import or scan can create one.
+
 ## Storage
 
-The index lives in a versioned JSON file (`projects.json`) by default. The optional SQLite backend adds a real jump log and updates only the rows a mutation touches.
+The index is `projects.db` (SQLite, schema version 3): one transaction per mutation, a real jump log, and only the rows a change touches. `info` gains a `history:` line with the latest jumps, `list --since` reads the same log (the latest 500 jumps per project), and data files are created `0600` with WAL journalling (`projects.db-wal` and `projects.db-shm` appear while overdosecd runs).
 
-Move an existing JSON index over with `overdosecd migrate`: it writes `projects.db` in one transaction and keeps the original as `projects.json.migrated-<timestamp>`. It is safe to run twice, and it refuses to overwrite a database that already holds projects. When the configured backend is still `json`, it prints the `[storage]` snippet so you can switch over.
-
-Both backends keep the same matching, ranking, and output behavior. On SQLite, `info` gains a `history:` line with the latest jumps, `list --since` reads the same log, data files are created `0600` with WAL journalling (`projects.db-wal` and `projects.db-shm` appear while overdosecd runs), and the jump log keeps the latest 500 jumps per project.
+A `projects.json` left by 0.2.0 moves over automatically on the next command — the first `goto`, `list`, `ui`, whatever comes first — and the original is kept as `projects.json.migrated-<timestamp>`. A corrupt file is quarantined to `projects.json.corrupt-<timestamp>` instead. `overdosecd migrate` does the same thing by hand and refuses to touch a database that already holds projects. `[storage] backend` in the config is ignored (a leftover 0.2.0 line cannot make the file stop loading), and `doctor` tells you it is stale.
 
 ## Git awareness
 
@@ -258,8 +267,8 @@ The remote is a snapshot taken at `add`; refresh it with `overdosecd doctor --re
 
 ```text
 $ overdosecd doctor
-index: ~/.local/share/overdosecd/projects.json (3 projects)
-storage: json
+index: ~/.local/share/overdosecd/projects.db (3 projects)
+storage: sqlite (schema v3)
 config: ~/.config/overdosecd/config.toml
 
 issues (2):
@@ -269,21 +278,19 @@ issues (2):
 hint: `--fix` repairs stale projects interactively; `--refresh` updates stored metadata
 ```
 
-It checks for stale paths, duplicate names, quarantined index files, permission problems (index, home cache, data directory), indexed values containing control characters, and an unreadable config file. Quarantined files are reported, never deleted.
-
-On SQLite it also reports the schema version, orphaned `projects.db-wal`/`-shm`/`-journal` files whose database is gone (`stray:`), a JSON and SQLite pair holding different projects (`mismatch:`), and an unreadable inactive index (`unreadable:`). Everything is read-only: the inactive index is inspected, never quarantined, migrated, or rewritten.
+It checks for stale paths, duplicate names, quarantined index files, a `projects.json` that did not migrate (`legacy:`), permission problems (index, home cache, data directory), indexed values containing control characters (notes included), and an unreadable config file; it also reports the schema version and orphaned `projects.db-wal`/`-shm`/`-journal` files whose database is gone (`stray:`). Quarantined files are reported, never deleted.
 
 `--fix` walks each stale project and lets you skip it, remove it, quit, or type a replacement path; repairs are applied under the lock and the git remote is re-detected. It needs a terminal, so it refuses to prompt in scripts. `--refresh` re-reads the stored metadata (git remote, project kind) of every indexed project, which is useful after `git remote set-url`.
 
 ## Data
 
 ```text
-~/.local/share/overdosecd/projects.json   # your index (default JSON backend)
-~/.local/share/overdosecd/projects.db     # your index when backend = "sqlite"
-~/.config/overdosecd/config.toml          # optional configuration
+~/.local/share/overdosecd/projects.db              # your index
+~/.local/share/overdosecd/projects.json.migrated-… # a kept 0.2.0 index, if one was imported
+~/.config/overdosecd/config.toml                   # optional configuration
 ```
 
-The locations follow the XDG directories. `--data-dir` / `OVERDOSECD_DATA_DIR` override the index location, `OVERDOSECD_CONFIG` the config file; both must be **absolute**, since a relative value would resolve against the current directory and could let a planted folder choose which index is read and written. The data directory is created `0700`, the JSON index is written atomically, and an unreadable index is moved aside to `projects.json.corrupt-<timestamp>` rather than silently wiped.
+The locations follow the XDG directories. `--data-dir` / `OVERDOSECD_DATA_DIR` override the index location, `OVERDOSECD_CONFIG` the config file; both must be **absolute**, since a relative value would resolve against the current directory and could let a planted folder choose which index is read and written. The data directory is created `0700`, the database `0600`, and a corrupt `projects.json` is moved aside to `projects.json.corrupt-<timestamp>` rather than silently wiped. A read-only data directory makes every command fail loudly: SQLite's write-ahead log needs write access next to the database.
 
 ## Exit codes
 

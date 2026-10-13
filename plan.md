@@ -9,6 +9,17 @@ and [README.md](README.md).
 
 ## Where we are
 
+0.3.0 shipped the single-backend release: `projects.db` is the only index (a
+0.2.0 `projects.json` migrates once automatically, backup kept, and the retired
+`[storage]` key parses and is ignored), projects carry single-line notes
+(`ocd note`, schema v3) and an explicit entry profile applied by the `ocd`
+wrapper behind `[general] hooks = true` (variables exported, one command run,
+shown before it runs, refused rather than escaped when unquotable), and the
+storage layer shed the JSON store, `AnyStore`/`Store` trait, and the sidecar
+lock. The whole release rode a simplification-and-performance pass (shared
+matcher, pre-lowered signals, cached sort keys, change-only redraws) whose
+cuts are recorded in the release notes.
+
 0.2.0 shipped the first slice of the git-health work: `.git/config` reads honor
 `include`/`includeIf` and `url.<base>.insteadOf`, bare repositories are
 detected, and projects remember their kind (`info`'s `type:`, `list --type`,
@@ -63,7 +74,7 @@ stdout or stderr can carry a terminal escape from any stored or live value.
 
 ## Roadmap
 
-Order: v0.2.0 → v0.3.0 → v0.4.0 → v0.5.0.
+Order: v0.4.0 → v0.5.0.
 The next milestone carries a full task list and definition of done; later ones
 are sketches that get detailed when they become next.
 
@@ -72,9 +83,8 @@ are sketches that get detailed when they become next.
 Recorded so this is not reopened: the matcher's scoring and signal caps
 (output-frozen), `format_projects_with_missing` (the tested layout engine),
 `TtyBackend` and the `Session`/`PendingRestore` plumbing (each exists for a
-recorded failure), the `Picker` state machine (wide, not deep), `AnyStore`
-(the trait is not object-safe; it retires with the JSON backend in v0.3.0),
-the three import parsers, and the hand-rolled `git.rs` (v0.2.0 extends it; it
+recorded failure), the `Picker` state machine (wide, not deep), the three
+import parsers, and the hand-rolled `git.rs` (v0.2.0 extends it; it
 is never replaced by `git2`/`gix`/subprocess).
 
 ### v0.2.0 — Config debt & project typing
@@ -126,25 +136,41 @@ Definition of done:
 
 ### v0.3.0 — Notes, entry hooks & single backend
 
-Goal: make a project remember what it was for — on one storage format.
+Goal: make a project remember what it was for — on one storage format. Shipped
+2026-10-12; the details live in [CHANGELOG.md](CHANGELOG.md).
 
-- JSON retirement: when `projects.json` exists, one-shot auto-migrate (reuse
-  the `migrate` machinery, keep the `.migrated-<ts>` backup), then delete
-  `JsonStore`, `AnyStore`, the `[storage] backend` key, and the `dual!` test
-  machinery; `doctor` sheds the JSON↔SQLite disagreement check and keeps
-  quarantine reporting. SQLite becomes the only backend.
-- `ocd note add|list|remove <project>` — notes stored with the project; the
-  schema moves to v3, once, SQLite-only.
-- Per-project profiles: environment variables exported on jump, and an optional
-  run-on-enter command. Security rule: hooks are explicit, per-project, and
-  user-authored. Nothing imported or scanned may register a hook, and a hook is
-  shown before it runs. SECURITY.md grows the hook boundary.
-- To decide when detailed: notes shape (one body vs ordered list) and profile
-  storage (columns vs a JSON blob).
+Tasks:
+
+- [x] 1. **Task 0: simplify & squeeze** — the ponytail pass (shared
+  `SkimMatcherV2`, `Lowered` signal views, `rank_indices`, cached sort keys,
+  change-only redraws, unified output funnels/completion embedding, one
+  UPSERT, linear duplicate-name tally and import planning, `git_dir` threaded
+  through `info`/`add`, dead helpers deleted) plus the autojump XDG fix;
+  output-identical, proven by the frozen tests and the pty smoke.
+- [x] 2. **JSON retirement** — auto-migrate once at startup (`migrate::auto`;
+  strict commands surface a clash/quarantine, doctor/complete/hook/init/enter
+  warn and keep going), `JsonStore`/`AnyStore`/`Store`/`fd-lock`/the sidecar
+  lock deleted, `store::json` shrunk to the legacy reader + `list --json`
+  shape, `[storage] backend` parses-and-is-ignored with a `doctor` note, the
+  60 `dual!` test bodies collapsed, benches and the picker smoke made
+  SQLite-only.
+- [x] 3. **Schema v3 + notes** — notes table (cascade, diffed through
+  `update`), `env`/`enter_cmd` profile columns, v1/v2→v3 migration with the
+  `VACUUM INTO` backup recipe, the by-path UNIQUE index pinned by an EXPLAIN
+  QUERY PLAN test, `note add|list|remove`, `info`/detail-pane rendering,
+  `doctor` note scanning.
+- [x] 4. **Profiles + `enter`** — `profile env add|remove`, `profile run
+  set|clear`, `profile show`; hidden `enter <shell> <path>` emitting quoted
+  shell code (bash/zsh/fish) with show-before-run, warn-not-fail, refuse-not-
+  escape; `[general] hooks` (default false) gates both emission and the
+  wrapper line; SECURITY.md hook boundary; pty-smoke scenario.
+- [x] 5. **Release** — CHANGELOG section, README/AGENTS.md facts, SECURITY.md
+  boundary, this milestone ticked, version bumped.
 
 ### v0.4.0 — tmux & worktree integration
 
-Goal: land in the right session and the right worktree.
+Goal: land in the right session and the right worktree. (Next; detailed when
+it becomes next.)
 
 - `ocd <project>` inside tmux attaches the project's session or creates one
   rooted there, following the maintainer's tmux session conventions (their
@@ -231,6 +257,21 @@ Definition of done:
 - Linux is the only supported platform (0.1.0): the crate refuses to build
   elsewhere, and no pre-built binaries are published — crates.io source
   installs are the delivery path.
+- Notes are single-line and display-only, never a matcher signal
+  (2026-10-12): a multi-line body would need a new escaped renderer, and a
+  note signal would reopen the output-frozen scoring.
+- Entry profiles ship as explicit hooks behind `[general] hooks = true`
+  (default off, 2026-10-12): nothing imported or scanned can register one, the
+  command is shown before it runs, an unquotable profile is refused, and a
+  planted database plus the switch is code execution on the next wrapper jump
+  — accepted, because the switch and the display notice are the boundary
+  (SECURITY.md).
+- The whole 0.3.0 surface lands in one schema bump (v3 carries notes and the
+  profile columns, 2026-10-12): one migration, one backup, one re-read under
+  the lock.
+- A read-only data directory fails reads since 0.3.0 (SQLite's WAL needs write
+  access beside the database); the jump-degrades-to-a-warning behavior was a
+  JSON-store property and is not re-created (2026-10-12).
 
 ## Known limitations
 
@@ -238,8 +279,7 @@ Definition of done:
 | - | ---------- | ----- |
 | 1 | Subcommand names are reserved by the `ocd` wrapper, so a project named `tag` needs `ocd goto tag` | by design |
 | 2 | Ranking aggregates jumps into one `use_count` instead of weighting the history log | by design |
-| 3 | The JSON backend rewrites the whole index file on every mutation (SQLite updates single rows) | by design (json); moot at v0.3.0 |
-| 4 | Data directories, config paths, and store entries must be absolute; a relative value is refused | by design |
+| 3 | Data directories, config paths, and store entries must be absolute; a relative value is refused | by design |
 
 ## Recorded numbers
 

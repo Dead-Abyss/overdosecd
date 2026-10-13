@@ -65,7 +65,8 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   returns `None` when stdout is piped, so piped output is never truncated.
 - Values that would break the line-oriented output or inject terminal escapes
   are refused at every entry point (`add` path/name/alias/tag, `rename`,
-  `alias add`, `tag add`, `doctor --fix` replacement paths) via
+  `alias add`, `tag add`, `note add`, `profile env add`/`profile run set`,
+  `doctor --fix` replacement paths) via
   `project::reject_control_chars`: C0 controls (newlines and tab included),
   DEL, C1, bidi overrides/isolates and never-visible characters (zero-width
   space, word joiner, invisible operators, BOM) are all rejected, since a
@@ -73,7 +74,7 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   ZWNJ stay legal (emoji and complex scripts need them). The error renders the
   value escaped so the message itself stays one line; the home walk and
   `load_cache` filter such names too, and `doctor` reports pre-guard entries
-  (name/alias/tag/path **and** stored git remote name/URL) as `unsafe:`.
+  (name/alias/tag/note/path **and** stored git remote name/URL) as `unsafe:`.
 - Display safety is a property of the **renderer**, not of the stored value:
   entry-point guards cannot see a planted index, a live `.git` read, `$CWD`,
   or an environment variable. `src/sanitize.rs` is the single rule
@@ -108,65 +109,74 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   `XDG_*` values ignored per the spec. An unset `$HOME` errors instead of
   resolving through `getpwuid` (recorded trade-off).
 - Store files are not trusted by name: every open refuses a symbolic link
-  (`paths::refuse_symlink`) for the JSON index, SQLite database, home cache,
-  visit counters, and the sidecar lock — a planted `projects.db -> /elsewhere`
-  used to be written through, mode included. Rebuildable files (`home-dirs.json`,
+  (`paths::refuse_symlink`) for the SQLite database, home cache, and
+  visit counters — a planted `projects.db -> /elsewhere` used to be written
+  through, mode included. Rebuildable files (`home-dirs.json`,
   `hook-visits.json`) treat a link as absent and rescan instead of failing.
   `doctor` reports a link as `symlink:` for every store file, and survives a
-  symlinked active index to do it. Paths entering the index must be valid UTF-8
-  (`Error::NonUtf8Path`): the SQLite backend used to store a lossy `U+FFFD`
-  row it could never load. `projects.lock` is created `0600`, quarantine and
-  migration backups share `paths::sibling_backup` (a numeric suffix, so two
+  symlinked database to do it (`load` reports it and `schema_version` tolerates
+  it). Paths entering the index must be valid UTF-8
+  (`Error::NonUtf8Path`): the old SQLite path used to store a lossy `U+FFFD`
+  row it could never load. Quarantine and migration backups share
+  `paths::sibling_backup` (a numeric suffix, so two
   events in the same second cannot overwrite the first forensic copy), and
-  `write_private` fsyncs the parent directory so the rename itself is durable.
+  `paths::write_private` fsyncs the parent directory so the rename itself is
+  durable.
 - Config file (`src/config.rs`): `~/.config/overdosecd/config.toml`, overridable with
   `$OVERDOSECD_CONFIG` (which must exist). Missing file = built-in defaults, malformed
   file = exit `3`; never a silent fallback. Settings resolve flag > env > config >
   default. `doctor` is deliberately tolerant: it reports a broken config as an issue
-  instead of exiting `3`. `[general]` carries `color`, `hook`, and `hint`; both
-  hook switches default to `false` and `init`/the hook read them leniently.
+  instead of exiting `3`. `[general]` carries `color`, `hook`, `hint`, and
+  `hooks` (entry profiles); all three switches default to `false` and
+  `init`/the hook/`enter` read them leniently.
   Matcher knobs live in `MatcherConfig` (`src/matcher.rs`)
   and every `rank`/`best` call takes it explicitly.
-- `projects.json` (version 1) is written atomically — tmp file + fsync + rename,
-  mode 0600. Corrupt files are quarantined to `projects.json.corrupt-<ts>`, never
-  wiped; a newer `version` is refused.
-- `projects.db` (SQLite, `src/store/sqlite.rs`) is the second backend: schema v2
-  with `meta` (`schema_version`), `projects` (`kind` joins in the v1→v2
-  migration), and a `usage` jump log capped at `USAGE_KEEP = 500` rows per
-  project (the oldest rows are pruned with each jump).
-  WAL mode; the file is created mode 0600 and WAL/SHM inherit it. `load` never
-  creates the file. `update` runs `BEGIN IMMEDIATE` (busy wait ~500 ms, then
-  `Error::LockTimeout`, matching the JSON sidecar lock) and *diffs* the snapshot
-  so a tracked jump updates one row instead of rewriting the index; `save`
-  upserts and only removed ids cascade their `usage` rows away. `ensure_schema`
-  must stay read-only once the schema exists — running DDL on every open would
-  block readers behind another writer. A v1 database migrates only on a
-  writable open: `VACUUM INTO` keeps a consistent `projects.db.v1-<stamp>` copy
-  beside it, then the `ALTER` runs in one `BEGIN IMMEDIATE` transaction that
-  re-reads the version under the lock, so concurrent first opens skip instead
-  of failing on the duplicate column; `load_readonly` reports the old version
-  instead of migrating.
-- `[storage] backend = "json" | "sqlite"` picks the index file (default `json`).
-  `doctor` and `complete` are dispatched before the strict config load, so they
-  resolve the backend leniently: a broken config falls back to the default
-  backend instead of failing them.
-- `doctor` reports the active backend and the SQLite schema version, checks the
-  active file's permissions, the data directory's mode (`0700` expected on
+- `projects.json` is *legacy input only* since 0.3.0: `store::json::StoreFile`
+  is the `list --json` output shape and `read_legacy` the migration's reader
+  (atomic private writes moved to `paths::write_private`). A corrupt file is
+  quarantined to `projects.json.corrupt-<ts>`, never wiped; a newer `version`
+  is refused; a symlink is refused.
+- `projects.db` (SQLite, `src/store/sqlite.rs`) is the only backend: schema v3
+  with `meta` (`schema_version`), `projects` (plus `env`/`enter_cmd` profile
+  columns since v3; `kind` joined in v1→v2), a `usage` jump log capped at
+  `USAGE_KEEP = 500` rows per project (the oldest rows are pruned with each
+  jump), and a `notes` table (`project_id`, `seq`, `text`; cascade delete;
+  rewritten per project when its list changes). `projects.path` is `UNIQUE`,
+  which is the index `profile_for_path` (the `enter` fast path) rides — pinned
+  by an EXPLAIN QUERY PLAN test. WAL mode; the file is created mode 0600 and
+  WAL/SHM inherit it. `load` never creates the file. `update` runs
+  `BEGIN IMMEDIATE` (busy wait ~500 ms, then `Error::LockTimeout`) and *diffs*
+  the snapshot so a tracked jump updates one row instead of rewriting the
+  index; `save` upserts and only removed ids cascade their `usage`/`notes` rows
+  away. `ensure_schema` must stay read-only once the schema exists — running
+  DDL on every open would block readers behind another writer. A v1 or v2
+  database migrates only on a writable open: `VACUUM INTO` keeps a consistent
+  `projects.db.v{1,2}-<stamp>` copy beside it, then the missing `ALTER`s (and
+  the notes table, via the idempotent `SCHEMA`) run in one `BEGIN IMMEDIATE`
+  transaction that re-reads the version under the lock, so concurrent first
+  opens skip instead of failing on the duplicate column. A read-only data
+  directory fails reads too: SQLite's WAL needs write access beside the file.
+- `[storage] backend` is retired: it still parses (so a 0.2.0 config loads;
+  `deny_unknown_fields` would otherwise reject the whole file) and is ignored;
+  `doctor` reports it as a stale key. `doctor` and `complete` are dispatched
+  before the strict config load, so a broken config cannot fail them.
+- `doctor` reports the SQLite schema version, checks the database's
+  permissions, the data directory's mode (`0700` expected on
   Unix), and indexed values for control characters, flags orphaned
   `projects.db-wal`/`-shm`/`-journal`
-  files (only when the database is gone), a JSON+SQLite pair whose id sets
-  differ, and an inactive index that cannot be read. It stays read-only: an
-  inactive database goes through `SqliteStore::load_readonly` (read-only
-  connection, no schema creation) and an inactive JSON is parsed directly, not
-  through `JsonStore::load` (which would quarantine). Quarantine files keep
-  the `projects.json.corrupt-` prefix whichever backend is active.
-- `migrate` (`src/migrate.rs`) imports `projects.json` into `projects.db` and
+  files (only when the database is gone), a `projects.json` that did not
+  migrate (`legacy:`), and quarantine files (the `projects.json.corrupt-`
+  prefix).
+- `migrate` (`src/migrate.rs`) moves `projects.json` into `projects.db` and
   renames the original to `projects.json.migrated-<ts>` (a name that already
-  exists gets a numeric suffix, so older backups are never overwritten). It is
+  exists gets a numeric suffix, so older backups are never overwritten). Startup
+  runs it automatically before any command touches the index (`migrate::auto`);
+  strict commands surface a refusal (`MigrationClash`, exit 1, when the database
+  already holds projects; the quarantine error, exit 3, for a corrupt file)
+  while `doctor`/`complete`/`hook`/`init`/`enter` warn on stderr and keep
+  going. The explicit `migrate` command is the see-it-by-hand path; it is
   idempotent (`AlreadyMigrated` when the database is there and the json is
-  gone), reuses an empty database, and refuses one that already holds projects
-  (`MigrationClash`, exit 1). When the configured backend is still json it adds
-  a note telling the user to set `[storage] backend = "sqlite"`.
+  gone) and reuses an empty database.
 - `overdosecd import zoxide|autojump|zsh-z` (`src/import.rs`) reads each tool's
   own store at its default location or the tool's env override (`_ZO_DATA_DIR`,
   `AUTOJUMP_DATA_DIR`, `$ZSHZ_DATA`), never a shell-out. zoxide's `db.zo` is
@@ -189,8 +199,9 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
 - `clap` definitions are the CLI source of truth. The `ocd` pass-through allowlist
   printed by `overdosecd init` is generated from clap in `src/output.rs`, so new
   subcommands appear automatically — do not hardcode shell allowlists. Hidden
-  commands are filtered out of the allowlist, so a project named `complete` stays
-  jumpable while the public `completions` is reserved.
+  commands (`complete`, `hook`, `enter`) are filtered out of the allowlist, so
+  a project named `complete` stays jumpable while the public `completions` is
+  reserved.
 - The completion helper (`overdosecd complete <prefix>`, hidden) is dispatched
   before the config load, like `doctor`: it runs on every TAB press and reads no
   matcher knobs, so a broken config must not break completion. Reuse
@@ -198,15 +209,30 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   sorted, stale excluded) rather than writing a second filter.
 - The cd hook (`src/hook.rs`, `overdosecd hook`, hidden) is dispatched before the
   strict config load like `doctor`/`complete`. `[general] hook = true` records
-  a jump when the current directory is an indexed project (`Store::record_use`,
-  so SQLite writes a real `usage` row); `[general] hint = true` counts visits
-  to directories that are not indexed in `hook-visits.json` (0600, atomic,
-  rebuildable, never quarantined — 3 visits, 14-day hint cooldown, 30-day
-  decay, and a 500-entry cap, all fixed constants). The hook is silent on
-  success, may print one stderr line, and never exits non-zero: it must not be
-  able to break a `cd`. `overdosecd init` installs the wrapper whenever either
-  knob is on, and all three wrappers jump with `builtin cd` so the hook can
-  never double-record a `ocd` jump.
+  a jump when the current directory is an indexed project
+  (`SqliteStore::record_use`, a real `usage` row); `[general] hint = true`
+  counts visits to directories that are not indexed in `hook-visits.json`
+  (0600, atomic, rebuildable, never quarantined — 3 visits, 14-day hint
+  cooldown, 30-day decay, and a 500-entry cap, all fixed constants). The hook
+  is silent on success, may print one stderr line, and never exits non-zero: it
+  must not be able to break a `cd`. `overdosecd init` installs the wrapper
+  whenever either knob is on, and all three wrappers jump with `builtin cd` so
+  the hook can never double-record a `ocd` jump.
+- Entry profiles (`src/enter.rs`, `overdosecd enter`, hidden) are the
+  wrapper's post-`cd` step, dispatched before the strict config load and
+  gated by `[general] hooks` (default off, read leniently): the *generated
+  wrapper* only carries the `enter` call when the switch was on at `init`
+  time, so a default install pays no extra process per jump. `enter` resolves
+  the just-entered path with `SqliteStore::profile_for_path` (the UNIQUE-index
+  lookup), then prints quoted shell code — bash/zsh `export` + `|| printf`
+  warning, fish `set -gx` + `or echo` — that the wrapper `eval`s/`source`s.
+  It must never break a jump: every failure is a stderr warning with empty
+  stdout and exit 0. A planted index cannot smuggle anything in: variable
+  names must be shell identifiers, values and the command pass
+  `reject_control_chars` when written and again when rendered, and an
+  unrenderable profile is *refused*, never escaped. The command is shown on
+  stderr before it runs; a failing command warns instead of propagating.
+  Imports and scans never write a profile.
 - The picker (`overdosecd ui`, `src/ui/`) draws on the controlling terminal
   (`/dev/tty`) and writes *only* the chosen path to
   stdout, so `cd "$(overdosecd ui)"` works even though stdout is a pipe —
@@ -279,19 +305,26 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   cursor's real position**. A hardcoded answer places the inline box wrongly
   and its exit-clear then wipes real output — that is what the `KEEP-ME-42`
   screen check guards.
-- Empty-query ordering is `project::display_order` (pinned, then last used,
-  then name — the same function backs `list`'s default sort); non-empty
-  queries go through `matcher::rank`. A keystroke re-ranks 100k projects in
-  ~37 ms (`ui::picker::tests::rank_latency_at_100k`, `#[ignore]`d, run with
+- Empty-query ordering is `project::sort_key` (pinned, then last used,
+  then name — the same key backs `list`'s default sort) through
+  `sort_by_cached_key`; non-empty queries go through `matcher::rank` (the
+  picker uses `rank_indices`, which skips materializing `Match` names/paths,
+  and `signal_score` compares a per-candidate `Lowered` view built once per
+  query; one shared `SkimMatcherV2` serves every path). A keystroke re-ranks
+  100k projects in ~37 ms (36.6 ms one word, 43.3 ms two words as of 0.3.0;
+  `ui::picker::tests::rank_latency_at_100k`, `#[ignore]`d, run with
   `--release -- --ignored --nocapture`). If that ever needs fixing, narrowing
   to the previous query's candidate set is provably equivalent when the new
   query extends the old one (every signal is subsequence-based).
+- The picker's event loop only redraws when something changed (details/home
+  updates report it; events mark it dirty), so idle poll timeouts repaint
+  nothing.
 - Bare `ocd` opens the picker: the shell wrappers in `src/output.rs` run
   `overdosecd ui` and `cd` to what it prints; `ocd ui` and `ocd --ui` are the
   same, and the usage text is gone. `ui` joins the subcommand names reserved
   by the wrapper.
 - Subcommand names are reserved by the `ocd` wrapper, so a project literally named
-  `tag` (or `ui`) must be jumped to via `ocd goto tag`.
+  `tag` (or `ui`, `note`, `profile`) must be jumped to via `ocd goto tag`.
 - Git metadata: the remote is stored in `Project.git` at add time (`add --force`
   refreshes it live, as does `doctor --refresh`), while `info` reads the branch
   live. Every `.git` read is capped
@@ -314,13 +347,12 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   `kind` column; JSON carries it with a serde default), and never stat'd on the
   query path. It is display and filter only (`info`'s `type:`, `list --type`,
   the picker badge) — never a matcher signal.
-- Index writes go through `Store::update(|projects| …)` (trait in `src/store/mod.rs`),
-  which owns lock → load → mutate → save. `JsonStore` serializes with the sidecar
-  `projects.lock` (`fd-lock`, ~500 ms retry); `SqliteStore` uses one
-  `BEGIN IMMEDIATE` transaction with a ~500 ms busy timeout. Route mutations
-  through `update`; each store's `save` is an inherent method (migration and
-  tests) that is deliberately not on the trait, so a generic caller cannot
-  bypass the lock. Readers do not lock.
+- Index writes go through `SqliteStore::update(|projects| …)`, which owns
+  lock → load → mutate → save: one `BEGIN IMMEDIATE` transaction with a
+  ~500 ms busy timeout. Route mutations through `update`; `save` (the
+  whole-snapshot path the migration and tests use) is a separate inherent
+  method so an ordinary caller cannot bypass the diff-and-lock path. Readers
+  do not lock.
 - Matcher fuzzy signals are hard-capped (name ≤ 400, alias ≤ 400, path ≤ 200,
   repo ≤ 300) and `signal_score()` skips one once the running best exceeds its
   cap: `improve` only replaces on a strict win and the signal order is
@@ -341,20 +373,20 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   `output::format_projects_with_missing`, which also derives the `!` footer. The
   plain `format_projects` wrapper is `#[cfg(test)]` and re-stats; production
   code must not call it.
-- `Store::record_use` records a jump: JSON bumps the counters inside `update`;
-  SQLite runs one `BEGIN IMMEDIATE` transaction (`MIN(use_count + 1, …)`) that
-  also appends to `usage` and prunes that project's log. `recent_uses` returns
-  newest-first timestamps on SQLite and an empty list on JSON. `goto` prints
-  the path before recording usage, so a failed bookkeeping write only produces
-  a stderr warning; keep it that way.
+- `SqliteStore::record_use` records a jump in one `BEGIN IMMEDIATE`
+  transaction (`MIN(use_count + 1, …)`) that also appends to `usage` and
+  prunes that project's log; `recent_uses` returns newest-first timestamps.
+  `goto` prints the path before recording usage, so a failed bookkeeping write
+  only produces a stderr warning; keep it that way.
 - `list --since <WHEN>` (`src/time.rs`) accepts durations (`30m`, `48h`, `7d`,
   `2w`, `1y`) and dates/RFC 3339 (`2026-09-01`); `now` is injected, invalid
   values exit 1 via `Error::InvalidValue`. It filters on the cached
-  `last_used_at` before sorting, so it works on both backends and never-used
+  `last_used_at` before sorting, so never-used
   projects are excluded, and its empty result prints its own message
   ("no projects jumped to since …") instead of the empty-index one.
 - `info` appends a `history:` line (up to 5 most recent jumps, relative times)
-  only when `recent_uses` is non-empty; the JSON backend never shows it.
+  only when `recent_uses` is non-empty, and numbers a project's notes under
+  `notes:` (display-only, like `kind` — never a matcher signal).
 
 - The home fallback (`src/discovery.rs`) never indexes anything: it walks
   `$HOME` within a depth cap and an entry budget applied *during* the walk
@@ -373,7 +405,7 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   `picker.needs_home()`, scans on a thread when the cache is missing or older
   than `ttl_hours`, picks the result up on a 150 ms `event::poll` (blocking
   otherwise), and filters out the data dir before handing dirs to the picker.
-- `home-dirs.json` is written by `store::json::write_private` (atomic, `0600`)
+- `home-dirs.json` is written by `paths::write_private` (atomic, `0600`)
   and is *rebuildable*: a broken or older-version cache is ignored, never
   quarantined like the index. `overdosecd scan --home [--refresh] [--dry-run]`
   is the explicit control; `doctor` prints a `home cache:` line and reports a
@@ -420,12 +452,11 @@ finds issues; `doctor --refresh` rewrites stored git metadata under the lock.
   tests point
   `OVERDOSECD_CONFIG` at a file inside the sandbox so they do not depend on
   platform paths.
-- Behavior tests run against both backends: wrap the body in
-  `dual!(sandbox, { … })`, which builds a fresh `Sandbox` per backend. A SQLite
-  sandbox writes `[storage] backend = "sqlite"` (plus any test body config) and
-  sets `OVERDOSECD_CONFIG`; `write_config` reuses that path. Tests that are
-  backend-specific (quarantine files, the sidecar lock, `projects.json`
-  permissions) stay on `Sandbox::new()` with a comment saying why.
+- `Sandbox::new()` is the single backend now (SQLite): it writes no config
+  unless a test calls `write_config`, and then `std_cmd` points
+  `OVERDOSECD_CONFIG` at that file. `age_last_used` edits the database
+  directly; `write_json_index` seeds a legacy `projects.json` for the
+  migration tests.
 - Edition 2024 makes `std::env::set_var` unsafe: never mutate env vars in tests.
   Use injected parameters instead (`expand_tilde_with`, `shorten_home(path, home)`,
   `relative_time(when, now)`, `format_projects(projects, home, width)`).
@@ -434,18 +465,16 @@ finds issues; `doctor --refresh` rewrites stored git metadata under the lock.
 - Permission tests are `#[cfg(unix)]`, restore their modes before the tempdir
   drops, and skip via `permissions_are_ignored` when running as root, where
   permission bits are not enforced.
-- Lock and concurrency tests hold `projects.lock` in-process with `fd-lock`
-  (dev-dependency); the SQLite analogue opens a second `rusqlite` connection
-  and holds `BEGIN IMMEDIATE`. The stress test spawns the built binary via
+- Lock and concurrency tests open a second `rusqlite` connection and hold
+  `BEGIN IMMEDIATE`. The stress test spawns the built binary via
   `env!("CARGO_BIN_EXE_overdosecd")`; `assert_cmd`'s `spawn` is private. Bench
   targets get the same variable, which is how `benches/cli.rs` finds the binary.
 - Benchmarks: `cargo bench` runs `benches/cli.rs` (criterion, `harness = false`)
-  over 1k/10k/100k fixtures on both backends, each iteration spawning the real
-  binary, plus `import autojump-1k-json` (a fresh index per iteration, since
-  imports are idempotent). CI does not run them; record numbers in the active
-  milestone and `CHANGELOG.md` when they change. Fixtures hand-write
-  `projects.json` and the SQLite fixture is built from it with one `migrate`
-  run — never loop `add`.
+  over 1k/10k/100k fixtures, each iteration spawning the real binary, plus
+  `import autojump-1k` (a fresh index per iteration, since imports are
+  idempotent). CI does not run them; record numbers in the active milestone
+  and `CHANGELOG.md` when they change. Fixtures hand-write `projects.json`
+  and the database is built from it with one `migrate` run — never loop `add`.
 - `proptest` (dev-only) guards the matcher — `rank` never panics on arbitrary
   queries and names, ranking is deterministic, a single contributing term
   keeps the old confidence rule — and the import parsers: arbitrary bytes are
@@ -462,7 +491,8 @@ finds issues; `doctor --refresh` rewrites stored git metadata under the lock.
 - Manual shell test: the wrapper calls `overdosecd` by name, so put the binary on
   `PATH` (e.g. `target/debug`) before `eval "$(overdosecd init zsh)"`.
 - The picker's end-to-end behavior (jump, filter, Tab+j/k, pin, add, cancel,
-  SIGTERM mid-session, mid-session resize, both wrappers, both backends) is
+  SIGTERM mid-session, mid-session resize, both wrappers, the entry profile
+  applied through the bash wrapper) is
   checked by `scripts/picker-smoke.py`, which drives the real binary through a
   pty and reads the path from a redirected stdout. It answers the inline
   viewport's cursor query itself — *every* time it is asked, including the

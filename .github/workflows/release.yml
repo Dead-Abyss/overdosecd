@@ -39,12 +39,15 @@ jobs:
       - name: Extract the CHANGELOG notes
         run: |
           version="${GITHUB_REF_NAME#v}"
+          # Keep the notes OUT of the work tree: `cargo publish` refuses a
+          # dirty checkout, and this step must run before the publish.
+          notes="$RUNNER_TEMP/release-notes.md"
           awk -v version="$version" '
             index($0, "## [" version "]") == 1 { in_section = 1; next }
             in_section && index($0, "## [") == 1 { exit }
             in_section { print }
-          ' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
+          ' CHANGELOG.md > "$notes"
+          if [ ! -s "$notes" ]; then
             echo "no CHANGELOG section for $version" >&2
             exit 1
           fi
@@ -58,7 +61,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          summary="$(awk 'NF { print; exit }' release-notes.md)"
+          notes="$RUNNER_TEMP/release-notes.md"
+          summary="$(awk 'NF { print; exit }' "$notes")"
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME — $summary" \
-            --notes-file release-notes.md
+            --notes-file "$notes"

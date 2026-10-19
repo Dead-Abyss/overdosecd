@@ -126,11 +126,25 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   `$OVERDOSECD_CONFIG` (which must exist). Missing file = built-in defaults, malformed
   file = exit `3`; never a silent fallback. Settings resolve flag > env > config >
   default. `doctor` is deliberately tolerant: it reports a broken config as an issue
-  instead of exiting `3`. `[general]` carries `color`, `hook`, `hint`, and
+  instead of exiting `3`. `[general]` carries `color`, `hook`, `hint`,
   `hooks` (entry profiles); all three switches default to `false` and
   `init`/the hook/`enter` read them leniently.
   Matcher knobs live in `MatcherConfig` (`src/matcher.rs`)
   and every `rank`/`best` call takes it explicitly.
+- The theme (`src/theme.rs`) is a renderer setting installed once in `run`
+  after the color mode resolves: `theme::active()` is the one global, like
+  `colored`'s override. `ColorSpec` parses named ANSI colors, `color0`–`color255`,
+  and `#rrggbb`; `Theme` maps the `Role`s (`accent`, `dim`, `good`, `bad`,
+  `warn`, `info`, `border`, optional `text`) to `colored` and ratatui colors.
+  CLI output calls `theme::active().paint(Role::…)` (never `.red()`/
+  `.yellow()`/`.dimmed()`), and the picker's `Palette` reads the same `Theme`
+  (never a literal `ratatui Color`) — that is what keeps a theme unable to emit
+  anything but a foreground SGR. `bleed` (rose/bone/ash, the default since
+  0.4.0) and `base` (the 0.3.0 look) are built in; `[theme]` overrides roles
+  inline; `$OVERDOSECD_THEME` (base|bleed) wins over `[theme] name` and
+  overrides still apply. `text` paints the picker canvas only; CLI body text
+  stays the terminal's. Hex emits truecolor (colored downscales when
+  `COLORTERM` is not truecolor/24bit).
 - `projects.json` is *legacy input only* since 0.3.0: `store::json::StoreFile`
   is the `list --json` output shape and `read_legacy` the migration's reader
   (atomic private writes moved to `paths::write_private`). A corrupt file is
@@ -233,6 +247,18 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   unrenderable profile is *refused*, never escaped. The command is shown on
   stderr before it runs; a failing command warns instead of propagating.
   Imports and scans never write a profile.
+- Worktrees are live, not indexed: `git::worktrees_in` reads
+  `<common-dir>/worktrees/*/gitdir` (first line only, `read_small` caps,
+  symlinked admin dirs skipped, registrations whose checkout vanished
+  skipped, the calling worktree itself skipped, at most `MAX_WORKTREES = 64`),
+  and the worktree's branch comes from its own admin `HEAD`. `info` lists
+  siblings after the remote. `ocd <name>:<branch>`
+  is a deliberately separate pre-matcher lookup: split at the last colon, resolve
+  the project with the normal matcher (honoring `--confident`), then match
+  `Branch::Named` exactly — the current checkout first, then siblings. The
+  colon form must never reach `rank`/`best`; scores and tie-breaks stay
+  bit-identical. A worktree target is not an index row, so `goto` prints it
+  with the usual safety check but records no usage.
 - The picker (`overdosecd ui`, `src/ui/`) draws on the controlling terminal
   (`/dev/tty`) and writes *only* the chosen path to
   stdout, so `cd "$(overdosecd ui)"` works even though stdout is a pipe —

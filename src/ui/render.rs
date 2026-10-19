@@ -8,7 +8,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
@@ -16,6 +16,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::matcher;
 use crate::output;
 use crate::project::Kind;
+use crate::theme::{self, Role, Theme};
 
 use super::actions::HELP;
 use super::picker::{Mode, Picker, sort_label};
@@ -32,10 +33,18 @@ pub fn draw(
     color: bool,
     border: bool,
 ) {
-    let palette = Palette { color };
+    let palette = Palette {
+        color,
+        theme: theme::active(),
+    };
     let area = frame.area();
+    // The theme's body color is the canvas every widget draws over; widgets
+    // that set their own foreground override it, the rest inherit.
+    if color && let Some(text) = palette.theme.tui(Role::Text) {
+        frame.render_widget(Block::default().style(Style::new().fg(text)), area);
+    }
     let inner = if border {
-        let block = Block::bordered().border_style(palette.dim());
+        let block = Block::bordered().border_style(palette.border());
         frame.render_widget(block.clone(), area);
         block.inner(area)
     } else {
@@ -150,14 +159,14 @@ fn project_row(
     let marked = picker.marks().contains(&project.id);
 
     let state = if project.pinned {
-        Span::styled("* ", palette.fg(Color::Yellow))
+        Span::styled("* ", palette.role(Role::Warn))
     } else if missing {
-        Span::styled("! ", palette.fg(Color::Red))
+        Span::styled("! ", palette.role(Role::Bad))
     } else {
         Span::styled("  ", palette.dim())
     };
     let mark = if marked {
-        Span::styled("▌ ", palette.fg(Color::Cyan))
+        Span::styled("▌ ", palette.role(Role::Accent))
     } else {
         Span::raw("  ")
     };
@@ -182,7 +191,7 @@ fn project_row(
     spans.push(Span::styled(
         detail,
         if missing {
-            palette.fg(Color::Red)
+            palette.role(Role::Bad)
         } else {
             palette.dim()
         },
@@ -213,7 +222,7 @@ fn home_row(
     };
 
     let indices = matcher::highlight_indices(picker.query(), &found.name);
-    let mut spans = vec![Span::styled("~ ", palette.fg(Color::Blue))];
+    let mut spans = vec![Span::styled("~ ", palette.role(Role::Info))];
     spans.extend(highlighted(&found.name, &indices, palette.accent()));
     spans.push(Span::styled(
         format!("  {}  ·  home", output::shorten_home(&found.path, home)),
@@ -304,7 +313,7 @@ fn draw_health(frame: &mut Frame, area: Rect, picker: &mut Picker, palette: &Pal
                 Span::styled(
                     marker.to_owned(),
                     if row.stale.is_some() {
-                        palette.fg(Color::Red)
+                        palette.role(Role::Bad)
                     } else {
                         palette.dim()
                     },
@@ -460,7 +469,7 @@ fn draw_status(frame: &mut Frame, area: Rect, picker: &Picker, palette: &Palette
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 crate::sanitize::text(&confirm.message),
-                palette.fg(Color::Yellow),
+                palette.role(Role::Warn),
             ))),
             area,
         );
@@ -471,9 +480,9 @@ fn draw_status(frame: &mut Frame, area: Rect, picker: &Picker, palette: &Palette
         Some(status) => Line::from(Span::styled(
             crate::sanitize::text(&status.text),
             if status.error {
-                palette.fg(Color::Red)
+                palette.role(Role::Bad)
             } else {
-                palette.fg(Color::Green)
+                palette.role(Role::Good)
             },
         )),
         None => Line::from(Span::styled(hint(picker.mode()), palette.dim())),
@@ -552,12 +561,13 @@ fn highlighted(text: &str, indices: &[usize], accent: Style) -> Vec<Span<'static
 
 struct Palette {
     color: bool,
+    theme: &'static Theme,
 }
 
 impl Palette {
     fn accent(&self) -> Style {
         if self.color {
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            self.role(Role::Accent).add_modifier(Modifier::BOLD)
         } else {
             Style::new().add_modifier(Modifier::BOLD)
         }
@@ -565,15 +575,26 @@ impl Palette {
 
     fn dim(&self) -> Style {
         if self.color {
-            Style::new().fg(Color::DarkGray)
+            self.role(Role::Dim)
         } else {
             Style::new().add_modifier(Modifier::DIM)
         }
     }
 
-    /// A plain foreground color; colorless output resets it.
-    fn fg(&self, color: Color) -> Style {
-        Style::new().fg(if self.color { color } else { Color::Reset })
+    fn border(&self) -> Style {
+        if self.color {
+            self.role(Role::Border)
+        } else {
+            Style::new().add_modifier(Modifier::DIM)
+        }
+    }
+
+    /// A themed foreground; colorless output leaves the cell alone.
+    fn role(&self, role: Role) -> Style {
+        match (self.color, self.theme.tui(role)) {
+            (true, Some(color)) => Style::new().fg(color),
+            _ => Style::new(),
+        }
     }
 }
 

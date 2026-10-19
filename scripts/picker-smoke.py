@@ -221,6 +221,7 @@ class Harness:
         snapshot_at=None,
         signal_at=None,
         resize=None,
+        color=False,
     ):
         """Run argv under a pty; stdin+stderr are the tty, stdout is a file.
 
@@ -248,6 +249,8 @@ class Harness:
             if cwd:
                 os.chdir(cwd)
             env = self.env()
+            if color:
+                env.pop("NO_COLOR", None)
             if shell == "zsh":
                 os.execve("/bin/zsh", ["zsh", "-f", "-c", argv], env)
             elif shell == "bash":
@@ -692,6 +695,16 @@ class Harness:
             "\n".join(self.final_screen or []),
         )
         self.check_non_intrusive(pty)
+
+        # The default `bleed` palette reaches the screen: its rose accent is
+        # emitted as a truecolor foreground (ratatui does not downscale RGB).
+        self.setup()
+        code, _, pty = self.run([binary, "ui"], [b"\r"], color=True)
+        self.check(
+            "bleed palette reaches the screen",
+            b"38;2;224;69;94" in pty,
+            f"code={code}, no rose SGR in the picker stream",
+        )
 
         # The wrappers: bare `ocd`, `ocd --ui`, and zsh all open the picker
         # and cd into the choice (`pwd` prints it after the picker exits).

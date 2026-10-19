@@ -208,7 +208,15 @@ fn parse_zoxide(bytes: &[u8], path: &Path) -> Result<Parsed> {
 /// mark a blacklisted directory.
 fn parse_autojump(bytes: &[u8]) -> Parsed {
     let mut parsed = Parsed::default();
-    for line in String::from_utf8_lossy(bytes).lines() {
+    for raw in bytes.split(|byte| *byte == b'\n') {
+        // Decode per line, not the whole file: a lossy decode would turn an
+        // invalid byte into U+FFFD and import a different path than the
+        // store spelled.
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let Ok(line) = std::str::from_utf8(raw) else {
+            parsed.malformed += 1;
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -239,7 +247,12 @@ fn parse_autojump(bytes: &[u8]) -> Parsed {
 /// so a path containing `|` survives.
 fn parse_zshz(bytes: &[u8]) -> Parsed {
     let mut parsed = Parsed::default();
-    for line in String::from_utf8_lossy(bytes).lines() {
+    for raw in bytes.split(|byte| *byte == b'\n') {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let Ok(line) = std::str::from_utf8(raw) else {
+            parsed.malformed += 1;
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -562,6 +575,20 @@ mod tests {
         assert_eq!(parsed.records[0].score, 12.5);
         assert_eq!(parsed.records[1].path, "/tmp/beta");
         assert_eq!(parsed.records[1].visited, None);
+    }
+
+    #[test]
+    fn non_utf8_lines_are_malformed_not_lossy() {
+        // A raw 0xff must not become U+FFFD and name a different directory.
+        let parsed = parse_autojump(b"10\t/good\xffpath\n11\t/fine\n");
+        assert_eq!(parsed.malformed, 1);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].path, "/fine");
+
+        let parsed = parse_zshz(b"/good\xffpath|1.0|1\n/fine|2.0|2\n");
+        assert_eq!(parsed.malformed, 1);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].path, "/fine");
     }
 
     #[test]

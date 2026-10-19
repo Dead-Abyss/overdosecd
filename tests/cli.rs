@@ -3028,16 +3028,18 @@ fn color_reaches_info_doctor_and_ambiguity_output() {
     // `info` dims its labels.
     sandbox
         .cmd()
+        .env("OVERDOSECD_THEME", "base")
         .args(["--color", "always", "info", "app-one"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("\u{1b}[2mname:"));
+        .stdout(predicate::str::contains("\u{1b}[90mname:"));
 
     fs::remove_dir_all(&stale).expect("remove project dir");
 
     // `doctor` renders issue kinds in red.
     sandbox
         .cmd()
+        .env("OVERDOSECD_THEME", "base")
         .args(["--color", "always", "doctor"])
         .assert()
         .code(1)
@@ -3046,11 +3048,13 @@ fn color_reaches_info_doctor_and_ambiguity_output() {
     // Ambiguous candidates bold the names on stderr.
     sandbox
         .cmd()
+        .env("OVERDOSECD_THEME", "base")
         .args(["--color", "always", "goto", "app"])
         .assert()
         .code(1)
         .stderr(
-            predicate::str::contains("\u{1b}[1mapp-one").and(predicate::str::contains("\u{1b}[2m")),
+            predicate::str::contains("\u{1b}[1mapp-one")
+                .and(predicate::str::contains("\u{1b}[90m")),
         );
 }
 
@@ -3084,6 +3088,15 @@ fn config_and_environment_can_force_color() {
         .failure()
         .code(3)
         .stderr(predicate::str::contains("OVERDOSECD_COLOR"));
+
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_THEME", "neon")
+        .arg("list")
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("OVERDOSECD_THEME"));
 }
 
 #[cfg(target_os = "linux")]
@@ -4026,6 +4039,63 @@ fn profile_guards_refuse_bad_keys_and_values() {
 }
 
 #[test]
+fn worktree_queries_and_info_list_siblings() {
+    let sandbox = Sandbox::new();
+    let main = sandbox.project("repo");
+    fs::create_dir_all(main.join(".git")).expect("create .git");
+    fs::write(main.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+    fs::write(main.join(".git/config"), "").expect("write config");
+
+    let sibling = sandbox.root.join("repo-feat");
+    fs::create_dir_all(&sibling).expect("create sibling");
+    let admin = main.join(".git/worktrees/feat");
+    fs::create_dir_all(&admin).expect("create admin dir");
+    fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", sibling.join(".git").display()),
+    )
+    .expect("write gitdir");
+    fs::write(admin.join("HEAD"), "ref: refs/heads/feat\n").expect("write sibling HEAD");
+    fs::write(
+        sibling.join(".git"),
+        format!("gitdir: {}\n", admin.display()),
+    )
+    .expect("write sibling .git");
+
+    sandbox.add(&main);
+
+    // The colon form resolves the project, then the sibling's branch exactly.
+    sandbox
+        .cmd()
+        .args(["goto", "repo:feat"])
+        .assert()
+        .success()
+        .stdout(format!("{}\n", sandbox.canonical(&sibling)));
+    sandbox
+        .cmd()
+        .args(["goto", "repo:main"])
+        .assert()
+        .success()
+        .stdout(format!("{}\n", sandbox.canonical(&main)));
+    sandbox
+        .cmd()
+        .args(["goto", "repo:nope"])
+        .assert()
+        .failure()
+        .code(1);
+
+    sandbox
+        .cmd()
+        .args(["info", "repo"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("worktrees:")
+                .and(predicate::str::contains(sandbox.canonical(&sibling))),
+        );
+}
+
+#[test]
 fn enter_refuses_planted_unsafe_profiles_without_failing() {
     let sandbox = Sandbox::new();
     let project = sandbox.project("overdosecd");
@@ -4050,4 +4120,148 @@ fn enter_refuses_planted_unsafe_profiles_without_failing() {
         .success()
         .stdout("")
         .stderr(predicate::str::contains("refusing the profile"));
+}
+
+#[test]
+fn shell_commands_survive_a_bad_color_environment() {
+    let sandbox = Sandbox::new();
+    sandbox.add(&sandbox.project("overdosecd"));
+
+    // These run on every keystroke, every cd, and at shell startup; a typo in
+    // the environment must not break them.
+    for command in ["hook", "complete"] {
+        sandbox
+            .cmd()
+            .env("OVERDOSECD_THEME", "bogus")
+            .arg(command)
+            .assert()
+            .success();
+    }
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_COLOR", "bogus")
+        .args(["init", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ocd()"));
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_THEME", "bogus")
+        .args(["enter", "bash", "/tmp"])
+        .assert()
+        .success();
+
+    // Strict commands still refuse the same value.
+    sandbox
+        .cmd()
+        .env("OVERDOSECD_THEME", "bogus")
+        .arg("list")
+        .assert()
+        .failure()
+        .code(3);
+}
+
+#[test]
+fn the_cd_wrapper_keeps_the_status_of_a_successful_cd() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.write_config("[general]\nhook = true\n");
+    let binary = Path::new(env!("CARGO_BIN_EXE_overdosecd"));
+    let path = format!(
+        "{}:{}",
+        binary.parent().expect("binary parent").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // A relative data dir makes the hook exit non-zero; the cd that already
+    // succeeded must still report success.
+    let output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"eval "$(overdosecd init bash)"; export OVERDOSECD_DATA_DIR=relative; cd /tmp; printf 'status=%s\n' "$?""#,
+        )
+        .env("PATH", path)
+        .env("HOME", &sandbox.root)
+        .env("OVERDOSECD_DATA_DIR", &sandbox.data)
+        .env("OVERDOSECD_CONFIG", &config)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run bash");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("status=0"),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn the_wrapper_jumps_to_a_dash_named_project() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project("-x");
+    sandbox.add(&project);
+    let binary = Path::new(env!("CARGO_BIN_EXE_overdosecd"));
+    let path = format!(
+        "{}:{}",
+        binary.parent().expect("binary parent").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(r#"eval "$(overdosecd init bash)"; ocd -x; pwd"#)
+        .env("PATH", path)
+        .env("HOME", &sandbox.root)
+        .env("OVERDOSECD_DATA_DIR", &sandbox.data)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run bash");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        sandbox.canonical(&project)
+    );
+}
+
+#[test]
+fn profile_show_escapes_planted_env_keys() {
+    let sandbox = Sandbox::new();
+    sandbox.add(&sandbox.project("overdosecd"));
+    let connection = rusqlite::Connection::open(sandbox.index_file()).expect("open database");
+    let planted = serde_json::json!({"PL\u{1b}[31mEY": "value"}).to_string();
+    connection
+        .execute("UPDATE projects SET env = ?1", rusqlite::params![planted])
+        .expect("plant profile");
+    drop(connection);
+
+    sandbox
+        .cmd()
+        .args(["profile", "show", "overdosecd"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PL").and(predicate::str::contains("\u{1b}").not()));
+}
+
+#[test]
+fn doctor_reports_planted_profile_control_characters() {
+    let sandbox = Sandbox::new();
+    sandbox.add(&sandbox.project("overdosecd"));
+    let connection = rusqlite::Connection::open(sandbox.index_file()).expect("open database");
+    let planted = serde_json::json!({"PL\u{1b}[31mEY": "value"}).to_string();
+    connection
+        .execute("UPDATE projects SET env = ?1", rusqlite::params![planted])
+        .expect("plant profile");
+    connection
+        .execute(
+            "UPDATE projects SET enter_cmd = 'echo\nrm'",
+            rusqlite::params![],
+        )
+        .expect("plant command");
+    drop(connection);
+
+    sandbox
+        .cmd()
+        .arg("doctor")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("env key"));
 }

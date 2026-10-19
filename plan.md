@@ -9,6 +9,11 @@ and [README.md](README.md).
 
 ## Where we are
 
+0.4.0 (code complete 2026-10-19) is the look-and-worktree release: a typed
+theme (`bleed` by default, `base` to restore the 0.3.0 colors) and worktree
+awareness with `ocd <project>:<branch>` as an exact lookup outside the
+matcher. The tag and crates.io publish are the remaining release step.
+
 0.3.0 shipped the single-backend release: `projects.db` is the only index (a
 0.2.0 `projects.json` migrates once automatically, backup kept, and the retired
 `[storage]` key parses and is ignored), projects carry single-line notes
@@ -167,21 +172,44 @@ Tasks:
 - [x] 5. **Release** — CHANGELOG section, README/AGENTS.md facts, SECURITY.md
   boundary, this milestone ticked, version bumped.
 
-### v0.4.0 — tmux & worktree integration
+### v0.4.0 — Worktrees & the house look
 
-Goal: land in the right session and the right worktree. (Next; detailed when
-it becomes next.)
+Goal: land in the right worktree, and look the way you want by default. Code
+complete 2026-10-19; the tag/publish step is pending.
 
-- `ocd <project>` inside tmux attaches the project's session or creates one
-  rooted there, following the maintainer's tmux session conventions (their
-  setup is the reference environment, not a dependency; outside tmux this
-  degrades to today's behavior).
-- Worktree-aware indexing: sibling worktrees of one repository (read through
-  `.git/worktrees/`, still hand-rolled) become related entries, queryable as
-  `ocd <repo>:<branch>`, and `info` lists them.
-- To decide when detailed: session-per-project vs a window in one session; flag
-  name (`--tmux` vs the reserved subcommand namespace); how `:` queries
-  negotiate with name matching.
+Tasks:
+
+- [x] 1. **Theming** — `src/theme.rs`: eight role tokens (`accent`, `dim`,
+  `good`, `bad`, `warn`, `info`, `border`, optional `text`), typed
+  `ColorSpec` (a named ANSI color, `color0`–`color255`, or `#rrggbb`), and
+  both renderers drawing through `theme::active()` so a theme value can only
+  ever produce a foreground SGR. `bleed` is the bundled default — blackrose's
+  rose/bone/ash look: rose `#e0455e` accents and borders, bone `#f5e9e2`
+  picker text, ash `#6b5a5f` secondary text, ember `#ff8a5c` warnings,
+  leaf `#7ee787` success. `base` restores the 0.3.0 colors, any role can be
+  overridden inline in `[theme]`, and `$OVERDOSECD_THEME` selects a palette.
+- [x] 2. **Worktree awareness** — `git::worktrees_in` reads
+  `.git/worktrees/*/gitdir` and each admin `HEAD` under the existing caps;
+  `info` lists siblings after the remote, and `ocd <project>:<branch>`
+  resolves the project first, then the branch exactly (current checkout first,
+  then siblings) before the matcher ever sees the query. Worktrees are live
+  resolved, never indexed; a worktree jump records no usage row.
+- [x] 3. **Docs** — README (palette, worktree queries), SECURITY.md (theme
+  boundary), AGENTS.md facts, CHANGELOG section.
+- [ ] 4. **Release** — bump `Cargo.toml`, tag, publish, GitHub release.
+
+Definition of done:
+
+- A fresh install renders `bleed`; `[theme] name = "base"` reproduces the
+  0.3.0 colors; no theme value can put a non-SGR escape on any stream; the
+  color mode, `NO_COLOR`, and `never` behave exactly as before.
+- Ordinary queries stay bit-identical: the colon form is resolved outside the
+  matcher, and scores, tie-breaks, and `--debug` never see it.
+- Worktree reads stay capped, refuse non-regular files, skip vanished
+  registrations, and every rendered value rides `sanitize`; a hostile
+  admin directory cannot make `info` unbounded.
+- `list`, `goto`, and `complete` hold the recorded floors; no new runtime
+  dependency.
 
 ### v0.5.0 — Git status & health UI
 
@@ -235,6 +263,11 @@ Definition of done:
 
 ### Backlog (unscheduled)
 
+- tmux session switching inside `ocd` — built during 0.4.0 and cut before
+  release (2026-10-19): the maintainer's `wilt` already owns session naming,
+  the workspace picker, and state badges, so a second implementation in the
+  jumper was surface without need. Revisit only if `wilt` is ever retired
+  (and then tmux stays the only multiplexer target).
 - Multi-machine sync through a plain file (git or a synced folder): only if a
   concrete need shows up; it needs a merge policy for usage data and stable ids
   across machines.
@@ -249,7 +282,16 @@ Definition of done:
   listings; revisit only if the recorded numbers demand it.
 - The JSON backend retires in v0.3.0, with a one-shot auto-migrate and a kept
   backup.
-- The multiplexer target is tmux only.
+- The house look is `bleed` (blackrose's rose / bone / ash), and it is the
+  default rather than an opt-in (2026-10-19): themes are a small built-in set
+  plus inline `[theme]` role overrides, with `base` as the escape hatch. A
+  theme-file directory or an `extends` engine stays out of scope — it is the
+  plugin system this roadmap does not build. Colors are typed values rendered
+  by overdosecd, never raw escape strings.
+- `ocd <project>:<branch>` is an exact, pre-matcher lookup (2026-10-19): the
+  project is resolved normally, then the branch is matched by name against
+  the live current checkout and its sibling worktrees. The colon form never
+  reaches `rank`/`best`, and worktrees are not index rows.
 - The git status reader and its UI ship as v0.5.0, not v0.2.0 (2026-10-04
   re-scope): the object layer — `flate2`, packfile, delta chains — is the
   roadmap's riskiest parser work and would hold the orthogonal config-debt and

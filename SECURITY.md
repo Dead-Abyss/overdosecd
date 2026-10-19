@@ -7,8 +7,8 @@ branch is the development line and is expected to be releasable at any time.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.3.x   | ✅        |
-| < 0.3   | ❌        |
+| 0.4.x   | ✅        |
+| < 0.4   | ❌        |
 
 ## Reporting a vulnerability
 
@@ -59,6 +59,13 @@ attack surfaces are all local:
   rendered. A profile a planted database smuggles in is still arbitrary
   shell — the switch, explicit authoring, and the display-before-run notice
   are what keep that boundary, per the out-of-scope note below.
+- **(g) Themes.** `[theme]` values are parsed into typed colors (a named
+  ANSI color, `color0`–`color255`, or `#rrggbb`) at config load; only
+  overdosecd renders them, and only as a foreground color change. A config
+  file cannot use a theme to smuggle an arbitrary escape sequence, and
+  `never`/`NO_COLOR` disable every color regardless of the palette.
+  `$OVERDOSECD_THEME` selects a bundled palette and accepts only `base` or
+  `bleed`.
 
 ### Out of scope
 
@@ -83,6 +90,8 @@ The rules that keep the guarantees above are recorded in
   refused with exit `1` instead of escaped.
 - No command's stdout or stderr carries a terminal control byte for any stored
   or live value (`NO_COLOR=1` in tests).
+- A theme can only change a foreground color; the output funnel still rejects
+  every escape that is not an SGR sequence.
 - Data directories, config paths, and store entries must be absolute; store
   files are never opened through a symbolic link.
 - Every read of a file that arrives from outside the tool is capped and

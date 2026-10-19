@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::matcher::Match;
 use crate::project::Project;
 use crate::sanitize;
+use crate::theme::{self, Role};
 
 /// The output funnel: nothing may carry a terminal control sequence that
 /// overdosecd itself did not emit as a colour change.
@@ -121,7 +122,12 @@ const HOOK_SCRIPT: &str = r#"
 # a jump into an indexed project, and visits to directories that are not
 # indexed are counted. cd's behavior and exit status are unchanged.
 cd() {
-  builtin cd "$@" && command overdosecd hook
+  # The hook may print one hint line, but its status must never leak: a
+  # non-zero hook would make a successful `cd` look failed to `set -e` and
+  # `&&` chains.
+  builtin cd "$@" || return
+  command overdosecd hook
+  return 0
 }
 "#;
 
@@ -132,7 +138,9 @@ const FISH_HOOK_SCRIPT: &str = r#"
 # indexed are counted. cd's behavior and exit status are unchanged.
 function cd --description 'cd, with a overdosecd hook'
     builtin cd $argv
-    and command overdosecd hook
+    or return
+    command overdosecd hook
+    return 0
 end
 "#;
 
@@ -217,7 +225,7 @@ ocd() {{
           command overdosecd "$@"
           ;;
         *)
-          command overdosecd goto "$@"
+          command overdosecd goto -- "$@"
           ;;
       esac
       return $?
@@ -235,14 +243,14 @@ ocd() {{
       # picker with the query typed in. Scripts (no stdin tty) keep plain
       # `goto` and its messages.
       if [ -t 0 ]; then
-        if target="$(command overdosecd goto --confident "$@" 2>/dev/null)"; then
+        if target="$(command overdosecd goto --confident -- "$@" 2>/dev/null)"; then
           builtin cd "$target" || return 1{enter}
           return 0
         fi
-        target="$(command overdosecd ui --query "$*")" || return 1
+        target="$(command overdosecd ui --query="$*")" || return 1
         builtin cd "$target" || return 1{enter}
       else
-        target="$(command overdosecd goto "$@")" || return 1
+        target="$(command overdosecd goto -- "$@")" || return 1
         builtin cd "$target" || return 1{enter}
       fi
       ;;
@@ -356,7 +364,7 @@ function ocd
                 case {commands}
                     command overdosecd $cmd
                 case '*'
-                    command overdosecd goto $cmd
+                    command overdosecd goto -- $cmd
             end
             return $status
         case ui --ui
@@ -371,18 +379,18 @@ function ocd
             # the picker with the query typed in; scripts (no tty on stdin)
             # keep plain `goto`.
             if isatty stdin
-                set -l target (command overdosecd goto --confident $argv 2>/dev/null)
+                set -l target (command overdosecd goto --confident -- $argv 2>/dev/null)
                 if test $status -eq 0
                     builtin cd $target
                     or return 1{enter}
                     return 0
                 end
-                set target (command overdosecd ui --query "$argv")
+                set target (command overdosecd ui --query="$argv")
                 or return 1
                 builtin cd $target
                 or return 1{enter}
             else
-                set -l target (command overdosecd goto $argv)
+                set -l target (command overdosecd goto -- $argv)
                 or return 1
                 builtin cd $target
                 or return 1{enter}
@@ -450,11 +458,16 @@ impl Tone {
     fn paint(self, text: &str) -> String {
         match self {
             Tone::Plain => text.to_owned(),
-            Tone::Dim => text.dimmed().to_string(),
-            Tone::Red => text.red().to_string(),
-            Tone::Yellow => text.yellow().to_string(),
+            Tone::Dim => role(Role::Dim, text),
+            Tone::Red => role(Role::Bad, text),
+            Tone::Yellow => role(Role::Warn, text),
         }
     }
+}
+
+/// Paints one CLI fragment through the active theme.
+fn role(role: Role, text: &str) -> String {
+    theme::active().paint(role, text)
 }
 
 struct Cell {
@@ -800,7 +813,7 @@ const INFO_LABEL_WIDTH: usize = 10;
 /// A dimmed, fixed-width label followed by a plain value, for `info` lines.
 pub fn info_line(label: &str, value: &str) -> String {
     let padding = INFO_LABEL_WIDTH.saturating_sub(display_width(label)) + 1;
-    format!("{}{}{value}", label.dimmed(), " ".repeat(padding))
+    format!("{}{}{value}", role(Role::Dim, label), " ".repeat(padding))
 }
 
 /// Picks the singular or plural noun for `count`: the one place the CLI's
@@ -857,7 +870,7 @@ pub fn format_doctor(
     ));
 
     if report.is_clean() {
-        out.push_str(&format!("\n{}\n", "no problems found".green()));
+        out.push_str(&format!("\n{}\n", role(Role::Good, "no problems found")));
         if projects == 0 {
             out.push_str("\nhint: `overdosecd add <path>` starts the index\n");
         }
@@ -872,53 +885,53 @@ pub fn format_doctor(
                 stale = true;
                 out.push_str(&format!(
                     "  - {} `{}` -> {} (directory no longer exists)\n",
-                    "stale:".red(),
+                    role(Role::Bad, "stale:"),
                     sanitize::text(name),
                     shorten_home(path, home)
                 ));
             }
             Issue::DuplicateName { name, count } => out.push_str(&format!(
                 "  - {} `{}` is used by {count} projects; queries for it are ambiguous (`overdosecd rename`)\n",
-                "duplicate name:".yellow(),
+                role(Role::Warn, "duplicate name:"),
                 sanitize::text(name)
             )),
             Issue::QuarantineFile(path) => out.push_str(&format!(
                 "  - {} {} (kept; review and delete manually)\n",
-                "quarantine:".dimmed(),
+                role(Role::Dim, "quarantine:"),
                 shorten_home(path, home)
             )),
             Issue::StrayFile(path) => out.push_str(&format!(
                 "  - {} {} (no projects.db beside it; delete it if no overdosecd is running)\n",
-                "stray:".red(),
+                role(Role::Bad, "stray:"),
                 shorten_home(path, home)
             )),
             Issue::LegacyJson { path } => out.push_str(&format!(
                 "  - {} {} was not migrated (the database already holds projects); `overdosecd migrate` reports why\n",
-                "legacy:".yellow(),
+                role(Role::Warn, "legacy:"),
                 shorten_home(path, home)
             )),
             Issue::DeprecatedStorageKey => out.push_str(&format!(
                 "  - {} the `[storage] backend` setting is ignored; SQLite is the only backend\n",
-                "config:".dimmed()
+                role(Role::Dim, "config:")
             )),
             Issue::IndexPermissions { path, mode } => out.push_str(&format!(
                 "  - {} {} is mode {mode:04o} (expected 0600)\n",
-                "permissions:".red(),
+                role(Role::Bad, "permissions:"),
                 shorten_home(path, home)
             )),
             Issue::CachePermissions { path, mode } => out.push_str(&format!(
                 "  - {} {} is mode {mode:04o} (expected 0600)\n",
-                "permissions:".red(),
+                role(Role::Bad, "permissions:"),
                 shorten_home(path, home)
             )),
             Issue::DataDirNotWritable(path) => out.push_str(&format!(
                 "  - {} data directory {} is not writable\n",
-                "permissions:".red(),
+                role(Role::Bad, "permissions:"),
                 shorten_home(path, home)
             )),
             Issue::DataDirPermissions { path, mode } => out.push_str(&format!(
                 "  - {} {} is mode {mode:04o} (expected 0700)\n",
-                "permissions:".red(),
+                role(Role::Bad, "permissions:"),
                 shorten_home(path, home)
             )),
             Issue::ControlInValue {
@@ -927,19 +940,19 @@ pub fn format_doctor(
                 value,
             } => out.push_str(&format!(
                 "  - {} project {} has unsafe characters in its {field} (rename or repath it): {}\n",
-                "unsafe:".red(),
+                role(Role::Bad, "unsafe:"),
                 sanitize::quoted(project),
                 sanitize::quoted(value)
             )),
             Issue::ConfigProblem { path, message } => out.push_str(&format!(
                 "  - {} {}: {}\n",
-                "config:".red(),
+                role(Role::Bad, "config:"),
                 shorten_home(path, home),
                 sanitize::text(message)
             )),
             Issue::SymlinkedFile(path) => out.push_str(&format!(
                 "  - {} {} is a symbolic link; overdosecd refuses it (move it aside and let overdosecd recreate it)\n",
-                "symlink:".red(),
+                role(Role::Bad, "symlink:"),
                 shorten_home(path, home)
             )),
         }
@@ -953,7 +966,11 @@ pub fn format_doctor(
         hints.push("`--refresh` updates stored git remotes".to_owned());
     }
     if !hints.is_empty() {
-        out.push_str(&format!("\n{} {}\n", "hint:".dimmed(), hints.join("; ")));
+        out.push_str(&format!(
+            "\n{} {}\n",
+            role(Role::Dim, "hint:"),
+            hints.join("; ")
+        ));
     }
 
     out
@@ -1021,6 +1038,37 @@ mod tests {
         let fish = init_script(Shell::Fish, HookSettings::default());
         assert!(fish.contains("function ocd"));
         assert!(fish.contains("add alias"));
+    }
+
+    #[test]
+    fn wrappers_survive_dash_queries_and_a_failing_hook() {
+        no_color();
+        for shell in [Shell::Bash, Shell::Zsh] {
+            let script = init_script(
+                shell,
+                HookSettings {
+                    record: true,
+                    ..HookSettings::default()
+                },
+            );
+            assert!(script.contains("goto --confident -- \"$@\""));
+            assert!(script.contains("ui --query=\"$*\""));
+            assert!(script.contains("goto -- \"$@\""));
+            assert!(script.contains("builtin cd \"$@\" || return"));
+            assert!(script.contains("command overdosecd hook\n  return 0"));
+        }
+
+        let fish = init_script(
+            Shell::Fish,
+            HookSettings {
+                record: true,
+                ..HookSettings::default()
+            },
+        );
+        assert!(fish.contains("goto --confident -- $argv"));
+        assert!(fish.contains("ui --query=\"$argv\""));
+        assert!(fish.contains("goto -- $argv"));
+        assert!(fish.contains("command overdosecd hook\n    return 0"));
     }
 
     #[test]

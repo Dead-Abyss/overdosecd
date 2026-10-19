@@ -6,6 +6,7 @@ use colored::Colorize;
 use crate::matcher::Match;
 use crate::output::shorten_home;
 use crate::sanitize;
+use crate::theme::{self, Role};
 
 /// Errors that reach the user, mapped to exit codes by [`Error::exit_code`].
 ///
@@ -207,8 +208,8 @@ impl fmt::Display for Candidates {
                 formatter,
                 "  - {} -> {} ({})",
                 sanitize::text(&candidate.name).bold(),
-                shorten_home(&candidate.path, home.as_deref()).dimmed(),
-                candidate.reason.label().dimmed()
+                theme::active().paint(Role::Dim, &shorten_home(&candidate.path, home.as_deref())),
+                theme::active().paint(Role::Dim, candidate.reason.label())
             )?;
         }
         Ok(())

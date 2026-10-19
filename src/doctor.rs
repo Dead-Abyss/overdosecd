@@ -114,6 +114,15 @@ pub fn inspect(data_dir: &Path, projects: &[Project]) -> Report {
         for note in &project.notes {
             report("note", note);
         }
+        // Profiles are written through the same guards, but a planted index
+        // can carry anything; `profile show` is a human-facing sink.
+        for (key, value) in &project.env {
+            report("env key", key);
+            report("env value", value);
+        }
+        if let Some(command) = &project.enter_cmd {
+            report("enter command", command);
+        }
         let path = project.path.to_string_lossy();
         report("path", &path);
         // Git metadata is read from a repository's own `.git` files, so it is

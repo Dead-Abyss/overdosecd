@@ -15,6 +15,7 @@ mod paths;
 mod project;
 mod sanitize;
 mod store;
+mod theme;
 mod time;
 mod ui;
 
@@ -28,7 +29,6 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use clap::Parser;
-use colored::Colorize;
 
 use crate::cli::{
     AddArgs, Cli, Command, DoctorArgs, ImportArgs, ListArgs, NoteCommand, ProfileCommand,
@@ -107,8 +107,30 @@ fn run(cli: Cli) -> Result<i32> {
     let configured = config
         .as_ref()
         .map_or(ColorMode::Auto, |config| config.general.color);
-    let color_mode = config::resolve_color(cli.color, config::env_color().as_deref(), configured)?;
+    let color_mode =
+        match config::resolve_color(cli.color, config::env_color().as_deref(), configured) {
+            Ok(mode) => mode,
+            // The shell-integration commands must survive a typo in the
+            // environment: completion, the `cd` hook, `init`, and `enter` cannot
+            // be allowed to fail that way. Strict commands still exit 3.
+            Err(_) if lenient => ColorMode::Auto,
+            Err(err) => return Err(err),
+        };
     config::apply_color(color_mode);
+
+    // The palette is a renderer setting like the color mode: installed once
+    // before any output. A config that did not parse keeps the defaults so
+    // `doctor` can still report the problem; the lenient commands fall back
+    // for the same reason as the color mode.
+    let theme = match &config {
+        Ok(config) => match theme::resolve(&config.theme, config::env_theme().as_deref()) {
+            Ok(theme) => theme,
+            Err(_) if lenient => theme::Theme::bleed(),
+            Err(err) => return Err(err),
+        },
+        Err(_) => theme::Theme::bleed(),
+    };
+    theme::install(theme);
 
     // `init` and the cd hook only need the hook switches, so they read the
     // config leniently like `doctor`: a broken file falls back to defaults
@@ -410,6 +432,22 @@ fn cmd_goto(
     debug: bool,
 ) -> Result<()> {
     let projects = store.load_lean()?;
+
+    // `name:branch` targets a worktree of the matched project. It is a
+    // separate, exact lookup: the colon form never reaches the matcher, so
+    // scores, signals, and tie-breaks stay bit-identical.
+    if let Some((repo, branch)) = query.rsplit_once(':') {
+        let (repo, branch) = (repo.trim(), branch.trim());
+        if !repo.is_empty()
+            && !branch.is_empty()
+            && let Ok(found) = resolve(&projects, repo, matching, debug)
+            && (!confident || found.all_confident())
+            && let Some(path) = worktree_for(&projects[found.index].path, branch)
+        {
+            return print_path(&path);
+        }
+    }
+
     let found = resolve(&projects, query, matching, debug)?;
     if confident && !found.all_confident() {
         // The caller decides what to do; `ocd` opens the picker prefilled.
@@ -428,14 +466,8 @@ fn cmd_goto(
 
     // The jump itself must never fail because of bookkeeping: print the path
     // first, then record usage and degrade lock or save failures to a warning.
-    // The printed line is captured by `cd "$(overdosecd goto …)"`, so a path a
-    // terminal would mangle is refused rather than escaped: an escaped path
-    // would be a wrong path.
-    if sanitize::contains_dangerous(&found.path.to_string_lossy()) {
-        return Err(Error::UnsafePath(sanitize::path(&found.path)));
-    }
     let id = projects[found.index].id.clone();
-    output::print_line(&found.path.display().to_string())?;
+    print_path(&found.path)?;
 
     if !no_track {
         let now = Utc::now();
@@ -445,6 +477,34 @@ fn cmd_goto(
     }
 
     Ok(())
+}
+
+/// The path of the project's checkout or sibling worktree on `branch`, read
+/// live: the current checkout first, then the registered siblings.
+fn worktree_for(project: &Path, branch: &str) -> Option<PathBuf> {
+    let git_dir = git::git_dir(project)?;
+    if matches!(
+        git::current_branch_in(&git_dir),
+        Some(git::Branch::Named(name)) if name == branch
+    ) {
+        return Some(project.to_path_buf());
+    }
+    git::worktrees_in(&git_dir)
+        .into_iter()
+        .find(
+            |worktree| matches!(&worktree.branch, Some(git::Branch::Named(name)) if name == branch),
+        )
+        .map(|worktree| worktree.path)
+}
+
+/// Prints a jump target. The line is captured by `cd "$(overdosecd goto …)"`,
+/// so a path a terminal would mangle is refused rather than escaped: an
+/// escaped path would be a wrong path.
+fn print_path(path: &Path) -> Result<()> {
+    if sanitize::contains_dangerous(&path.to_string_lossy()) {
+        return Err(Error::UnsafePath(sanitize::path(path)));
+    }
+    output::print_line(&path.display().to_string())
 }
 
 fn cmd_info(store: &SqliteStore, query: &str, matching: &MatcherConfig, debug: bool) -> Result<()> {
@@ -493,13 +553,13 @@ fn cmd_info(store: &SqliteStore, query: &str, matching: &MatcherConfig, debug: b
     rows.push((
         "pinned:",
         if project.pinned {
-            "yes".yellow().to_string()
+            theme::active().paint(theme::Role::Warn, "yes")
         } else {
             "no".to_owned()
         },
     ));
     if let Some(git_dir) = git::git_dir(&project.path) {
-        rows.push(("git:", "yes".green().to_string()));
+        rows.push(("git:", theme::active().paint(theme::Role::Good, "yes")));
         let branch = git::current_branch_in(&git_dir)
             .map(git::Branch::label)
             .unwrap_or_else(|| dash.clone());
@@ -508,6 +568,20 @@ fn cmd_info(store: &SqliteStore, query: &str, matching: &MatcherConfig, debug: b
             .map(|remote| format!("{} {}", remote.name, remote.url))
             .unwrap_or_else(|| dash.clone());
         rows.push(("remote:", sanitize::text(&remote)));
+        for (index, worktree) in git::worktrees_in(&git_dir).iter().enumerate() {
+            let branch = worktree
+                .branch
+                .clone()
+                .map_or_else(|| dash.clone(), git::Branch::label);
+            rows.push((
+                if index == 0 { "worktrees:" } else { "" },
+                format!(
+                    "{} ({})",
+                    sanitize::path(&worktree.path),
+                    sanitize::text(&branch)
+                ),
+            ));
+        }
     } else {
         rows.push(("git:", "no".to_owned()));
     }
@@ -770,7 +844,11 @@ fn cmd_profile(
             }
             let mut out = String::new();
             for (key, value) in &found.env {
-                out.push_str(&format!("env {key}={}\n", sanitize::text(value)));
+                out.push_str(&format!(
+                    "env {}={}\n",
+                    sanitize::text(key),
+                    sanitize::text(value)
+                ));
             }
             if let Some(cmd) = &found.enter_cmd {
                 out.push_str(&format!("run {}\n", sanitize::text(cmd)));

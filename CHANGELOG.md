@@ -4,6 +4,43 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-19
+
+A palette of its own, and worktrees by name.
+
+### Features
+
+- Themes: `[theme]` selects a bundled palette and can override any role inline
+  (`accent`, `dim`, `good`, `bad`, `warn`, `info`, `border`, `text`) with a
+  named ANSI color, `color0`–`color255`, or `#rrggbb`. `bleed` — blackrose's
+  rose / bone / ash look — is the default; `base` restores the 0.3.0 colors.
+  `OVERDOSECD_THEME=base|bleed` picks a palette for one command. Values are
+  parsed into typed colors at config load and rendered by overdosecd, so a
+  theme can only change a foreground color; `never` and `NO_COLOR` still turn
+  all color off.
+- Worktrees: sibling checkouts are read live from `.git/worktrees/`, `info`
+  lists them after the remote, and `ocd <project>:<branch>` jumps straight to
+  the checkout on that branch. The colon form is resolved before matching
+  (current checkout first, then siblings), so ordinary ranking is untouched;
+  a worktree jump prints its path without recording a usage row.
+
+### Changed
+
+- The default look is now `bleed`: rose accents and borders, bone picker text,
+  ash secondary text, ember warnings, leaf success. Existing output keeps its
+  shape; `[theme] name = "base"` reproduces 0.3.0 exactly, except that CLI
+  secondary text is now the dim palette color (bright black in `base`) instead
+  of the faint attribute.
+- `init` only emits the profile step when its switch was on at generation
+  time, as before; re-run the `init` line after changing it.
+
+### Internals
+
+- New `src/theme.rs` owns color parsing and the role map; CLI renderers and
+  the picker's `Palette` both draw through it instead of hardcoded
+  `colored`/ratatui colors.
+- `git.rs` gained the limited `worktrees_in` reader.
+
 ## [0.3.0] - 2026-10-12
 
 One storage format, notes to remember projects by, and explicit entry hooks.

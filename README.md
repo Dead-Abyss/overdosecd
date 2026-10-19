@@ -70,7 +70,7 @@ overdosecd completions fish > ~/.config/fish/completions/overdosecd.fish
 | `alias add\|remove <query> <alias>` | add or remove another name to match |
 | `tag add\|remove <query> <tag>` | add or remove a tag |
 | `note add\|list\|remove <query> <text>\|<n>` | one-line notes shown by `info` and the picker's details |
-| `profile env add\|remove <query> KEY=VALUE\|KEY`, `profile run set\|clear <query> [CMD]`, `profile show <query>` | the entry profile applied on a wrapper jump (see [Notes and profiles](#notes-and-profiles)) |
+| `profile env add\|remove <query> KEY=VALUE\|KEY`, `profile run set <query> <CMD>` / `profile run clear <query>`, `profile show <query>` | the entry profile applied on a wrapper jump (see [Notes and profiles](#notes-and-profiles)) |
 | `scan <roots>…` / `scan --home [--refresh] [--dry-run] [--max-depth N]` | preview directories with the discovery walk, writing nothing to the index |
 | `import zoxide\|autojump\|zsh-z [--dry-run] [--min-score N] [--limit N]` | bring another jumper's history over |
 | `ui [--query TEXT] [--no-track]` | the interactive picker (see below); `ocd` and `ocd --ui` run this |
@@ -199,6 +199,11 @@ hook = false            # install a cd wrapper that records jumps into indexed p
 hint = false            # ...and one-line hints to `ocd add` directories you visit often
 hooks = false           # apply entry profiles on wrapper jumps (see Notes and profiles)
 
+[theme]
+name = "bleed"          # bleed (rose/bone/ash) or base (the 0.3.0 colors)
+# accent = "#e0455e"    # override any role inline: accent, dim, good, bad, warn,
+# border = "#e0455e"    #   info, border, text — a name, color0..color255, or #rrggbb
+
 [matching]
 fuzzy = true            # subsequence matching on names, aliases, paths, remotes
 recency_max = 800       # maximum bonus for a just-used project
@@ -229,6 +234,8 @@ Every key is optional and the defaults above are the built-in behavior. Unknown 
 
 The color mode resolves in this order: `--color WHEN`, then `OVERDOSECD_COLOR`, then `color` in the file, then `auto` (colorize on a terminal, honoring `NO_COLOR`). Point overdosecd at a different config file with `OVERDOSECD_CONFIG=/path/to/config.toml`; that file must exist, and `doctor` reports an unreadable one as an issue.
 
+The palette is `bleed` by default — blackrose's rose / bone / ash look: rose `#e0455e` accents and borders, bone `#f5e9e2` picker text, ash `#6b5a5f` secondary text, ember `#ff8a5c` warnings, leaf `#7ee787` success. `name = "base"` restores the 0.3.0 colors, and any role can be overridden inline. `OVERDOSECD_THEME=base` picks a palette for one command. Theme values are typed colors, rendered by overdosecd itself; `never` and `NO_COLOR` turn them off with everything else. Hex colors need truecolor (`COLORTERM=truecolor`; tmux passes it through with `set -as terminal-overrides ",*:Tc"`) — otherwise the nearest terminal color is used.
+
 ## Notes and profiles
 
 `ocd note add <project> "<text>"` attaches a one-line memory to a project ("the branch with the old API"); `ocd note list` numbers them and `ocd note remove <project> <n>` drops one. They show up in `info` and in the picker's detail pane, and they never affect matching.
@@ -257,9 +264,18 @@ type:      rust
 git:       yes
 branch:    main
 remote:    origin git@github.com:Dead-Abyss/overdosecd.git
+worktrees: ~/code/overdosecd-fix (fix-login)
 ```
 
 The remote is a snapshot taken at `add`; refresh it with `overdosecd doctor --refresh` (or `overdosecd add --force <path>`) after changing it. Worktrees are understood (branch from the worktree, config from the main repository), `include.path`/`includeIf "gitdir:…"` config includes and `url.<base>.insteadOf` rewrites are honored, and bare repositories are detected. The org/owner alone is not searchable. Projects also remember their kind — `rust`, `node`, `python`, `go`, or `unknown`, from marker files at `add` — shown as `type:` and filterable with `list --type`.
+
+Sibling worktrees are read live from `.git/worktrees/` and listed by `info`; `ocd <project>:<branch>` jumps straight to the checkout on that branch:
+
+```sh
+ocd widgets:fix-login
+```
+
+The colon form resolves the project first, then matches the branch exactly — it never reaches the ranker, so ordinary queries keep their ordering. Worktrees are not indexed entries: the jump prints the path without recording a usage row, and a worktree that is not registered (or is detached) is not addressable this way.
 
 ## Health check
 

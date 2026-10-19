@@ -18,6 +18,16 @@ const MAX_CONFIG_TOTAL: u64 = 16 * 1024 * 1024;
 /// A ridiculous `gitdir:` pattern is not worth matching.
 const MAX_PATTERN_CHARS: usize = 1024;
 
+/// The total wildmatch work one config read may spend. A config may legally
+/// carry thousands of `includeIf` lines with long `**` patterns inside the
+/// 16 MiB cap; without a shared budget that is unbounded CPU even though the
+/// bytes are bounded.
+const MAX_WILDMATCH_STEPS: usize = 2_000_000;
+
+/// The most sibling worktrees one read reports; a planted `worktrees/` tree
+/// cannot grow `info` without bound.
+const MAX_WORKTREES: usize = 64;
+
 /// Reads a small text file, refusing anything that is not a regular file or
 /// that exceeds `cap`. `None` means "treat as absent", which is how every
 /// caller already handles a missing or unreadable `.git` file.
@@ -61,6 +71,82 @@ impl Branch {
             Branch::Detached(sha) => format!("detached ({sha})"),
         }
     }
+}
+
+/// A sibling worktree: the checkout path and the branch its own `HEAD` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: Option<Branch>,
+}
+
+/// The sibling worktrees registered under a repository's common directory,
+/// read from `.git/worktrees/*/gitdir` (still no subprocess and no `git2`).
+///
+/// Missing, unreadable, or malformed entries are skipped: a worktree that no
+/// longer exists is not an entry, and a hostile admin directory cannot make
+/// this read unbounded. The main checkout and the calling worktree are not
+/// listed; `info` already shows the one being inspected.
+pub fn worktrees_in(admin: &Path) -> Vec<Worktree> {
+    let common = common_dir(admin);
+    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else {
+        return Vec::new();
+    };
+    let own = admin.canonicalize().unwrap_or_else(|_| admin.to_path_buf());
+
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .take(MAX_WORKTREES)
+        .collect();
+    dirs.sort();
+
+    let mut worktrees = Vec::new();
+    for dir in dirs {
+        if dir.canonicalize().unwrap_or_else(|_| dir.clone()) == own {
+            continue;
+        }
+        let Some(gitdir) = read_small(&dir.join("gitdir"), MAX_INDIRECTION_BYTES) else {
+            continue;
+        };
+        // Only the first line is the path, exactly as `worktrees/<id>/gitdir`
+        // stores it.
+        let target = gitdir.lines().next().unwrap_or("").trim();
+        if target.is_empty() {
+            continue;
+        }
+        let target = Path::new(target);
+        let target = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            dir.join(target)
+        };
+        // The file points at `<checkout>/.git`; anything else is not a
+        // checkout this parser understands.
+        if target.file_name() != Some(std::ffi::OsStr::new(".git")) {
+            continue;
+        }
+        let Some(path) = target.parent() else {
+            continue;
+        };
+        if !path.is_dir() {
+            continue;
+        }
+        // The admin `gitdir` only *claims* where the checkout is. Require the
+        // checkout's own `.git` to point back at this admin directory, or a
+        // planted file could turn any existing directory into a jump target.
+        let recorded = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        let back_link = git_dir(path).map(|back| back.canonicalize().unwrap_or(back));
+        if back_link.as_deref() != Some(recorded.as_path()) {
+            continue;
+        }
+        worktrees.push(Worktree {
+            path: path.to_path_buf(),
+            branch: current_branch_in(&dir),
+        });
+    }
+    worktrees
 }
 
 /// Resolves the directory holding `HEAD` and friends, or `None` when `path`
@@ -166,6 +252,7 @@ fn read_remote_dir_with(git_dir: &Path, home: Option<&Path>) -> Option<Remote> {
         home,
         files_left: MAX_INCLUDE_FILES,
         bytes_left: MAX_CONFIG_TOTAL,
+        steps_left: MAX_WILDMATCH_STEPS,
         seen: Vec::new(),
     };
     let contents = read_config(&config_path, git_dir, &mut includes)?;
@@ -185,6 +272,7 @@ struct Includes<'a> {
     home: Option<&'a Path>,
     files_left: usize,
     bytes_left: u64,
+    steps_left: usize,
     seen: Vec<PathBuf>,
 }
 
@@ -266,7 +354,13 @@ fn include_target(
         return None;
     }
     if let IncludeSection::Conditional(condition) = section
-        && !condition_matches(condition, git_dir, base, includes.home)
+        && !condition_matches(
+            condition,
+            git_dir,
+            base,
+            includes.home,
+            &mut includes.steps_left,
+        )
     {
         return None;
     }
@@ -296,12 +390,18 @@ fn include_path(value: &str, base: &Path, home: Option<&Path>) -> Option<PathBuf
 
 /// git's include conditions, within this build's subset: `gitdir:` and
 /// `gitdir/i:`; anything else (`onbranch:`) never matches.
-fn condition_matches(condition: &str, git_dir: &Path, base: &Path, home: Option<&Path>) -> bool {
+fn condition_matches(
+    condition: &str,
+    git_dir: &Path,
+    base: &Path,
+    home: Option<&Path>,
+    steps: &mut usize,
+) -> bool {
     if let Some(pattern) = strip_prefix_ci(condition, "gitdir/i:") {
-        return gitdir_matches(pattern, git_dir, base, home, true);
+        return gitdir_matches(pattern, git_dir, base, home, true, steps);
     }
     if let Some(pattern) = strip_prefix_ci(condition, "gitdir:") {
-        return gitdir_matches(pattern, git_dir, base, home, false);
+        return gitdir_matches(pattern, git_dir, base, home, false, steps);
     }
     false
 }
@@ -324,6 +424,7 @@ fn gitdir_matches(
     base: &Path,
     home: Option<&Path>,
     icase: bool,
+    steps: &mut usize,
 ) -> bool {
     let Some(pattern) = prepare_pattern(pattern, base, home) else {
         return false;
@@ -331,8 +432,8 @@ fn gitdir_matches(
     let resolved = git_dir
         .canonicalize()
         .unwrap_or_else(|_| git_dir.to_path_buf());
-    wildmatch(&pattern, &resolved.to_string_lossy(), icase)
-        || wildmatch(&pattern, &git_dir.to_string_lossy(), icase)
+    wildmatch(&pattern, &resolved.to_string_lossy(), icase, steps)
+        || wildmatch(&pattern, &git_dir.to_string_lossy(), icase, steps)
 }
 
 fn prepare_pattern(pattern: &str, base: &Path, home: Option<&Path>) -> Option<String> {
@@ -356,7 +457,7 @@ fn prepare_pattern(pattern: &str, base: &Path, home: Option<&Path>) -> Option<St
 /// matches `foo`, `foo/**` matches `foo`). Character classes (`[a-z]`) are
 /// not supported. Failed states are memoized, so a hostile pattern cannot
 /// cause exponential backtracking.
-fn wildmatch(pattern: &str, text: &str, icase: bool) -> bool {
+fn wildmatch(pattern: &str, text: &str, icase: bool, steps: &mut usize) -> bool {
     fn inner(
         pat: &[char],
         text: &[char],
@@ -364,7 +465,12 @@ fn wildmatch(pattern: &str, text: &str, icase: bool) -> bool {
         ti: usize,
         icase: bool,
         failed: &mut HashSet<(usize, usize)>,
+        steps: &mut usize,
     ) -> bool {
+        if *steps == 0 {
+            return false;
+        }
+        *steps -= 1;
         if failed.contains(&(pi, ti)) {
             return false;
         }
@@ -374,7 +480,7 @@ fn wildmatch(pattern: &str, text: &str, icase: bool) -> bool {
             }
             // `**/` may match no components at all.
             if pat[pi..].starts_with(&['*', '*', '/'])
-                && inner(pat, text, pi + 3, ti, icase, failed)
+                && inner(pat, text, pi + 3, ti, icase, failed, steps)
             {
                 return true;
             }
@@ -386,15 +492,14 @@ fn wildmatch(pattern: &str, text: &str, icase: bool) -> bool {
                 '?' => {
                     ti < text.len()
                         && text[ti] != '/'
-                        && inner(pat, text, pi + 1, ti + 1, icase, failed)
+                        && inner(pat, text, pi + 1, ti + 1, icase, failed, steps)
                 }
-                '*' if pat.get(pi + 1) == Some(&'*') => {
-                    (ti..=text.len()).any(|split| inner(pat, text, pi + 2, split, icase, failed))
-                }
+                '*' if pat.get(pi + 1) == Some(&'*') => (ti..=text.len())
+                    .any(|split| inner(pat, text, pi + 2, split, icase, failed, steps)),
                 '*' => {
                     let mut split = ti;
                     loop {
-                        if inner(pat, text, pi + 1, split, icase, failed) {
+                        if inner(pat, text, pi + 1, split, icase, failed, steps) {
                             return true;
                         }
                         if split == text.len() || text[split] == '/' {
@@ -412,7 +517,7 @@ fn wildmatch(pattern: &str, text: &str, icase: bool) -> bool {
                     } else {
                         text[ti] == literal
                     };
-                    hit && inner(pat, text, pi + 1, ti + 1, icase, failed)
+                    hit && inner(pat, text, pi + 1, ti + 1, icase, failed, steps)
                 }
             }
         })();
@@ -427,7 +532,7 @@ fn wildmatch(pattern: &str, text: &str, icase: bool) -> bool {
     }
     let pat: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
-    inner(&pat, &text, 0, 0, icase, &mut HashSet::new())
+    inner(&pat, &text, 0, 0, icase, &mut HashSet::new(), steps)
 }
 
 /// The current branch, or a short hash when detached.
@@ -652,6 +757,117 @@ mod tests {
 
         std::fs::create_dir(dir.path().join(".git")).expect("create .git");
         assert!(git_dir(dir.path()).is_some());
+    }
+
+    #[test]
+    fn reads_sibling_worktrees_and_skips_vanished_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = checkout(dir.path(), "ref: refs/heads/main\n", "");
+        let admin = main.join(".git/worktrees/wt-a");
+        let sibling = dir.path().join("sibling");
+        write(
+            &admin.join("gitdir"),
+            &format!("{}\n", sibling.join(".git").display()),
+        );
+        write(&admin.join("HEAD"), "ref: refs/heads/feat\n");
+        write(
+            &sibling.join(".git"),
+            &format!("gitdir: {}\n", admin.display()),
+        );
+
+        // A registration whose checkout no longer exists is not an entry.
+        let gone = main.join(".git/worktrees/gone");
+        write(
+            &gone.join("gitdir"),
+            &format!("{}\n", dir.path().join("gone/.git").display()),
+        );
+        write(&gone.join("HEAD"), "ref: refs/heads/gone\n");
+
+        assert_eq!(
+            worktrees_in(&main.join(".git")),
+            vec![Worktree {
+                path: sibling,
+                branch: Some(Branch::Named("feat".to_owned())),
+            }]
+        );
+    }
+
+    #[test]
+    fn worktrees_are_read_from_a_linked_checkouts_admin_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = checkout(dir.path(), "ref: refs/heads/main\n", "");
+        let admin = main.join(".git/worktrees/wt-a");
+        let sibling_a = dir.path().join("sibling-a");
+        let sibling_b = dir.path().join("sibling-b");
+        write(&admin.join("commondir"), "../..\n");
+        write(
+            &admin.join("gitdir"),
+            &format!("{}\n", sibling_a.join(".git").display()),
+        );
+        write(&admin.join("HEAD"), "ref: refs/heads/feat-a\n");
+        write(
+            &sibling_a.join(".git"),
+            &format!("gitdir: {}\n", admin.display()),
+        );
+        let admin_b = main.join(".git/worktrees/wt-b");
+        write(
+            &admin_b.join("gitdir"),
+            &format!("{}\n", sibling_b.join(".git").display()),
+        );
+        write(&admin_b.join("HEAD"), "ref: refs/heads/feat-b\n");
+        write(
+            &sibling_b.join(".git"),
+            &format!("gitdir: {}\n", admin_b.display()),
+        );
+
+        // Reading through a linked checkout's own admin dir finds its
+        // siblings via `commondir`, and does not list itself.
+        assert_eq!(
+            worktrees_in(&admin),
+            vec![Worktree {
+                path: sibling_b,
+                branch: Some(Branch::Named("feat-b".to_owned())),
+            }]
+        );
+    }
+
+    #[test]
+    fn worktrees_must_point_back_at_their_admin_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = checkout(dir.path(), "ref: refs/heads/main\n", "");
+        let admin = main.join(".git/worktrees/wt-a");
+        let planted = dir.path().join("planted");
+        std::fs::create_dir_all(&planted).expect("create planted dir");
+        write(
+            &admin.join("gitdir"),
+            &format!("{}\n", planted.join(".git").display()),
+        );
+        write(&admin.join("HEAD"), "ref: refs/heads/evil\n");
+
+        // The directory exists and was named by the admin file, but it is not
+        // a checkout of this repository.
+        assert!(worktrees_in(&main.join(".git")).is_empty());
+    }
+
+    #[test]
+    fn wildmatch_spends_a_bounded_budget() {
+        let mut steps = 100;
+        let pattern = format!("/**{}x", "/**".repeat(300));
+        assert!(!wildmatch(
+            &pattern,
+            "/tmp/a/b/c/d/e/f/g",
+            false,
+            &mut steps
+        ));
+        assert!(steps < 100, "the budget must be spent, not bypassed");
+
+        let mut steps = MAX_WILDMATCH_STEPS;
+        assert!(wildmatch(
+            "**/Trash",
+            "/home/x/.local/share/Trash",
+            false,
+            &mut steps
+        ));
     }
 
     #[test]
@@ -1121,12 +1337,18 @@ mod tests {
             ("/a/**/b", "/a/x/y/b", true),
         ] {
             assert_eq!(
-                wildmatch(pattern, text, false),
+                matches(pattern, text, false),
                 expected,
                 "{pattern} vs {text}"
             );
         }
-        assert!(wildmatch("/A/B", "/a/b", true), "gitdir/i folds case");
-        assert!(!wildmatch("/A/B", "/a/b", false));
+        assert!(matches("/A/B", "/a/b", true), "gitdir/i folds case");
+        assert!(!matches("/A/B", "/a/b", false));
+    }
+
+    /// [`wildmatch`] with the production budget, for pattern tests.
+    fn matches(pattern: &str, text: &str, icase: bool) -> bool {
+        let mut steps = MAX_WILDMATCH_STEPS;
+        wildmatch(pattern, text, icase, &mut steps)
     }
 }

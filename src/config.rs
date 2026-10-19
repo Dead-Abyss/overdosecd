@@ -13,6 +13,9 @@ const ENV_CONFIG: &str = "OVERDOSECD_CONFIG";
 /// Environment variable overriding the color mode.
 const ENV_COLOR: &str = "OVERDOSECD_COLOR";
 
+/// Environment variable overriding the theme name.
+const ENV_THEME: &str = "OVERDOSECD_THEME";
+
 /// When to colorize output.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -35,6 +38,7 @@ pub struct Config {
     pub storage: Storage,
     pub ui: Ui,
     pub discovery: Discovery,
+    pub theme: crate::theme::ThemeConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -227,6 +231,11 @@ pub fn env_color() -> Option<String> {
     crate::dirs::os_env(ENV_COLOR).map(|value| value.to_string_lossy().into_owned())
 }
 
+/// The `$OVERDOSECD_THEME` value, if it is set and non-empty.
+pub fn env_theme() -> Option<String> {
+    crate::dirs::os_env(ENV_THEME).map(|value| value.to_string_lossy().into_owned())
+}
+
 /// The platform config path (`~/.config/overdosecd/config.toml` on Linux).
 pub fn platform_path() -> Option<PathBuf> {
     crate::dirs::config_dir().map(|dir| dir.join("config.toml"))
@@ -410,6 +419,24 @@ mod tests {
         assert_eq!(config.ui.height, 10);
         assert!(!config.ui.border);
         assert_eq!(config.ui.mouse, MouseMode::Auto);
+        assert_eq!(config.theme.name, crate::theme::ThemeName::Bleed);
+        assert_eq!(config.theme.accent, None);
+    }
+
+    #[test]
+    fn theme_settings_parse() {
+        let config =
+            parse("[theme]\nname = \"base\"\naccent = \"#010203\"\n").expect("theme config parses");
+        assert_eq!(config.theme.name, crate::theme::ThemeName::Base);
+        assert_eq!(
+            config.theme.accent,
+            Some(crate::theme::ColorSpec::Rgb(1, 2, 3))
+        );
+
+        let err = parse("[theme]\naccent = \"neon\"\n").expect_err("bad color");
+        assert!(err.contains("neon"), "error was: {err}");
+        let err = parse("[theme]\nname = \"goth\"\n").expect_err("bad name");
+        assert!(err.contains("goth"), "error was: {err}");
     }
 
     #[test]

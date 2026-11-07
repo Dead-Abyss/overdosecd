@@ -507,9 +507,10 @@ finds issues; `doctor --refresh` rewrites stored git metadata under the lock.
   counted into exactly one bucket, and the bincode parser either rejects the
   frame or stays inside the buffer. Keep the properties cheap; they run on
   every `cargo test`.
-- Fish is not installed on this machine; the fish wrapper and its completion
-  are smoke-tested by the `fish` CI job and cannot be verified manually. Bash
-  and zsh are available for manual shell tests.
+- Fish 4.9.3 is installed on this machine (`blackrose`'s login shell since
+  2026-11-07), so the fish wrapper and completion can be verified manually as
+  well as by the `fish` CI job. Bash and zsh are still available for manual
+  shell tests.
 - Completion smoke tests without a pty: for bash, call `_ocd` directly with
   `COMP_WORDS`/`COMP_CWORD` set and inspect `COMPREPLY`; for zsh, source the init
   script after `compinit -u` and assert `${_comps[ocd]}` is `_ocd`. Registering

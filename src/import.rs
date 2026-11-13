@@ -44,6 +44,9 @@ pub(crate) struct NewProject {
     pub path: PathBuf,
     pub use_count: u64,
     pub last_used_at: Option<DateTime<Utc>>,
+    /// Detected while planning, outside the store lock.
+    pub git: Option<project::GitInfo>,
+    pub kind: project::Kind,
 }
 
 /// What an import (dry-run or real) does, by category.
@@ -336,10 +339,15 @@ pub fn plan(
             plan.excluded += 1;
             continue;
         }
+        // Detected here, before the store lock is taken.
+        let git = project::GitInfo::detect(&canonical);
+        let kind = project::kind_of(&canonical);
         candidates.push(NewProject {
             path: canonical,
             use_count,
             last_used_at: record.visited,
+            git,
+            kind,
         });
     }
 
@@ -437,6 +445,7 @@ pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usiz
             Vec::new(),
             Vec::new(),
             false,
+            (entry.git.clone(), entry.kind),
         )
         .is_err()
         {
@@ -688,6 +697,8 @@ mod tests {
             path: canonical.clone(),
             use_count: 7,
             last_used_at: None,
+            git: None,
+            kind: project::Kind::Unknown,
         };
 
         let mut projects = Vec::new();
@@ -710,6 +721,8 @@ mod tests {
                 path: PathBuf::from("/tmp/one"),
                 use_count: 1,
                 last_used_at: None,
+                git: None,
+                kind: project::Kind::Unknown,
             }],
             existing: 2,
             missing: 1,
@@ -738,6 +751,8 @@ mod tests {
                 path: PathBuf::from("/tmp/notes"),
                 use_count: 4,
                 last_used_at: None,
+                git: None,
+                kind: project::Kind::Unknown,
             }],
             ..Plan::default()
         };

@@ -28,6 +28,11 @@ const MAX_WILDMATCH_STEPS: usize = 2_000_000;
 /// cannot grow `info` without bound.
 const MAX_WORKTREES: usize = 64;
 
+/// Bounds on what a hostile `.git/config` can put into the index: every
+/// `list`/`goto` re-reads the stored remote, so it must not be megabytes.
+const MAX_REMOTE_NAME: usize = 4 * 1024;
+const MAX_REMOTE_URL: usize = 8 * 1024;
+
 /// Reads a small text file, refusing anything that is not a regular file or
 /// that exceeds `cap`. `None` means "treat as absent", which is how every
 /// caller already handles a missing or unreadable `.git` file.
@@ -98,8 +103,9 @@ pub fn worktrees_in(admin: &Path) -> Vec<Worktree> {
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
-        .take(MAX_WORKTREES)
         .collect();
+    // Sort before capping: `read_dir` order is filesystem-dependent, and the
+    // self entry or a broken registration must not take a valid one's slot.
     dirs.sort();
 
     let mut worktrees = Vec::new();
@@ -145,6 +151,9 @@ pub fn worktrees_in(admin: &Path) -> Vec<Worktree> {
             path: path.to_path_buf(),
             branch: current_branch_in(&dir),
         });
+        if worktrees.len() == MAX_WORKTREES {
+            break;
+        }
     }
     worktrees
 }
@@ -647,9 +656,11 @@ fn parse_config(config: &str) -> ParsedConfig {
                 url: value.to_owned(),
             };
             // `.git/config` comes with the repository and is attacker-controlled:
-            // a remote whose name or URL carries terminal escapes or bidi
-            // controls is treated as no remote at all.
-            if crate::sanitize::contains_dangerous(&remote.name)
+            // a remote whose name or URL is huge or carries terminal escapes or
+            // bidi controls is treated as no remote at all.
+            if remote.name.len() > MAX_REMOTE_NAME
+                || remote.url.len() > MAX_REMOTE_URL
+                || crate::sanitize::contains_dangerous(&remote.name)
                 || crate::sanitize::contains_dangerous(&remote.url)
             {
                 continue;
@@ -713,13 +724,35 @@ fn parse_section_header(line: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     let subsection = match rest {
-        Some(rest) => Some(rest.strip_prefix('"')?.strip_suffix('"')?.to_owned()),
+        Some(rest) => Some(unescape_quoted(rest.strip_prefix('"')?.strip_suffix('"')?)?),
         None => None,
     };
     if subsection.as_deref() == Some("") {
         return None;
     }
     Some((name.to_owned(), subsection))
+}
+
+/// Unescapes git's double-quoted form: `\\`, `\"`, `\t`, `\n`. Any other
+/// escape, or a dangling backslash, is malformed — the same "absent" policy
+/// every other config failure follows.
+fn unescape_quoted(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        out.push(match chars.next()? {
+            '\\' => '\\',
+            '"' => '"',
+            't' => '\t',
+            'n' => '\n',
+            _ => return None,
+        });
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1350,5 +1383,39 @@ mod tests {
     fn matches(pattern: &str, text: &str, icase: bool) -> bool {
         let mut steps = MAX_WILDMATCH_STEPS;
         wildmatch(pattern, text, icase, &mut steps)
+    }
+
+    #[test]
+    fn quoted_section_names_are_unescaped() {
+        assert_eq!(
+            parse_section_header(r#"[includeIf "gitdir:/home/me/my\\repo/"]"#),
+            Some((
+                "includeIf".to_owned(),
+                Some(r"gitdir:/home/me/my\repo/".to_owned())
+            ))
+        );
+        assert_eq!(
+            parse_section_header(r#"[remote "a\"b"]"#),
+            Some(("remote".to_owned(), Some("a\"b".to_owned())))
+        );
+        assert_eq!(
+            parse_section_header(r#"[remote "dangling\"]"#),
+            None,
+            "a dangling escape is malformed"
+        );
+    }
+
+    #[test]
+    fn oversized_remotes_are_absent() {
+        let url = format!(
+            "[remote \"origin\"]\n\turl = {}\n",
+            "A".repeat(MAX_REMOTE_URL + 1)
+        );
+        assert_eq!(parse_remote(&url), None);
+        let name = format!(
+            "[remote \"{}\"]\n\turl = /x\n",
+            "n".repeat(MAX_REMOTE_NAME + 1)
+        );
+        assert_eq!(parse_remote(&name), None);
     }
 }

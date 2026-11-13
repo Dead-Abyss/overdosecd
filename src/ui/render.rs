@@ -43,11 +43,13 @@ pub fn draw(
     if color && let Some(text) = palette.theme.tui(Role::Text) {
         frame.render_widget(Block::default().style(Style::new().fg(text)), area);
     }
-    let inner = if border {
+    let inner = if border && area.height >= 5 {
         let block = Block::bordered().border_style(palette.border());
         frame.render_widget(block.clone(), area);
         block.inner(area)
     } else {
+        // A bordered box under five rows cannot fit the list, the input and
+        // the status line; an invisible y/N confirmation must never be armed.
         area
     };
 

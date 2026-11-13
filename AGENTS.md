@@ -379,17 +379,19 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   whole-snapshot path the migration and tests use) is a separate inherent
   method so an ordinary caller cannot bypass the diff-and-lock path. Readers
   do not lock.
-- Matcher fuzzy signals are hard-capped (name ≤ 400, alias ≤ 400, path ≤ 200,
-  repo ≤ 300) and `signal_score()` skips one once the running best exceeds its
-  cap: `improve` only replaces on a strict win and the signal order is
-  unchanged, so scores and tie-break reasons stay identical (Phase 10e,
+- Matcher fuzzy signals are hard-capped (base + clamp: name ≤ 700, alias ≤ 400,
+  path ≤ 200, repo ≤ 300) and `signal_score()` skips one once the running best
+  exceeds its total cap: `improve` only replaces on a strict win and the signal
+  order is unchanged, so scores and tie-break reasons stay identical (Phase 10e,
   output-identical optimization). Do not reorder the signals — `--debug`
   output and tie-breaks depend on the order.
 - `matcher::rank` splits the query on whitespace. One term takes the original
   path exactly; several terms require every term to match (AND), sum the
   per-term signals, and apply the bonuses once — and the *whole* query still
   scores as one term, so names containing spaces match exactly (a tie goes to
-  the whole query). `Match.terms` carries the per-term hits, `all_confident()`
+  the whole query). The fuzzy path signal scores only `Component::Normal`
+  names, so the root `/` cannot make a query match every absolute path.
+  `Match.terms` carries the per-term hits, `all_confident()`
   is the rule behind `goto --confident`/`ocd`, and `--debug` prints per-term
   lines only when more than one term contributed. Single-word scores, reasons,
   and ordering are bit-identical; `highlight_indices` unions every term

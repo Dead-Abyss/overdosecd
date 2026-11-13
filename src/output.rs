@@ -407,7 +407,7 @@ const FISH_COMPLETION: &str = r#"
 # Jump-query completion: subcommands for the first word, then names, aliases,
 # and tags from `overdosecd complete`.
 complete -c ocd -f -n 'test (count (commandline -opc)) -eq 1' -a '%COMMANDS% --cmd'
-complete -c ocd -f -n 'test (count (commandline -opc)) -eq 1' -a '(command overdosecd complete (commandline -ct))'
+complete -c ocd -f -n 'test (count (commandline -opc)) -eq 1; and not string match -q -- "-*" (commandline -ct)' -a '(command overdosecd complete (commandline -ct))'
 complete -c ocd -f -n 'set -l opc (commandline -opc); test (count $opc) -eq 1; and string match -q -- "-*" (commandline -ct)' -a '--cmd --no-track'
 complete -c ocd -f -n 'set -l opc (commandline -opc); test (count $opc) -eq 2; and test $opc[2] = --cmd' -a '%COMMANDS%'
 "#;

@@ -281,14 +281,14 @@ impl SqliteStore {
     /// version instead of migrating.
     fn migrate_schema(&self, conn: &mut Connection, from: u32) -> Result<()> {
         // `VACUUM INTO` writes a consistent copy, WAL content included.
-        let backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
-        let Some(target) = backup.to_str() else {
-            return Err(
-                self.storage_err("cannot back up the database to a non-UTF-8 path".to_owned())
-            );
-        };
-        conn.execute("VACUUM INTO ?1", [target])
-            .map_err(|err| self.map_rusqlite(err))?;
+        let backup = self.consistent_copy(conn, from)?;
+        // The copy holds every indexed path; keep it as private as the
+        // database (SQLite creates it with the umask).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
+        }
 
         match from {
             1 | 2 => {
@@ -329,6 +329,30 @@ impl SqliteStore {
                 tx.commit().map_err(|err| self.map_rusqlite(err))
             }
             other => Err(self.storage_err(format!("unsupported schema version {other}"))),
+        }
+    }
+
+    /// `VACUUM INTO` a fresh sibling copy of the database. `sibling_backup`
+    /// only *suggests* a name, so two first opens in the same second can pick
+    /// the same one; the loser retries once with the suffix the winner's copy
+    /// now forces.
+    fn consistent_copy(&self, conn: &Connection, from: u32) -> Result<PathBuf> {
+        let mut backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
+        let mut retried = false;
+        loop {
+            let Some(target) = backup.to_str() else {
+                return Err(
+                    self.storage_err("cannot back up the database to a non-UTF-8 path".to_owned())
+                );
+            };
+            match conn.execute("VACUUM INTO ?1", [target]) {
+                Ok(_) => return Ok(backup),
+                Err(_) if !retried && backup.exists() => {
+                    retried = true;
+                    backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
+                }
+                Err(err) => return Err(self.map_rusqlite(err)),
+            }
         }
     }
 
@@ -486,7 +510,7 @@ impl SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| self.map_rusqlite(err))?;
 
-        let stamp = now.to_rfc3339_opts(SecondsFormat::AutoSi, true);
+        let stamp = now.to_rfc3339_opts(SecondsFormat::Micros, true);
         let updated = transaction
             .execute(
                 "UPDATE projects SET last_used_at = ?1, \
@@ -614,10 +638,10 @@ fn execute_project(
         ":path": project.path.to_string_lossy().into_owned(),
         ":aliases": serde_json::to_string(&project.aliases).unwrap_or_else(|_| "[]".to_owned()),
         ":tags": serde_json::to_string(&project.tags).unwrap_or_else(|_| "[]".to_owned()),
-        ":created_at": project.created_at.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+        ":created_at": project.created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
         ":last_used_at": project
             .last_used_at
-            .map(|when| when.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
+            .map(|when| when.to_rfc3339_opts(SecondsFormat::Micros, true)),
         ":use_count": i64::try_from(project.use_count).unwrap_or(i64::MAX),
         ":pinned": i64::from(project.pinned),
         ":git": i64::from(project.git.is_some()),
@@ -743,7 +767,14 @@ fn create_private_file(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::project::Project;
+    use chrono::Timelike;
     use rusqlite::params;
+
+    /// The store keeps microseconds; test expectations use the same precision.
+    fn micros(when: DateTime<Utc>) -> DateTime<Utc> {
+        when.with_nanosecond(when.nanosecond() / 1000 * 1000)
+            .expect("truncated nanos are valid")
+    }
 
     fn project(name: &str) -> Project {
         Project::for_test(name, &format!("/tmp/{name}"))
@@ -765,16 +796,18 @@ mod tests {
         let store = store(&dir);
 
         let mut first = project("alpha");
+        first.created_at = micros(first.created_at);
         first.aliases = vec!["a".into()];
         first.tags = vec!["rust".into()];
         first.pinned = true;
         first.use_count = 7;
-        first.last_used_at = Some(Utc::now());
+        first.last_used_at = Some(micros(Utc::now()));
         first.git = Some(GitInfo {
             remote_name: Some("origin".into()),
             remote_url: Some("git@github.com:o/alpha.git".into()),
         });
-        let second = project("beta");
+        let mut second = project("beta");
+        second.created_at = micros(second.created_at);
 
         store.save(&[first.clone(), second.clone()]).unwrap();
         let loaded = store.load().unwrap();
@@ -1048,7 +1081,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let now = Utc::now();
+        let now = micros(Utc::now());
         store
             .update(|projects| {
                 let project = projects
@@ -1189,7 +1222,7 @@ mod tests {
         let store = store(&dir);
         store.save(&[project("alpha")]).unwrap();
 
-        let first = Utc::now();
+        let first = micros(Utc::now());
         let second = first + chrono::Duration::seconds(5);
         store.record_use("alpha", first).unwrap();
         store.record_use("alpha", second).unwrap();
@@ -1208,6 +1241,29 @@ mod tests {
             vec![second],
             "the limit keeps the newest jumps"
         );
+    }
+
+    #[test]
+    fn same_second_history_is_ordered_chronologically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        store.save(&[project("alpha")]).unwrap();
+
+        // The early jump sits exactly on a whole second; the later one has a
+        // fraction. Their string forms must not invert that order.
+        let early = DateTime::parse_from_rfc3339("2026-11-13T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let later = DateTime::parse_from_rfc3339("2026-11-13T10:00:00.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.record_use("alpha", early).unwrap();
+        store.record_use("alpha", later).unwrap();
+
+        let recent = store.recent_uses("alpha", 10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[1], early, "the older jump is listed last");
+        assert!(recent[0] > recent[1], "the newer jump is listed first");
     }
 
     #[test]

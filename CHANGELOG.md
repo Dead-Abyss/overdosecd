@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Dependencies: `rusqlite` 0.40 → 0.42 (bundled SQLite 3.53 → 3.54.1) and a
+  lockfile refresh (`toml` 1.2, `proptest` 1.12, `signal-hook` 0.4.6, and
+  transitive patches). The MSRV and the `msrv` CI job move to 1.100;
+  `bincode` stays exact-pinned at 1.3.3.
+
 ## [0.4.0] - 2026-10-19
 
 A palette of its own, and worktrees by name.

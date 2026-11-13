@@ -1,6 +1,6 @@
 # AGENTS.md
 
-`overdosecd` is a small local-first Rust CLI (edition 2024, MSRV 1.99, binary-only
+`overdosecd` is a small local-first Rust CLI (edition 2024, MSRV 1.100, binary-only
 crate). `plan.md` is the forward-looking roadmap (milestones, decided calls,
 known limitations); what already shipped is in `CHANGELOG.md`. Read both before
 starting roadmap work.
@@ -20,7 +20,7 @@ metadata), put `[skip ci]` in the commit message.
 
 - `checks` (ubuntu, stable): `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`
 - `test` (ubuntu, stable): `cargo test`
-- `msrv` (ubuntu, 1.99, matching `rust-version` in `Cargo.toml`):
+- `msrv` (ubuntu, 1.100, matching `rust-version` in `Cargo.toml`):
   `cargo check --all-targets`. The toolchain is passed as `with: toolchain:`
   and a step asserts `rustc --version` against `Cargo.toml`, because Dependabot
   collapses all `dtolnay/rust-toolchain` pins to one ref's SHA — pinning by ref
@@ -534,11 +534,15 @@ finds issues; `doctor --refresh` rewrites stored git metadata under the lock.
   interaction changes. Exercising the picker inside a tmux pane/split stays a
   manual check.
 - Dependency note: the MSRV tracks current Rust stable (`rust-version` in
-  `Cargo.toml`, currently 1.99), and moved there with the ratatui 0.30 stable
+  `Cargo.toml`, currently 1.100), and moved there with the ratatui 0.30 stable
   upgrade — 0.30.2 pulls `ratatui-core 0.1.2` (`lru ^0.18`) and
   `ratatui-widgets 0.3.2` (`time ^0.3.47`), which retired the beta pin and
   both inherited advisories at once. Run `rustup update` before raising
-  `rust-version`; local builds fail against a newer declaration. `bincode` is
+  `rust-version`; local builds fail against a newer declaration. `rusqlite` is
+  0.42 (bundled SQLite 3.54.1); 0.41's iterator-returning column APIs and
+  PRAGMA-name check do not touch the store, which only uses
+  `prepare`/`query_map`/`query_row`/`execute_batch` and `PRAGMA journal_mode`.
+  `bincode` is
   exact-pinned (`=1.3.3`) and must stay there: the crate is unmaintained and
   its 3.0.0 release is a lone `compile_error!` published to announce that, so
   it compiles nowhere (and no fixed 3.x is coming); 1.3.3 is the dev-only

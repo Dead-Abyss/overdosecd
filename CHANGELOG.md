@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-11-13
+
+Correctness, safety, and terminal fixes from a full repository audit.
+
+### Fixed
+
+- `goto /` and the picker's `/` search no longer match every project: the
+  filesystem root is not a searchable path component.
+- The picker's health view clears repaired rows, so `x`+`y` can no longer
+  remove a project that was just relocated.
+- The picker survives terminals that never answer the cursor-position query
+  (slow SSH links, emulated terminals): the box anchors at the bottom edge
+  instead of the session ending, a reply is still parsed when typing preceded
+  it, and signal handlers are registered before the terminal is captured.
+- A terminal too small for the bordered box drops the border instead of
+  hiding an armed `y`/`N` confirmation.
+- Home discovery never offers its own root, skips non-UTF-8 directory names
+  (which could make the cache unwritable), respects its entry budget inside a
+  single huge directory, and dedupes canonical paths.
+- `.git` parsing: the worktree cap keeps a deterministic subset, remote
+  names/URLs are length-capped before they enter the index, and quoted
+  subsection names unescape git's `\\`/`\"`.
+- Jump history stays chronological for jumps within one second; the
+  pre-migration database copy retries a same-second name race and is kept
+  `0600`.
+- Index mutations no longer hold the write lock across `.git` reads (`add`,
+  `import`, `doctor --refresh`), so a second terminal does not time out.
+- Diagnostics: weak-match refusals name the weak term, `enter` escapes the
+  path in its refusal warning, fish completion ignores dash tokens, and
+  `--debug` prints one listing for a `name:branch` miss.
+
+### Changed
+
+- Successful rename/alias/tag prompts close instead of staying editable, so a
+  second Enter cannot re-submit the same mutation.
+- The pty smoke harness gained a silent-terminal scenario and asserts
+  bracketed-paste/cursor restoration on exit; `TestBackend` tests now cover
+  the picker frame layout.
+
 ## [0.4.1] - 2026-11-13
 
 Dependency refresh and the Rust 1.100 floor.

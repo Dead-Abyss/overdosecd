@@ -9,9 +9,10 @@ and [README.md](README.md).
 
 ## Current state
 
-0.4.1 (2026-11-13) is the latest release — the dependency refresh (rusqlite
-0.42, bundled SQLite 3.54.1) and the MSRV/toolchain move to 1.100. 0.4.0 added
-themes and worktrees.
+0.4.2 (2026-11-13) is the latest release — correctness, safety, and terminal
+fixes from a full repository audit. 0.4.1 was the dependency refresh
+(rusqlite 0.42, bundled SQLite 3.54.1) and the MSRV/toolchain move to 1.100.
+0.4.0 added themes and worktrees.
 
 The CLI is complete for its original job — index, organize, inspect, jump.
 Everything below adds new capability or pays down an accepted debt.

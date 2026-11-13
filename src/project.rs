@@ -245,6 +245,10 @@ pub fn sort_key(project: &Project, sort: crate::cli::SortBy) -> SortKey {
 /// Inserts a project for the canonical `path`, or (with `force`) updates the
 /// existing entry for it. Returns the user-facing message. Shared by
 /// `overdosecd add` and the picker's add prompt.
+///
+/// `meta` (git info, kind) is detected by the caller *before* the store lock:
+/// the store's `update` holds `BEGIN IMMEDIATE`, and `.git` reads there would
+/// block every other command's writes.
 pub fn insert(
     projects: &mut Vec<Project>,
     path: PathBuf,
@@ -252,6 +256,7 @@ pub fn insert(
     aliases: Vec<String>,
     tags: Vec<String>,
     force: bool,
+    meta: (Option<GitInfo>, Kind),
 ) -> Result<String> {
     if let Some(existing) = projects.iter_mut().find(|project| project.path == path) {
         if !force {
@@ -263,8 +268,8 @@ pub fn insert(
         if let Some(name) = name {
             existing.name = name;
         }
-        existing.git = GitInfo::detect(&path);
-        existing.kind = kind_of(&path);
+        existing.git = meta.0;
+        existing.kind = meta.1;
         for alias in &aliases {
             push_unique(&mut existing.aliases, alias);
         }
@@ -292,8 +297,8 @@ pub fn insert(
         last_used_at: None,
         use_count: 0,
         pinned: false,
-        git: GitInfo::detect(&path),
-        kind: kind_of(&path),
+        git: meta.0,
+        kind: meta.1,
         env: BTreeMap::new(),
         enter_cmd: None,
         notes: Vec::new(),
@@ -528,6 +533,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             false,
+            (None, Kind::Unknown),
         )
         .expect("insert a fresh project");
         assert!(
@@ -544,6 +550,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             false,
+            (None, Kind::Unknown),
         )
         .expect_err("duplicate paths are refused without --force");
         assert!(matches!(err, Error::Duplicate { .. }));
@@ -559,6 +566,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             false,
+            (None, Kind::Unknown),
         )
         .expect("insert a fresh project");
 
@@ -569,6 +577,7 @@ mod tests {
             vec!["b".into()],
             vec!["t".into()],
             true,
+            (None, Kind::Unknown),
         )
         .expect("force updates the entry");
         assert_eq!(projects.len(), 1);

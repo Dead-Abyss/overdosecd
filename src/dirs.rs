@@ -100,7 +100,12 @@ pub(crate) fn os_env(name: &str) -> Option<OsString> {
 /// A non-empty environment value that is an absolute path; relative XDG
 /// values are ignored per the specification.
 fn absolute_env(name: &str) -> Option<PathBuf> {
-    os_env(name)
+    absolute_env_with(os_env, name)
+}
+
+/// Testable [`absolute_env`] with an injected lookup.
+fn absolute_env_with(lookup: impl Fn(&str) -> Option<OsString>, name: &str) -> Option<PathBuf> {
+    lookup(name)
         .map(PathBuf::from)
         .filter(|value| value.is_absolute())
 }
@@ -120,6 +125,15 @@ mod tests {
     #[test]
     fn relative_xdg_values_are_ignored() {
         assert_eq!(absolute_env("OVERDOSECD_TEST_UNSET_VARIABLE"), None);
+        assert_eq!(
+            absolute_env_with(|_| Some("relative/dir".into()), "X"),
+            None
+        );
+        assert_eq!(
+            absolute_env_with(|_| Some("/abs/dir".into()), "X"),
+            Some(PathBuf::from("/abs/dir"))
+        );
+        assert_eq!(absolute_env_with(|_| Some(String::new().into()), "X"), None);
     }
 
     #[test]

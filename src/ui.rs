@@ -162,14 +162,12 @@ fn pick(
     color: bool,
     options: &Options,
 ) -> Result<Option<Selected>> {
-    let mut session = Session::enter(options)?;
-    picker.set_home_enabled(context.discovery.home);
-    let mut scanner: Option<mpsc::Receiver<Vec<Dir>>> = None;
-
     // Mouse tracking stays on until it is explicitly released, and a default
     // signal disposition would skip every `Drop`, leaving the shell with a
     // mouse-reporting terminal. Route TERM/INT/HUP through a flag and exit via
-    // the normal cancel path so `Session::drop` always runs.
+    // the normal cancel path so `Session::drop` always runs. Register before
+    // `Session::enter` enables anything: a signal during startup must take the
+    // cancel path too.
     let interrupted = Arc::new(AtomicBool::new(false));
     let terminate = [
         signal_hook::consts::SIGTERM,
@@ -179,6 +177,10 @@ fn pick(
     for signal in terminate {
         signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
     }
+
+    let mut session = Session::enter(options)?;
+    picker.set_home_enabled(context.discovery.home);
+    let mut scanner: Option<mpsc::Receiver<Vec<Dir>>> = None;
 
     let mut dirty = true;
     loop {
@@ -306,8 +308,13 @@ fn start_scan(
 
 /// Never offer overdosecd's own data directory as a place to jump to.
 fn drop_data_dir(dirs: Vec<Dir>, data_dir: &Path) -> Vec<Dir> {
+    // The walk carries canonical paths; canonicalize the filter so a `..`
+    // or symlink spelling of the data dir still hides it.
+    let data_dir = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
     dirs.into_iter()
-        .filter(|dir| !dir.path.starts_with(data_dir))
+        .filter(|dir| !dir.path.starts_with(&data_dir))
         .collect()
 }
 
@@ -494,6 +501,10 @@ fn rename(store: &SqliteStore, picker: &mut Picker, id: String, name: String, fo
     match result {
         Ok(old_name) => {
             reload(store, picker, Some(&confirmed_id));
+            // The mutation is done; leaving the prompt open would re-send it
+            // on a second Enter. Set the mode before the status: changing
+            // mode clears it.
+            picker.set_mode(picker::Mode::Search);
             picker.set_status(format!("renamed `{old_name}` -> `{name}`"), false);
         }
         Err(Error::NameTaken { name, .. }) => picker.ask_rename_force(confirmed_id, name),
@@ -518,8 +529,8 @@ fn set_term(
         }
     };
 
-    let label = id.to_owned();
-    let id = label.clone();
+    let label = picker.name_of(id);
+    let id = id.to_owned();
     let result = store.update(move |projects| {
         let project = project::revalidate(projects, &id, label)?;
         project::set_term(project, kind, &value, add)
@@ -527,8 +538,12 @@ fn set_term(
 
     match result {
         Ok(message) => {
-            picker.set_status(message, false);
             reload(store, picker, None);
+            // The mutation is done; leaving the prompt open would re-send it
+            // on a second Enter. Set the mode before the status: changing
+            // mode clears it.
+            picker.set_mode(picker::Mode::Search);
+            picker.set_status(message, false);
         }
         Err(err) => picker.set_status(error_status(&err), true),
     }
@@ -574,11 +589,13 @@ fn health(context: &Context, picker: &mut Picker) {
         .map(|issue| issue_row(issue, home.as_deref()))
         .collect();
 
-    if rows.is_empty() {
-        picker.set_status("no problems found", false);
-        return;
-    }
+    // Always replace the list, including with an empty one: a re-check after
+    // a repair must not leave stale rows that `x` would act on.
+    let empty = rows.is_empty();
     picker.set_issues(rows);
+    if empty {
+        picker.set_status("no problems found", false);
+    }
 }
 
 /// One compact line per issue; stale projects keep their id so the health
@@ -686,11 +703,17 @@ fn reload(store: &SqliteStore, picker: &mut Picker, preserve: Option<&str>) {
 /// there. The read-write variant serves the cursor query, which has to read
 /// the terminal's answer back.
 fn open_tty(read: bool) -> Result<File> {
-    OpenOptions::new()
-        .read(read)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| Error::NoTerminal)
+    let mut options = OpenOptions::new();
+    options.read(read).write(true);
+    if read {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The cursor query must not block forever on a terminal that never
+        // answers; its timeout is a deadline loop over non-blocking reads.
+        // shortcut: Linux's O_NONBLOCK (0o4000) is hard-coded; the platform
+        // is Linux-only by contract.
+        options.custom_flags(0o4000);
+    }
+    options.open("/dev/tty").map_err(|_| Error::NoTerminal)
 }
 
 /// Whether the picker draws with color. `auto` means "a terminal is
@@ -755,9 +778,23 @@ fn add_project(store: &SqliteStore, picker: &mut Picker, input: &str) {
 fn add_path(store: &SqliteStore, input: &str) -> Result<(String, String)> {
     let canonical = project::require_dir(Path::new(input.trim()), project::home_dir().as_deref())?;
     let name = project::default_name(&canonical)?;
+    // Read `.git` before the lock: detection inside `BEGIN IMMEDIATE` would
+    // block other terminals' writes.
+    let meta = (
+        project::GitInfo::detect(&canonical),
+        project::kind_of(&canonical),
+    );
 
     let message = store.update(move |projects| {
-        project::insert(projects, canonical, None, Vec::new(), Vec::new(), false)
+        project::insert(
+            projects,
+            canonical,
+            None,
+            Vec::new(),
+            Vec::new(),
+            false,
+            meta,
+        )
     })?;
     Ok((message, name))
 }
@@ -1079,17 +1116,28 @@ mod tests {
             picker.status().expect("status").text,
             "renamed `alpha` -> `beta`"
         );
+        assert_eq!(
+            picker.mode(),
+            Mode::Search,
+            "a successful rename closes the prompt"
+        );
     }
 
     #[test]
     fn terms_are_added_and_removed() {
         let (store, _dir) = store_with(vec![project("alpha", "/x/alpha")]);
         let mut picker = picker_with(store.load().unwrap());
+        picker.set_mode(Mode::Prompt);
 
         set_term(&store, &mut picker, TermKind::Alias, "alpha", "a", true);
         assert_eq!(
             picker.status().expect("status").text,
             "added alias `a` to `alpha`"
+        );
+        assert_eq!(
+            picker.mode(),
+            Mode::Search,
+            "a successful mutation closes the prompt"
         );
         assert_eq!(store.load().expect("load")[0].aliases, vec!["a".to_owned()]);
 
@@ -1207,6 +1255,61 @@ mod tests {
         let status = picker.status().expect("status");
         assert!(status.text.starts_with("added `alpha`"), "{}", status.text);
         assert!(!status.error);
+    }
+
+    #[test]
+    fn health_clears_stale_rows_after_a_clean_recheck() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700");
+        }
+        let (store, _dir) = store_with(vec![project("alpha", "/x/gone")]);
+        let mut picker = picker_with(store.load().unwrap());
+        let discovery = crate::config::Discovery::default();
+        let context = Context {
+            data_dir: dir.path(),
+            discovery: &discovery,
+        };
+
+        health(&context, &mut picker);
+        assert_eq!(picker.issues().len(), 1, "the stale row is listed");
+
+        // The project is healed; the next check must drop the old row instead
+        // of leaving it armed for `x`.
+        picker.set_projects(vec![project("alpha", dir.path().to_str().unwrap())], None);
+        health(&context, &mut picker);
+        assert!(
+            picker.issues().is_empty(),
+            "a clean re-check must clear the stale rows"
+        );
+    }
+
+    #[test]
+    fn drop_data_dir_compares_canonical_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(&data).expect("create");
+        let inside = Dir {
+            path: data.join("cache"),
+            name: "cache".to_owned(),
+            depth: 1,
+            project_like: false,
+        };
+        let outside = Dir {
+            path: temp.path().join("code"),
+            name: "code".to_owned(),
+            depth: 1,
+            project_like: false,
+        };
+        // A `..` spelling still names the data dir.
+        let filter = data.join("..").join("data");
+
+        let kept = drop_data_dir(vec![inside, outside], &filter);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "code");
     }
 
     #[test]

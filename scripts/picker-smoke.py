@@ -16,8 +16,9 @@ the next prompt lands where the box was).
 It covers jump, filter, Tab+j/k, pin, add, cancel, mouse scroll/click, the
 palette's remove/rename/tag actions, batched pinning through marks, the detail
 and health views, the help overlay, `ui --query`, the home-directory fallback
-and `scan --home`, and both wrappers. Needs Linux (ptys), python3, bash, and
-zsh. Not run by CI.
+and `scan --home`, both wrappers, and a terminal that never answers the
+cursor-position query. Needs Linux (ptys), python3, bash, and zsh. Not run by
+CI.
 """
 
 import argparse
@@ -222,6 +223,8 @@ class Harness:
         signal_at=None,
         resize=None,
         color=False,
+        answer_queries=True,
+        warmup=1.0,
     ):
         """Run argv under a pty; stdin+stderr are the tty, stdout is a file.
 
@@ -230,6 +233,8 @@ class Harness:
         open rather than after it is cleared. With `signal_at`, SIGTERM is
         sent after that many keys (0 sends it right after startup); with
         `resize`, the pty is resized `(rows, cols)` once the picker is up.
+        With `answer_queries=False`, the emulated terminal stays silent and the
+        picker must survive on its fallback anchor.
         """
         out_path = tempfile.mktemp(dir=self.root)
         pid, fd = pty.fork()
@@ -276,6 +281,8 @@ class Harness:
                 return
             pty_bytes += chunk
             self.screen.feed(chunk)
+            if not answer_queries:
+                return
             # A real terminal answers every cursor-position query with the
             # cursor's current position (1-based), and the inline viewport
             # asks again after a resize, not just at startup.
@@ -299,8 +306,8 @@ class Harness:
         # frame), so keys never race the query's reply. The reply is sent by
         # `pump` as soon as the query appears -- the picker waits, but not
         # forever.
-        warmup = time.time() + 1.0
-        while time.time() < warmup:
+        warmup_deadline = time.time() + warmup
+        while time.time() < warmup_deadline:
             done, raw = os.waitpid(pid, os.WNOHANG)
             if done:
                 status = raw
@@ -404,6 +411,15 @@ class Harness:
             (row, col) == anchor,
             f"cursor at ({row},{col}), expected {anchor}",
         )
+        for escape, what in [
+            (b"\x1b[?2004l", "bracketed paste released"),
+            (b"\x1b[?25h", "cursor shown"),
+        ]:
+            self.check(
+                f"{label} ({what})",
+                escape in pty,
+                f"{escape!r} missing from the stream",
+            )
         if queries is not None:
             found = pty.count(b"\x1b[6n")
             self.check(
@@ -492,6 +508,25 @@ class Harness:
         self.check_non_intrusive(raw)
         # Two queries: the startup anchor and the resize re-anchor.
         self.check_exit_cursor("resize keeps the picker inline", raw, queries=2)
+
+        # A terminal that never answers `ESC [ 6 n` must not end the picker:
+        # the fallback anchors the box at the bottom edge and the jump still
+        # works, with the terminal restored on the way out.
+        self.setup()
+        code, out, raw = self.run(
+            [binary, "ui"], [b"\r"], answer_queries=False, warmup=1.6
+        )
+        self.check(
+            "a silent terminal still jumps",
+            code == 0 and out == alpha + "\n",
+            f"code={code} out={out!r}",
+        )
+        self.check_non_intrusive(raw)
+        self.check(
+            "a silent terminal restores the terminal",
+            b"\x1b[?1006l" in raw and b"\x1b[?2004l" in raw and b"\x1b[?25h" in raw,
+            "a restore escape is missing from the stream",
+        )
 
         # Ctrl+a adds the current directory.
         self.setup()

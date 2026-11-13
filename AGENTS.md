@@ -60,9 +60,10 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   `output::print` (both broken-pipe safe), not `println!`. `--debug` listings go to
   stderr for the same reason.
 - Tables measure display width (`unicode-width`), never `chars().count()`, so CJK
-  and emoji align. `output::format_projects` takes the terminal width as an
-  injected `Option<usize>`; `output::terminal_width()` is the only tty read and
-  returns `None` when stdout is piped, so piped output is never truncated.
+  and emoji align. `output::format_projects_with_missing` takes the terminal
+  width as an injected `Option<usize>`; `output::terminal_width()` is the only
+  tty read and returns `None` when stdout is piped, so piped output is never
+  truncated.
 - Values that would break the line-oriented output or inject terminal escapes
   are refused at every entry point (`add` path/name/alias/tag, `rename`,
   `alias add`, `tag add`, `note add`, `profile env add`/`profile run set`,
@@ -286,12 +287,18 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   `signal_hook` flag checked each loop (the poll timeout is 200 ms so a signal
   is noticed promptly) and exits via the cancel path. That is not politeness:
   a default signal disposition would skip every `Drop`, and the shell would
-  keep a mouse-reporting terminal. Every exit path must run `Session::drop`'s
+  keep a mouse-reporting terminal. The handlers are registered *before*
+  `Session::enter` enables raw mode/mouse/paste, so a signal during startup
+  takes the cancel path too. Every exit path must run `Session::drop`'s
   restore (erase, raw mode off, bracketed paste off, mouse off, cursor show).
 - `src/ui/backend.rs` exists for one reason: crossterm's cursor query writes
   `ESC [ 6 n` to *stdout*, which the wrapper captures with `$(...)`.
-  `TtyBackend::get_cursor_position` sends the query on a read+write `/dev/tty`
-  handle instead (1 s timeout). Never let
+  `TtyBackend::get_cursor_position` sends the query on a non-blocking
+  read+write `/dev/tty` handle instead: a 1 s deadline loop, a lenient parser
+  (typed input in front of the report is tolerated), and a bottom-edge
+  fallback. A terminal that never answers must keep the box usable, never end
+  the session, and no reader thread may outlive the query (it would steal
+  typed input). Never let
   ratatui's inline viewport reach crossterm's own position query — that bug was
   caught by the pty harness reading stdout.
 - Mouse: `[ui] mouse = auto` captures in a plain terminal but leaves the mouse
@@ -330,7 +337,10 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   SGR ignored) and **answers the cursor-position query with the emulated
   cursor's real position**. A hardcoded answer places the inline box wrongly
   and its exit-clear then wipes real output — that is what the `KEEP-ME-42`
-  screen check guards.
+  screen check guards. One scenario instead leaves the query unanswered
+  (`answer_queries=False`): the picker must open on its fallback anchor, jump,
+  and still restore the terminal. Every exit check also asserts bracketed
+  paste was released and the cursor shown again.
 - Empty-query ordering is `project::sort_key` (pinned, then last used,
   then name — the same key backs `list`'s default sort) through
   `sort_by_cached_key`; non-empty queries go through `matcher::rank` (the
@@ -356,7 +366,11 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   live. Every `.git` read is capped
   (`HEAD`/`gitdir:`/`commondir` 64 KiB, `config` 16 MiB) and only the first
   line of a `gitdir:`/`commondir` indirection is used, so a hostile repository
-  cannot feed an unbounded read into `add`, `import`, or `doctor --refresh`. The
+  cannot feed an unbounded read into `add`, `import`, or `doctor --refresh`. A
+  remote's name and URL are length-capped (4 KiB / 8 KiB) before they enter
+  the index, because every `list`/`goto` re-reads them; quoted section names
+  unescape git's `\\`/`\"` (a dangling escape is absent, like every other
+  parse failure). The
   read stats before opening, so a planted FIFO can never block it. Config reads
   follow `include.path`/`includeIf` (`gitdir:` and `gitdir/i:`) under fixed
   budgets (≤8 files, 16 MiB merged, regular files only, cycles cut) and apply
@@ -379,17 +393,19 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
   whole-snapshot path the migration and tests use) is a separate inherent
   method so an ordinary caller cannot bypass the diff-and-lock path. Readers
   do not lock.
-- Matcher fuzzy signals are hard-capped (name ≤ 400, alias ≤ 400, path ≤ 200,
-  repo ≤ 300) and `signal_score()` skips one once the running best exceeds its
-  cap: `improve` only replaces on a strict win and the signal order is
-  unchanged, so scores and tie-break reasons stay identical (Phase 10e,
+- Matcher fuzzy signals are hard-capped (base + clamp: name ≤ 700, alias ≤ 400,
+  path ≤ 200, repo ≤ 300) and `signal_score()` skips one once the running best
+  exceeds its total cap: `improve` only replaces on a strict win and the signal
+  order is unchanged, so scores and tie-break reasons stay identical (Phase 10e,
   output-identical optimization). Do not reorder the signals — `--debug`
   output and tie-breaks depend on the order.
 - `matcher::rank` splits the query on whitespace. One term takes the original
   path exactly; several terms require every term to match (AND), sum the
   per-term signals, and apply the bonuses once — and the *whole* query still
   scores as one term, so names containing spaces match exactly (a tie goes to
-  the whole query). `Match.terms` carries the per-term hits, `all_confident()`
+  the whole query). The fuzzy path signal scores only `Component::Normal`
+  names, so the root `/` cannot make a query match every absolute path.
+  `Match.terms` carries the per-term hits, `all_confident()`
   is the rule behind `goto --confident`/`ocd`, and `--debug` prints per-term
   lines only when more than one term contributed. Single-word scores, reasons,
   and ordering are bit-identical; `highlight_indices` unions every term
@@ -402,6 +418,8 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
 - `SqliteStore::record_use` records a jump in one `BEGIN IMMEDIATE`
   transaction (`MIN(use_count + 1, …)`) that also appends to `usage` and
   prunes that project's log; `recent_uses` returns newest-first timestamps.
+  Timestamps are stored with `SecondsFormat::Micros` (fixed width), so the
+  `ORDER BY used_at` string sort stays chronological inside one second.
   `goto` prints the path before recording usage, so a failed bookkeeping write
   only produces a stderr warning; keep it that way.
 - `list --since <WHEN>` (`src/time.rs`) accepts durations (`30m`, `48h`, `7d`,
@@ -416,10 +434,14 @@ cargo test --test cli ambiguous_query_lists_candidates_with_exit_1 # integration
 
 - The home fallback (`src/discovery.rs`) never indexes anything: it walks
   `$HOME` within a depth cap and an entry budget applied *during* the walk
-  (`max_entries * 8`, so a planted tree cannot grow the queue before the final
+  (`max_entries * 8`, enforced both between directories and inside one wide
+  directory, so a planted tree cannot grow the queue before the final
   truncate), without following symlinks, skipping `DEFAULT_SKIP` plus
   `[discovery] skip`, and scores the cached directories (name fuzzy,
-  project-like bonus, depth penalty). A skip pattern containing `/` matches
+  project-like bonus, depth penalty). The walk canonicalizes its root, never
+  offers the root itself, and drops non-UTF-8 names (the cache is JSON; one
+  such name used to fail the whole write). A skip pattern containing `/`
+  matches
   trailing path components, so `.local/share/Trash` actually skips; a bare
   pattern matches the directory name. `home-dirs.json` and `hook-visits.json`
   are read only when they are small regular files, so a planted giant file is
@@ -462,12 +484,17 @@ the target with `matcher::best` *outside* the lock, then re-verify by `id` insid
 `Store::update` and fail with `NoLongerIndexed` if it vanished. Keep new
 mutations on that path. `rename` refuses a case-insensitively taken name unless
 `--force`; idempotent operations succeed with an "already …" note.
+`project::insert` takes the detected `(GitInfo, Kind)` from its caller; `add`,
+`import`, and `doctor --refresh` detect *before* the transaction, because
+`.git` reads under `BEGIN IMMEDIATE` block every other terminal's writes. Only
+the picker's single-project add/repath still detects inside `update`.
 
 `doctor --fix` is the deliberate batch exception: it collects repairs
 interactively outside the lock, then applies them in one `update` that
 re-verifies each `id` and *skips* vanished or newly-colliding targets instead of
 failing the whole session. `doctor` alone is read-only and exits `1` when it
-finds issues; `doctor --refresh` rewrites stored git metadata under the lock.
+finds issues; `doctor --refresh` detects git metadata outside the lock and
+applies it inside, re-verifying `id` + `path`.
 
 ## Testing conventions
 
@@ -517,22 +544,33 @@ finds issues; `doctor --refresh` rewrites stored git metadata under the lock.
 - Manual shell test: the wrapper calls `overdosecd` by name, so put the binary on
   `PATH` (e.g. `target/debug`) before `eval "$(overdosecd init zsh)"`.
 - The picker's end-to-end behavior (jump, filter, Tab+j/k, pin, add, cancel,
-  SIGTERM mid-session, mid-session resize, both wrappers, the entry profile
+  SIGTERM mid-session, mid-session resize, a terminal that never answers the
+  cursor query, both wrappers, the entry profile
   applied through the bash wrapper) is
   checked by `scripts/picker-smoke.py`, which drives the real binary through a
-  pty and reads the path from a redirected stdout. It answers the inline
+  pty and reads the path from a redirected stdout:
+
+```sh
+cargo build && python3 scripts/picker-smoke.py   # --release / --binary PATH also work
+```
+
+  It answers the inline
   viewport's cursor query itself — *every* time it is asked, including the
   re-anchor after a resize; answering only the first query made a resize kill
-  the picker with an I/O error, which is how that rule was learned. It drives
+  the picker with an I/O error, which is how that rule was learned. One
+  scenario deliberately leaves the query unanswered and expects the fallback
+  anchor to survive. It drives
   real mouse sequences and asserts the escape stream carries no alternate
   screen, no scrollback clear, and no visible-screen clear except the one
   ratatui emits on a horizontal shrink. It also asserts that every exit path
   parks the emulated cursor at the box origin with no exit-time cursor query —
-  the check that would have caught the ratatui 0.30 `clear()` gap. It is a
-  manual check
-  (python3 + bash + zsh), not part of CI; add a scenario there when picker
-  interaction changes. Exercising the picker inside a tmux pane/split stays a
-  manual check.
+  the check that would have caught the ratatui 0.30 `clear()` gap — and that
+  bracketed paste is released and the cursor shown. It runs headless through
+  `pty.fork` (python3 + bash + zsh), not part of CI; add a scenario there when
+  picker interaction changes. It runs `target/debug/overdosecd`, so
+  `cargo build` first: `cargo test` builds a different binary and leaves the
+  harness target untouched. Exercising the picker inside a tmux pane/split
+  stays a manual check.
 - Dependency note: the MSRV tracks current Rust stable (`rust-version` in
   `Cargo.toml`, currently 1.100), and moved there with the ratatui 0.30 stable
   upgrade — 0.30.2 pulls `ratatui-core 0.1.2` (`lru ^0.18`) and

@@ -44,6 +44,9 @@ pub(crate) struct NewProject {
     pub path: PathBuf,
     pub use_count: u64,
     pub last_used_at: Option<DateTime<Utc>>,
+    /// Detected while planning, outside the store lock.
+    pub git: Option<project::GitInfo>,
+    pub kind: project::Kind,
 }
 
 /// What an import (dry-run or real) does, by category.
@@ -336,10 +339,15 @@ pub fn plan(
             plan.excluded += 1;
             continue;
         }
+        // Detected here, before the store lock is taken.
+        let git = project::GitInfo::detect(&canonical);
+        let kind = project::kind_of(&canonical);
         candidates.push(NewProject {
             path: canonical,
             use_count,
             last_used_at: record.visited,
+            git,
+            kind,
         });
     }
 
@@ -437,6 +445,7 @@ pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usiz
             Vec::new(),
             Vec::new(),
             false,
+            (entry.git.clone(), entry.kind),
         )
         .is_err()
         {
@@ -513,6 +522,61 @@ mod tests {
 
     fn project(name: &str, path: &Path) -> Project {
         Project::for_test(name, path.to_str().expect("utf-8 path"))
+    }
+
+    #[test]
+    fn text_stores_tolerate_crlf() {
+        let parsed = parse_autojump(b"10\t/tmp/a\r\n");
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].path, "/tmp/a");
+
+        let parsed = parse_zshz(b"/tmp/b|5|1700000000\r\n");
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].path, "/tmp/b");
+    }
+
+    #[test]
+    fn zoxide_framing_errors_are_reported() {
+        let path = Path::new("db.zo");
+
+        // Two entries declared, none present.
+        let mut count_over = Vec::new();
+        bincode::serialize_into(&mut count_over, &3u32).expect("version");
+        bincode::serialize_into(&mut count_over, &2u64).expect("count");
+        let err = parse_zoxide(&count_over, path).expect_err("count exceeds the buffer");
+        assert!(
+            err.to_string().contains("entry count exceeds the buffer"),
+            "{err}"
+        );
+
+        // One entry whose declared length runs past the buffer (it still has
+        // to clear the 24-byte-per-entry count guard first).
+        let mut len_over = Vec::new();
+        bincode::serialize_into(&mut len_over, &3u32).expect("version");
+        bincode::serialize_into(&mut len_over, &1u64).expect("count");
+        bincode::serialize_into(&mut len_over, &100u64).expect("len");
+        len_over.extend_from_slice(&[0u8; 24]);
+        let err = parse_zoxide(&len_over, path).expect_err("length exceeds the buffer");
+        assert!(
+            err.to_string().contains("entry length exceeds the buffer"),
+            "{err}"
+        );
+
+        // Trailing bytes after the last entry are tolerated.
+        let mut trailing = zoxide_bytes(&[("/tmp/one", 1.0, 0)]);
+        trailing.extend_from_slice(b"garbage");
+        let parsed = parse_zoxide(&trailing, path).expect("trailing bytes are ignored");
+        assert_eq!(parsed.records.len(), 1);
+
+        // A count exactly at the 24-byte-per-entry bound is accepted.
+        let mut exact = Vec::new();
+        bincode::serialize_into(&mut exact, &3u32).expect("version");
+        bincode::serialize_into(&mut exact, &1u64).expect("count");
+        bincode::serialize_into(&mut exact, &0u64).expect("len");
+        bincode::serialize_into(&mut exact, &1.0f64).expect("rank");
+        bincode::serialize_into(&mut exact, &0u64).expect("epoch");
+        let parsed = parse_zoxide(&exact, path).expect("minimal frame");
+        assert_eq!(parsed.malformed, 1, "an empty path is malformed, not fatal");
     }
 
     #[test]
@@ -688,6 +752,8 @@ mod tests {
             path: canonical.clone(),
             use_count: 7,
             last_used_at: None,
+            git: None,
+            kind: project::Kind::Unknown,
         };
 
         let mut projects = Vec::new();
@@ -710,6 +776,8 @@ mod tests {
                 path: PathBuf::from("/tmp/one"),
                 use_count: 1,
                 last_used_at: None,
+                git: None,
+                kind: project::Kind::Unknown,
             }],
             existing: 2,
             missing: 1,
@@ -738,6 +806,8 @@ mod tests {
                 path: PathBuf::from("/tmp/notes"),
                 use_count: 4,
                 last_used_at: None,
+                git: None,
+                kind: project::Kind::Unknown,
             }],
             ..Plan::default()
         };

@@ -181,6 +181,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_private_replaces_atomically_and_privately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("store.json");
+        std::fs::write(&path, "old").expect("seed");
+        write_private(&path, b"new").expect("write");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new");
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries.len(), 1, "no tmp litter survives: {entries:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the file stays private");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_does_not_follow_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "safe").expect("seed");
+        let link = dir.path().join("store.json");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+
+        write_private(&link, b"new").expect("write");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read"),
+            "safe",
+            "the link target is never written through"
+        );
+        assert_eq!(std::fs::read_to_string(&link).expect("read"), "new");
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .expect("metadata")
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn read_rebuildable_json_refuses_links_and_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.json");
+        std::fs::write(&path, "{\"dirs\":[]}").expect("seed");
+        assert!(
+            read_rebuildable_json::<serde_json::Value>(&path, 1024).is_some(),
+            "a small regular file reads"
+        );
+        assert!(
+            read_rebuildable_json::<serde_json::Value>(dir.path(), 1024).is_none(),
+            "a directory is absent"
+        );
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("cache-link.json");
+            std::os::unix::fs::symlink(&path, &link).expect("symlink");
+            assert!(
+                read_rebuildable_json::<serde_json::Value>(&link, 1024).is_none(),
+                "a symlink is absent"
+            );
+        }
+    }
+
+    #[test]
     fn absolute_overrides_win() {
         let dir = std::env::temp_dir().join("overdosecd-explicit");
         assert_eq!(

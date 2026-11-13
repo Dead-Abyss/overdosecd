@@ -261,9 +261,23 @@ fn cmd_add(store: &SqliteStore, args: AddArgs) -> Result<()> {
     let aliases = sanitize_terms("alias", &args.alias)?;
     let tags = sanitize_terms("tag", &args.tag)?;
     let force = args.force;
+    // Read `.git` before the lock: detection inside `BEGIN IMMEDIATE` would
+    // block other terminals' writes.
+    let meta = (
+        project::GitInfo::detect(&canonical),
+        project::kind_of(&canonical),
+    );
 
     let message = store.update(move |projects| {
-        project::insert(projects, canonical, provided_name, aliases, tags, force)
+        project::insert(
+            projects,
+            canonical,
+            provided_name,
+            aliases,
+            tags,
+            force,
+            meta,
+        )
     })?;
     output::print_line(&message)
 }
@@ -440,7 +454,9 @@ fn cmd_goto(
         let (repo, branch) = (repo.trim(), branch.trim());
         if !repo.is_empty()
             && !branch.is_empty()
-            && let Ok(found) = resolve(&projects, repo, matching, debug)
+            // The probe is not a resolution of the user's query: only the
+            // fall-through below may print a debug listing.
+            && let Ok(found) = resolve(&projects, repo, matching, false)
             && (!confident || found.all_confident())
             && let Some(path) = worktree_for(&projects[found.index].path, branch)
         {
@@ -451,10 +467,17 @@ fn cmd_goto(
     let found = resolve(&projects, query, matching, debug)?;
     if confident && !found.all_confident() {
         // The caller decides what to do; `ocd` opens the picker prefilled.
+        // Name the weak term, not the strongest one: `reason` is the winner's
+        // class, and it may well be the confident label that was refused.
+        let reason = found
+            .terms
+            .iter()
+            .find(|hit| !hit.reason.is_confident())
+            .map_or_else(|| found.reason.label(), |hit| hit.reason.label());
         return Err(Error::WeakMatch {
             query: query.trim().to_owned(),
             name: found.name.clone(),
-            reason: found.reason.label(),
+            reason,
         });
     }
     if !found.path.exists() {
@@ -1098,17 +1121,34 @@ fn cmd_doctor(
     let index_path = paths::sqlite_file(data_dir);
 
     if args.refresh {
-        let (total, changed) = store.update(|projects| {
+        // Detect outside the lock, apply inside it by id-and-path re-verify:
+        // `.git` reads under `BEGIN IMMEDIATE` would block other terminals.
+        let snapshot = store.load_lean()?;
+        let detected: Vec<_> = snapshot
+            .iter()
+            .filter(|project| project.path.exists())
+            .map(|project| {
+                (
+                    project.id.clone(),
+                    project.path.clone(),
+                    project::GitInfo::detect(&project.path),
+                    project::kind_of(&project.path),
+                )
+            })
+            .collect();
+        let (total, changed) = store.update(move |projects| {
             let mut changed = 0;
-            for project in projects.iter_mut() {
-                if !project.path.exists() {
+            for (id, path, git, kind) in &detected {
+                let Some(project) = projects
+                    .iter_mut()
+                    .find(|project| project.id == *id && project.path == *path)
+                else {
+                    // Repathed or removed while planning; the next run sees it.
                     continue;
-                }
-                let detected = project::GitInfo::detect(&project.path);
-                let kind = project::kind_of(&project.path);
-                if detected != project.git || kind != project.kind {
-                    project.git = detected;
-                    project.kind = kind;
+                };
+                if project.git != *git || project.kind != *kind {
+                    project.git = git.clone();
+                    project.kind = *kind;
                     changed += 1;
                 }
             }

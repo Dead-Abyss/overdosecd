@@ -97,6 +97,10 @@ fn is_skipped(skip: &[&str], name: &str, path: &Path) -> bool {
 /// Walks `root` and returns every directory it may offer, shallowest and
 /// project-like first when the cap bites. `root` itself is not included.
 pub fn scan(root: &Path, options: &Options) -> Vec<Dir> {
+    // The index stores canonical paths; a canonical root keeps home rows
+    // comparable to indexed paths (and to the canonicalized data dir) and
+    // stops one directory being offered twice under two spellings.
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let skip: Vec<&str> = DEFAULT_SKIP
         .iter()
         .copied()
@@ -105,7 +109,7 @@ pub fn scan(root: &Path, options: &Options) -> Vec<Dir> {
 
     let mut dirs: Vec<Dir> = Vec::new();
     let mut queue: VecDeque<(PathBuf, u16)> = VecDeque::new();
-    queue.push_back((root.to_path_buf(), 0));
+    queue.push_back((root, 0));
 
     // The cap is applied while walking, not only at the end: a planted tree
     // of millions of empty directories must not grow the queue unbounded
@@ -134,15 +138,28 @@ pub fn scan(root: &Path, options: &Options) -> Vec<Dir> {
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
+            let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if file_type.is_dir() {
-                if is_skipped(&skip, &name, &entry.path()) {
+                // The cache is JSON: one non-UTF-8 path would fail the whole
+                // write, not just this row.
+                if path.to_str().is_none() || is_skipped(&skip, &name, &path) {
                     continue;
                 }
-                queue.push_back((entry.path(), depth + 1));
+                // The budget above is checked once per directory; a single
+                // wide directory must not grow the queue past it.
+                if dirs.len().saturating_add(queue.len()) >= budget {
+                    break;
+                }
+                queue.push_back((path, depth + 1));
             } else if MARKERS.contains(&name.as_str()) {
                 has_marker = true;
             }
+        }
+
+        // The walk offers children, never the root itself.
+        if depth == 0 {
+            continue;
         }
 
         let name = path
@@ -333,6 +350,35 @@ mod tests {
         let code = dirs.iter().find(|dir| dir.name == "code").expect("code");
         assert!(!code.project_like);
         assert!(code.depth < alpha.depth);
+    }
+
+    #[test]
+    fn the_root_is_never_offered() {
+        let temp = fixture();
+        let root = temp.path().canonicalize().expect("canonical temp");
+        let dirs = scan(&root, &options(4));
+        assert!(
+            dirs.iter().all(|dir| dir.path != root),
+            "the walk offers children, not the root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_directories_never_enter_the_cache() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        touch(&root.join("good"));
+        let bad = std::ffi::OsString::from_vec(b"bad\xffname".to_vec());
+        fs::create_dir(root.join(&bad)).expect("create");
+
+        let dirs = scan(root, &options(2));
+        assert!(dirs.iter().all(|dir| dir.path.to_str().is_some()));
+
+        // The whole cache write must survive a tree that has such a name.
+        let cache = Cache::new(dirs, chrono::Utc::now());
+        save_cache(&root.join("home-dirs.json"), &cache).expect("cache is UTF-8");
     }
 
     #[test]

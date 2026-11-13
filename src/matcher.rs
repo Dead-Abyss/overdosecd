@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use fuzzy_matcher::FuzzyMatcher;
@@ -348,7 +348,7 @@ pub fn completion_candidates(projects: &[Project], prefix: &str) -> Vec<String> 
         .collect();
 
     candidates.sort_by_cached_key(|value| value.to_lowercase());
-    candidates.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    candidates.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
     candidates
 }
 
@@ -644,6 +644,11 @@ fn and_terms(
 fn best_path_match(matcher: &SkimMatcherV2, path: &Path, query: &str) -> Option<i64> {
     path.components()
         .filter_map(|component| {
+            // The root `/` is a component of every absolute path; scoring it
+            // would make the query `/` match any project.
+            if !matches!(component, Component::Normal(_)) {
+                return None;
+            }
             let text = component.as_os_str().to_string_lossy().to_lowercase();
             if text.is_empty() {
                 return None;
@@ -782,6 +787,14 @@ mod tests {
             found.score,
             NAME_PREFIX - MatcherConfig::DEFAULT.depth_penalty * 3,
         );
+    }
+
+    #[test]
+    fn the_root_component_never_matches() {
+        // `/` is shared by every absolute path; it must not make a query
+        // match every project.
+        let projects = vec![project("alpha", "/home/me/alpha")];
+        assert!(matches!(best("/", &projects), Err(Error::NoMatch { .. })));
     }
 
     #[test]
@@ -975,6 +988,14 @@ mod tests {
 
         let projects = vec![first, second];
         assert_eq!(completion_candidates(&projects, "alp"), vec!["alpha"]);
+
+        let mut sigma = Project::for_test("Σ", live);
+        sigma.aliases.push("σ".into());
+        assert_eq!(
+            completion_candidates(&[sigma], ""),
+            vec!["Σ"],
+            "non-ASCII case folds collapse too"
+        );
     }
 
     #[test]

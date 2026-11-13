@@ -108,7 +108,10 @@ pub fn apply(shell: Shell, path: &Path, data_dir: &Path) {
     let code = match render(shell, &profile) {
         Ok(code) => code,
         Err(err) => {
-            warn(format!("refusing the profile for {raw}: {err}"));
+            warn(format!(
+                "refusing the profile for {}: {err}",
+                sanitize::path(path)
+            ));
             return;
         }
     };

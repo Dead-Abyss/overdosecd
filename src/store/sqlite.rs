@@ -1267,6 +1267,30 @@ mod tests {
     }
 
     #[test]
+    fn record_use_saturates_the_use_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        store.save(&[project("alpha")]).unwrap();
+
+        let conn = Connection::open(store.path()).unwrap();
+        conn.execute(
+            "UPDATE projects SET use_count = ?1 WHERE id = 'alpha'",
+            [i64::MAX],
+        )
+        .unwrap();
+        drop(conn);
+
+        store.record_use("alpha", micros(Utc::now())).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded[0].use_count,
+            i64::MAX as u64,
+            "the counter saturates instead of wrapping"
+        );
+    }
+
+    #[test]
     fn record_use_ignores_a_vanished_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store(&dir);

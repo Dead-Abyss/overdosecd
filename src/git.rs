@@ -793,6 +793,43 @@ mod tests {
     }
 
     #[test]
+    fn the_worktree_cap_is_deterministic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = checkout(dir.path(), "ref: refs/heads/main\n", "");
+        for index in 0..=MAX_WORKTREES {
+            let sibling = dir.path().join(format!("sibling-{index:02}"));
+            let admin = main.join(format!(".git/worktrees/wt-{index:02}"));
+            write(
+                &admin.join("gitdir"),
+                &format!("{}\n", sibling.join(".git").display()),
+            );
+            write(
+                &admin.join("HEAD"),
+                &format!("ref: refs/heads/b{index:02}\n"),
+            );
+            write(
+                &sibling.join(".git"),
+                &format!("gitdir: {}\n", admin.display()),
+            );
+        }
+
+        let first = worktrees_in(&main.join(".git"));
+        assert_eq!(first.len(), MAX_WORKTREES);
+        assert_eq!(
+            first,
+            worktrees_in(&main.join(".git")),
+            "the surviving subset is stable"
+        );
+        assert!(
+            first
+                .iter()
+                .all(|worktree| worktree.path
+                    != dir.path().join(format!("sibling-{MAX_WORKTREES:02}"))),
+            "the sorted cap drops the last registration"
+        );
+    }
+
+    #[test]
     fn reads_sibling_worktrees_and_skips_vanished_ones() {
         let dir = tempfile::tempdir().expect("tempdir");
         let main = checkout(dir.path(), "ref: refs/heads/main\n", "");

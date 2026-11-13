@@ -57,7 +57,9 @@ Recorded so this is not reopened: the matcher's scoring and signal caps
 (output-frozen), `format_projects_with_missing` (the tested layout engine),
 `TtyBackend` and the `Session`/`PendingRestore` plumbing (each exists for a
 recorded failure), the `Picker` state machine (wide, not deep), the three
-import parsers, and the hand-rolled `git.rs` (v0.5.0 extends it; it is never
+import parsers, the picker's single-project git detection in the add/repath
+paths (one row, bounded; imports and `doctor --refresh` detect outside the
+lock), and the hand-rolled `git.rs` (v0.5.0 extends it; it is never
 replaced by `git2`/`gix`/subprocess).
 
 ### v0.5.0 — Git status & health UI
@@ -112,6 +114,12 @@ Definition of done:
 
 ### Backlog (unscheduled)
 
+- zoxide's plaintext store: zoxide announced (2026-10-03) that it is switching
+  from the bincode `db.zo` to a text `db.txt`; no release ships it yet (0.10.0
+  is the latest, 2026-07-04). Its own migration leaves `db.zo` behind, so once
+  a release has it, `import zoxide` must prefer `db.txt` or it will import a
+  frozen snapshot. Upgrade trigger: the first zoxide release whose `db.zo` is
+  no longer updated; then parse the text form and keep `db.zo` as the fallback.
 - tmux session switching inside `ocd` — built during 0.4.0 and cut before
   release (2026-10-19): the maintainer's `wilt` already owns session naming,
   the workspace picker, and state badges, so a second implementation in the

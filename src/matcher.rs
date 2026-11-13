@@ -348,7 +348,7 @@ pub fn completion_candidates(projects: &[Project], prefix: &str) -> Vec<String> 
         .collect();
 
     candidates.sort_by_cached_key(|value| value.to_lowercase());
-    candidates.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    candidates.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
     candidates
 }
 
@@ -988,6 +988,14 @@ mod tests {
 
         let projects = vec![first, second];
         assert_eq!(completion_candidates(&projects, "alp"), vec!["alpha"]);
+
+        let mut sigma = Project::for_test("Σ", live);
+        sigma.aliases.push("σ".into());
+        assert_eq!(
+            completion_candidates(&[sigma], ""),
+            vec!["Σ"],
+            "non-ASCII case folds collapse too"
+        );
     }
 
     #[test]

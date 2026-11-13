@@ -460,7 +460,7 @@ fn draw_input(frame: &mut Frame, area: Rect, picker: &Picker, palette: &Palette)
             UnicodeWidthStr::width(prompt.as_str()) + UnicodeWidthStr::width(text.as_str());
         let x = area
             .x
-            .saturating_add(offset as u16)
+            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX))
             .min(area.right().saturating_sub(1));
         frame.set_cursor_position((x, area.y));
     }
@@ -632,6 +632,50 @@ mod tests {
             "height 2 cannot center; the selection stays visible"
         );
         assert_eq!(window(2, 100, 99), (98, 2), "clamped to the end");
+    }
+
+    fn test_picker() -> Picker {
+        let project = crate::project::Project::for_test("alpha", "/tmp/alpha");
+        Picker::new(vec![project], crate::matcher::MatcherConfig::DEFAULT)
+    }
+
+    #[test]
+    fn a_normal_frame_draws_the_border_and_the_list() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut picker = test_picker();
+        terminal
+            .draw(|frame| draw(frame, &mut picker, None, false, true))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("alpha"), "the list is drawn");
+        assert!(text.contains('┌'), "the border is drawn");
+    }
+
+    #[test]
+    fn a_tiny_frame_drops_the_border_but_keeps_the_status() {
+        let backend = ratatui::backend::TestBackend::new(10, 4);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let mut picker = test_picker();
+        picker.set_status("remove `alpha`? y/N".to_owned(), false);
+        terminal
+            .draw(|frame| draw(frame, &mut picker, None, false, true))
+            .expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!text.contains('┌'), "the border is dropped at four rows");
+        assert!(text.contains("remove"), "the status stays visible");
     }
 
     #[test]

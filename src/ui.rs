@@ -501,6 +501,10 @@ fn rename(store: &SqliteStore, picker: &mut Picker, id: String, name: String, fo
     match result {
         Ok(old_name) => {
             reload(store, picker, Some(&confirmed_id));
+            // The mutation is done; leaving the prompt open would re-send it
+            // on a second Enter. Set the mode before the status: changing
+            // mode clears it.
+            picker.set_mode(picker::Mode::Search);
             picker.set_status(format!("renamed `{old_name}` -> `{name}`"), false);
         }
         Err(Error::NameTaken { name, .. }) => picker.ask_rename_force(confirmed_id, name),
@@ -525,8 +529,8 @@ fn set_term(
         }
     };
 
-    let label = id.to_owned();
-    let id = label.clone();
+    let label = picker.name_of(id);
+    let id = id.to_owned();
     let result = store.update(move |projects| {
         let project = project::revalidate(projects, &id, label)?;
         project::set_term(project, kind, &value, add)
@@ -534,8 +538,12 @@ fn set_term(
 
     match result {
         Ok(message) => {
-            picker.set_status(message, false);
             reload(store, picker, None);
+            // The mutation is done; leaving the prompt open would re-send it
+            // on a second Enter. Set the mode before the status: changing
+            // mode clears it.
+            picker.set_mode(picker::Mode::Search);
+            picker.set_status(message, false);
         }
         Err(err) => picker.set_status(error_status(&err), true),
     }
@@ -1108,17 +1116,28 @@ mod tests {
             picker.status().expect("status").text,
             "renamed `alpha` -> `beta`"
         );
+        assert_eq!(
+            picker.mode(),
+            Mode::Search,
+            "a successful rename closes the prompt"
+        );
     }
 
     #[test]
     fn terms_are_added_and_removed() {
         let (store, _dir) = store_with(vec![project("alpha", "/x/alpha")]);
         let mut picker = picker_with(store.load().unwrap());
+        picker.set_mode(Mode::Prompt);
 
         set_term(&store, &mut picker, TermKind::Alias, "alpha", "a", true);
         assert_eq!(
             picker.status().expect("status").text,
             "added alias `a` to `alpha`"
+        );
+        assert_eq!(
+            picker.mode(),
+            Mode::Search,
+            "a successful mutation closes the prompt"
         );
         assert_eq!(store.load().expect("load")[0].aliases, vec!["a".to_owned()]);
 

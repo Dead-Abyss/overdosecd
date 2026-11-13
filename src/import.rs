@@ -525,6 +525,61 @@ mod tests {
     }
 
     #[test]
+    fn text_stores_tolerate_crlf() {
+        let parsed = parse_autojump(b"10\t/tmp/a\r\n");
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].path, "/tmp/a");
+
+        let parsed = parse_zshz(b"/tmp/b|5|1700000000\r\n");
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.records[0].path, "/tmp/b");
+    }
+
+    #[test]
+    fn zoxide_framing_errors_are_reported() {
+        let path = Path::new("db.zo");
+
+        // Two entries declared, none present.
+        let mut count_over = Vec::new();
+        bincode::serialize_into(&mut count_over, &3u32).expect("version");
+        bincode::serialize_into(&mut count_over, &2u64).expect("count");
+        let err = parse_zoxide(&count_over, path).expect_err("count exceeds the buffer");
+        assert!(
+            err.to_string().contains("entry count exceeds the buffer"),
+            "{err}"
+        );
+
+        // One entry whose declared length runs past the buffer (it still has
+        // to clear the 24-byte-per-entry count guard first).
+        let mut len_over = Vec::new();
+        bincode::serialize_into(&mut len_over, &3u32).expect("version");
+        bincode::serialize_into(&mut len_over, &1u64).expect("count");
+        bincode::serialize_into(&mut len_over, &100u64).expect("len");
+        len_over.extend_from_slice(&[0u8; 24]);
+        let err = parse_zoxide(&len_over, path).expect_err("length exceeds the buffer");
+        assert!(
+            err.to_string().contains("entry length exceeds the buffer"),
+            "{err}"
+        );
+
+        // Trailing bytes after the last entry are tolerated.
+        let mut trailing = zoxide_bytes(&[("/tmp/one", 1.0, 0)]);
+        trailing.extend_from_slice(b"garbage");
+        let parsed = parse_zoxide(&trailing, path).expect("trailing bytes are ignored");
+        assert_eq!(parsed.records.len(), 1);
+
+        // A count exactly at the 24-byte-per-entry bound is accepted.
+        let mut exact = Vec::new();
+        bincode::serialize_into(&mut exact, &3u32).expect("version");
+        bincode::serialize_into(&mut exact, &1u64).expect("count");
+        bincode::serialize_into(&mut exact, &0u64).expect("len");
+        bincode::serialize_into(&mut exact, &1.0f64).expect("rank");
+        bincode::serialize_into(&mut exact, &0u64).expect("epoch");
+        let parsed = parse_zoxide(&exact, path).expect("minimal frame");
+        assert_eq!(parsed.malformed, 1, "an empty path is malformed, not fatal");
+    }
+
+    #[test]
     fn zoxide_records_round_trip_and_corruption_is_an_error() {
         let dirs: Vec<(String, f64, u64)> = vec![
             ("/tmp/one".to_owned(), 12.0, 1_700_000_000),

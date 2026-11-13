@@ -9,10 +9,9 @@ and [README.md](README.md).
 
 ## Current state
 
-0.4.0 (2026-10-19) is the latest release — themes and worktrees. `main` carries
-one unreleased change since that tag: the dependency refresh (rusqlite 0.42,
-bundled SQLite 3.54.1) and the MSRV/toolchain move to 1.100, waiting in the
-`[Unreleased]` CHANGELOG section for 0.4.1.
+0.4.1 (2026-11-13) is the latest release — the dependency refresh (rusqlite
+0.42, bundled SQLite 3.54.1) and the MSRV/toolchain move to 1.100. 0.4.0 added
+themes and worktrees.
 
 The CLI is complete for its original job — index, organize, inspect, jump.
 Everything below adds new capability or pays down an accepted debt.
@@ -46,7 +45,7 @@ stdout or stderr can carry a terminal escape from any stored or live value.
 
 ## Roadmap
 
-Order: v0.4.1 → v0.5.0. Beyond v0.5.0 the roadmap is deliberately empty —
+Order: v0.5.0. Beyond v0.5.0 the roadmap is deliberately empty —
 features enter this file once the maintainer decides they are worth building;
 the backlog below records the only two deferred ideas. The next milestone
 carries a full task list and definition of done; later ones are sketches that
@@ -60,32 +59,6 @@ Recorded so this is not reopened: the matcher's scoring and signal caps
 recorded failure), the `Picker` state machine (wide, not deep), the three
 import parsers, and the hand-rolled `git.rs` (v0.5.0 extends it; it is never
 replaced by `git2`/`gix`/subprocess).
-
-### v0.4.1 — Ship the dependency refresh
-
-Goal: publish what `main` already carries — rusqlite 0.42 (bundled SQLite
-3.54.1) and MSRV 1.100 — without waiting for a feature release, so
-`cargo install overdosecd` produces a build that matches the declared
-toolchain.
-
-Tasks:
-
-- [ ] 1. **Version bump** — `Cargo.toml` to 0.4.1 and retitle the CHANGELOG
-  `[Unreleased]` section to `[0.4.1] - <date>`.
-- [ ] 2. **Release** — `cargo publish --dry-run`, merge, tag `v0.4.1`; the tag
-  runs `release.yml` (crate publish plus the GitHub release from the CHANGELOG
-  section).
-- [ ] 3. **Verify** — crates.io lists 0.4.1, `cargo install overdosecd` builds
-  and runs, the GitHub release notes match the section, then delete the
-  branch.
-
-Definition of done:
-
-- 0.4.1 is on crates.io and installs from source on Rust 1.100.
-- `main` at the tag is identical to the published crate; the release notes are
-  the CHANGELOG section.
-- No behavior change beyond the dependency/MSRV move; the 0.4.0 performance
-  floors still hold.
 
 ### v0.5.0 — Git status & health UI
 

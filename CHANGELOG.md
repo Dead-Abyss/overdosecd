@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-11-15
+
+Bound the remote URL after `insteadOf` rewriting.
+
+### Fixed
+
+- `.git` parsing: a remote URL rewritten by `url.<base>.insteadOf` is
+  length-checked again after the rewrite, so a hostile config can no longer
+  inflate the stored URL past the 8 KiB cap that was enforced only at parse
+  time.
+
 ## [0.4.2] - 2026-11-13
 
 Correctness, safety, and terminal fixes from a full repository audit.

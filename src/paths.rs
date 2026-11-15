@@ -303,19 +303,11 @@ mod tests {
 
             // The whole point of `O_NONBLOCK | O_NOFOLLOW`: a FIFO must be
             // refused without blocking this thread forever.
-            use std::ffi::CString;
-            use std::os::unix::ffi::OsStrExt;
             let fifo = dir.path().join("cache-fifo.json");
-            let raw = CString::new(fifo.as_os_str().as_bytes()).expect("path");
-            // SAFETY: plain `mkfifo(2)` on a fresh temp path.
-            assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0, "mkfifo");
+            make_fifo(&fifo);
             assert!(
                 read_rebuildable_json::<serde_json::Value>(&fifo, 1024).is_none(),
                 "a FIFO is absent, not a blocking read"
-            );
-            assert!(
-                open_regular_io(&fifo, 1024).expect("open").is_none(),
-                "a FIFO is not a regular file"
             );
         }
 
@@ -324,38 +316,52 @@ mod tests {
             read_rebuildable_json::<serde_json::Value>(&path, 4).is_none(),
             "a file over the cap is absent"
         );
+    }
 
-        #[cfg(unix)]
-        {
-            // The relaxed variant (for `.git`/include files) follows a
-            // symlink to a small regular file but still refuses a FIFO and an
-            // over-cap target.
-            let target = dir.path().join("target.json");
-            std::fs::write(&target, b"ok").expect("target");
-            let link = dir.path().join("target-link");
-            std::os::unix::fs::symlink(&target, &link).expect("symlink");
-            assert!(
-                open_follow_io(&link, 1024).expect("open").is_some(),
-                "a symlinked regular file is followed"
-            );
-            assert!(
-                open_follow_io(&target, 1).expect("open").is_none(),
-                "an over-cap target is refused"
-            );
+    /// A plain `mkfifo(2)` on a fresh temp path.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
 
-            use std::ffi::CString;
-            use std::os::unix::ffi::OsStrExt;
-            let fifo = dir.path().join("follow-fifo");
-            let raw = CString::new(fifo.as_os_str().as_bytes()).expect("path");
-            // SAFETY: plain `mkfifo(2)` on a fresh temp path.
-            assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0, "mkfifo");
-            let fifo_link = dir.path().join("follow-fifo-link");
-            std::os::unix::fs::symlink(&fifo, &fifo_link).expect("symlink");
-            assert!(
-                open_follow_io(&fifo_link, 1024).expect("open").is_none(),
-                "a symlink to a FIFO is not a regular file"
-            );
-        }
+        let raw = CString::new(path.as_os_str().as_bytes()).expect("path");
+        // SAFETY: the path is a fresh temp file name.
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0, "mkfifo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_follow_io_follows_symlinks_but_refuses_special_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A symlinked small regular file is followed (dotfile managers do
+        // this to `.git`/`include.path`); the type and size are still checked
+        // on the followed target.
+        let target = dir.path().join("target.json");
+        std::fs::write(&target, b"ok").expect("target");
+        let link = dir.path().join("target-link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(
+            open_follow_io(&link, 1024).expect("open").is_some(),
+            "a symlinked regular file is followed"
+        );
+        assert!(
+            open_follow_io(&link, 1).expect("open").is_none(),
+            "an over-cap followed target is refused"
+        );
+
+        let fifo = dir.path().join("follow-fifo");
+        make_fifo(&fifo);
+        let fifo_link = dir.path().join("follow-fifo-link");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).expect("symlink");
+        assert!(
+            open_follow_io(&fifo_link, 1024).expect("open").is_none(),
+            "a symlink to a FIFO is not a regular file"
+        );
+        assert!(
+            open_regular_io(&fifo, 1024).expect("open").is_none(),
+            "the strict variant refuses a FIFO without blocking"
+        );
     }
 
     #[test]

@@ -58,8 +58,18 @@ fn run_with(data_dir: &Path, save: &dyn Fn(PathBuf, &[Project]) -> Result<()>) -
     // live JSON" behind, which every later command reports as
     // `MigrationClash` — permanently. Now a failed save simply puts the JSON
     // back and the migration is retryable.
+    //
+    // The marker narrows what a crash can hide: it exists only while the JSON
+    // is renamed aside and the database is not yet populated, so startup can
+    // tell that state apart from a legitimately empty index.
+    let marker = marker_path(data_dir);
+    fs::write(&marker, b"migrating\n")?;
+
     let backup = paths::sibling_backup(&json_path, "migrated");
-    fs::rename(&json_path, &backup)?;
+    if let Err(err) = fs::rename(&json_path, &backup) {
+        let _ = fs::remove_file(&marker);
+        return Err(err.into());
+    }
 
     if let Err(err) = save(db_path, &projects) {
         // Best effort: restore the original name so the next run retries.
@@ -70,13 +80,22 @@ fn run_with(data_dir: &Path, save: &dyn Fn(PathBuf, &[Project]) -> Result<()>) -
                 backup.display()
             )));
         }
+        let _ = fs::remove_file(&marker);
         return Err(err);
     }
 
+    // The database is populated; the marker has served its purpose. A failed
+    // removal is harmless: the recovery check only fires for an *empty* index.
+    let _ = fs::remove_file(&marker);
     Ok(Outcome::Migrated {
         projects: count,
         backup,
     })
+}
+
+/// The transient marker written during `run`'s rename window.
+fn marker_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("projects.json.migrating")
 }
 
 /// The startup one-shot: migrates a `projects.json` left by 0.2.0 before any
@@ -85,20 +104,23 @@ fn run_with(data_dir: &Path, save: &dyn Fn(PathBuf, &[Project]) -> Result<()>) -
 /// A corrupt legacy file is quarantined by [`read_legacy`] and the error is
 /// returned; a clash with a populated database is [`Error::MigrationClash`].
 ///
-/// A crash between "move the JSON aside" and "write the database" leaves no
-/// live JSON and no database — which used to read as an empty index, silently.
-/// A leftover `projects.json.migrated-*` backup with no index at all is
-/// reported instead, so the data is findable.
+/// A crash while the migration marker exists leaves no live JSON and an empty
+/// (or missing) database — which used to read as an empty index, silently.
+/// That state is reported instead, so the backup is findable.
 pub fn auto(data_dir: &Path) -> Result<Option<Outcome>> {
     if !paths::store_file(data_dir).exists() {
-        if !paths::sqlite_file(data_dir).exists()
+        if marker_path(data_dir).exists()
             && let Some(backup) = interrupted_backup(data_dir)
         {
-            return Err(Error::Storage(format!(
-                "no index found, but {} holds a migrated copy; rename it back to {} to recover (or remove it to start empty)",
-                backup.display(),
-                paths::store_file(data_dir).display()
-            )));
+            let db = paths::sqlite_file(data_dir);
+            let empty = !db.exists() || SqliteStore::new(db).is_empty().unwrap_or(true);
+            if empty {
+                return Err(Error::Storage(format!(
+                    "an interrupted migration left no index; {} holds a migrated copy — rename it back to {} to recover (or remove it to start empty)",
+                    backup.display(),
+                    paths::store_file(data_dir).display()
+                )));
+            }
         }
         return Ok(None);
     }
@@ -157,11 +179,42 @@ mod tests {
         let dir = directory();
         let backup = paths::sibling_backup(&paths::store_file(dir.path()), "migrated");
         fs::write(&backup, "[]").expect("write backup");
-        let err = auto(dir.path()).expect_err("no index, but a backup exists");
+        // The crash state: the marker exists, the JSON was moved aside, and
+        // the database is absent (or schema-only).
+        fs::write(marker_path(dir.path()), b"migrating\n").expect("write marker");
+        SqliteStore::new(paths::sqlite_file(dir.path()))
+            .save(&[])
+            .expect("schema-only database");
+
+        let err = auto(dir.path()).expect_err("an interrupted migration is loud");
+        let rendered = err.to_string();
         assert!(
-            err.to_string().contains("migrated copy"),
-            "the message must name the recovery path: {err}"
+            rendered.contains(&backup.display().to_string()),
+            "the message must name the backup to restore: {rendered}"
         );
+        assert!(
+            rendered.contains("interrupted"),
+            "the message must say what happened: {rendered}"
+        );
+
+        // Without the marker it is just a (legitimately) empty index.
+        fs::remove_file(marker_path(dir.path())).expect("remove marker");
+        assert!(
+            auto(dir.path()).expect("quiet again").is_none(),
+            "an empty index with an old backup is not an interrupted migration"
+        );
+    }
+
+    #[test]
+    fn a_successful_migration_clears_the_marker() {
+        let dir = directory();
+        write_json(dir.path(), &[project("alpha")]);
+        run(dir.path()).expect("migrate");
+        assert!(
+            !marker_path(dir.path()).exists(),
+            "the transient marker must not survive a successful migration"
+        );
+        assert!(auto(dir.path()).expect("quiet").is_none());
     }
 
     #[test]

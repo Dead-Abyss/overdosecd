@@ -9,7 +9,7 @@
 //! that never answers must not hang the picker.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -125,30 +125,13 @@ fn query_cursor_position(tty: &mut File) -> io::Result<Option<Position>> {
     drain_queued(tty);
 
     // A full output queue (Ctrl-S flow control) is backpressure, not a dead
-    // terminal: retry the remaining bytes under a deadline instead of
-    // abandoning a partial `ESC [ 6 n` in the terminal's parser.
-    let query = b"\x1b[6n";
+    // terminal: retry the remaining bytes under the shared query deadline
+    // instead of abandoning a partial `ESC [ 6 n` in its parser.
     let deadline = Instant::now() + CURSOR_QUERY_TIMEOUT;
-    let mut written = 0;
-    while written < query.len() {
-        match tty.write(&query[written..]) {
-            Ok(0) => return Ok(None),
-            Ok(count) => written += count,
-            Err(err)
-                if err.kind() == io::ErrorKind::WouldBlock
-                    || err.kind() == io::ErrorKind::Interrupted =>
-            {
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                thread::sleep(Duration::from_millis(2));
-            }
-            Err(err) => return Err(err),
-        }
+    if !write_query(tty, deadline)? {
+        return Ok(None);
     }
-    tty.flush()?;
 
-    let deadline = Instant::now() + CURSOR_QUERY_TIMEOUT;
     let mut reply = Vec::with_capacity(MAX_REPORT_BYTES);
     let mut byte = [0u8; 1];
     let mut saw_report = false;
@@ -179,6 +162,34 @@ fn query_cursor_position(tty: &mut File) -> io::Result<Option<Position>> {
     } else {
         None
     })
+}
+
+/// Writes `ESC [ 6 n`, retrying a non-blocking writer until `deadline`.
+///
+/// Returns `false` when the whole sequence could not be written in time (or
+/// the handle closed); the caller then treats the query as unanswered, so a
+/// flow-controlled terminal degrades to the fallback anchor.
+fn write_query(tty: &mut impl std::io::Write, deadline: Instant) -> io::Result<bool> {
+    let query = b"\x1b[6n";
+    let mut written = 0;
+    while written < query.len() {
+        match tty.write(&query[written..]) {
+            Ok(0) => return Ok(false),
+            Ok(count) => written += count,
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::Interrupted =>
+            {
+                if Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    tty.flush()?;
+    Ok(true)
 }
 
 /// Reads and discards up to one report's worth of bytes already queued on the
@@ -285,5 +296,57 @@ mod tests {
                 assert_eq!(parsed, None, "reply: {reply:?}");
             }
         }
+    }
+
+    /// A writer that reports backpressure for the first `stalls` calls, then
+    /// accepts at most `chunk` bytes per call.
+    struct FlakyWriter {
+        stalls: usize,
+        chunk: usize,
+        out: Vec<u8>,
+    }
+
+    impl std::io::Write for FlakyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.stalls > 0 {
+                self.stalls -= 1;
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            let count = buf.len().min(self.chunk);
+            self.out.extend_from_slice(&buf[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_query_write_survives_backpressure() {
+        let mut writer = FlakyWriter {
+            stalls: 2,
+            chunk: 2,
+            out: Vec::new(),
+        };
+        assert!(
+            write_query(&mut writer, Instant::now() + Duration::from_secs(1)).expect("write"),
+            "a partial write is retried to completion"
+        );
+        assert_eq!(
+            writer.out, b"\x1b[6n",
+            "no truncated escape is left in the parser"
+        );
+
+        let mut stalled = FlakyWriter {
+            stalls: usize::MAX,
+            chunk: 1,
+            out: Vec::new(),
+        };
+        assert!(
+            !write_query(&mut stalled, Instant::now()).expect("timeout is not an error"),
+            "an expired deadline means the query is unanswered"
+        );
+        assert!(stalled.out.is_empty(), "nothing partial is written");
     }
 }

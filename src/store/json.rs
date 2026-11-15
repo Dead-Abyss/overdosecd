@@ -198,6 +198,41 @@ mod tests {
     }
 
     #[test]
+    fn an_undecodable_file_is_quarantined_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("projects.json");
+        // Invalid UTF-8: as broken as unparsable JSON, and it used to stay in
+        // place and fail every later startup.
+        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+
+        let err = read_legacy(&path).unwrap_err();
+        assert!(err.to_string().contains("moved to"), "error: {err}");
+        assert!(!path.exists(), "the undecodable file is moved aside");
+        let quarantined = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("projects.json.corrupt-")
+            })
+            .count();
+        assert_eq!(quarantined, 1, "one forensic copy");
+        assert!(read_legacy(&path).is_ok(), "the next run starts clean");
+    }
+
+    #[test]
+    fn a_directory_at_the_legacy_path_is_quarantined() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("projects.json");
+        fs::create_dir(&path).unwrap();
+        let err = read_legacy(&path).unwrap_err();
+        assert!(err.to_string().contains("moved to"), "error: {err}");
+        assert!(!path.exists(), "the directory is moved aside, not read");
+    }
+
+    #[test]
     fn newer_file_version_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("projects.json");

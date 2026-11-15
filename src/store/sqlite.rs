@@ -366,18 +366,31 @@ impl SqliteStore {
         }
     }
 
-    /// `VACUUM INTO` a fresh sibling copy of the database. `sibling_backup`
-    /// only *suggests* a name, so two first opens in the same second can pick
-    /// the same one; the loser retries with the suffix the winner's copy now
-    /// forces (bounded, so a stuck file cannot loop forever).
+    /// `VACUUM INTO` a fresh sibling copy of the database.
+    ///
+    /// The name carries this process's pid: two first opens (the `ocd` wrapper
+    /// racing the cd hook) can never suggest the same target, so a failed
+    /// `VACUUM` is the real error and the partial file it may have started is
+    /// provably ours to remove.
     fn consistent_copy(&self, conn: &Connection, from: u32) -> Result<PathBuf> {
-        for _ in 0..8 {
-            let backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
-            // `VACUUM INTO` refuses an existing target. If the suggested name
-            // is already taken, that is a lost naming race and the next
-            // suggestion is retried; a target that did *not* exist and still
-            // failed (disk full, unsupported) is the real error.
+        let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let name = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "projects.db".to_owned());
+        for suffix in 0..8 {
+            let numbered = if suffix == 0 {
+                String::new()
+            } else {
+                format!("-{suffix}")
+            };
+            let backup = self.path.with_file_name(format!(
+                "{name}.v{from}-{stamp}-{pid}{numbered}",
+                pid = std::process::id()
+            ));
             if backup.exists() {
+                // A leftover from a recycled pid, or a crashed earlier run.
                 continue;
             }
             let Some(target) = backup.to_str() else {
@@ -388,14 +401,8 @@ impl SqliteStore {
             match conn.execute("VACUUM INTO ?1", [target]) {
                 Ok(_) => return Ok(backup),
                 Err(err) => {
-                    // Two first opens can pick the same suggested name; the
-                    // loser must retry, not remove the winner's copy (which
-                    // exists but was not created by this process).
-                    if err.to_string().contains("output file already exists") {
-                        continue;
-                    }
-                    // Otherwise the failure is real; a partial file this
-                    // process started is not a usable forensic copy.
+                    // A failed VACUUM (disk full, unsupported) may have left a
+                    // partial file; it is not a usable forensic copy.
                     let _ = std::fs::remove_file(&backup);
                     return Err(self.map_rusqlite(err));
                 }

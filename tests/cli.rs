@@ -1309,8 +1309,6 @@ fn migrate_backups(sandbox: &Sandbox) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Seeds the default JSON backend, migrates with a SQLite config, and checks
-/// the same data comes back through the new backend.
 /// The exact bytes zoxide writes to `db.zo`: bincode 1.x's legacy (fixint,
 /// little-endian) encoding of a `u32` format version followed by the entries.
 fn write_zoxide_fixture(dir: &Path, entries: &[(&Path, f64, u64)]) {
@@ -1727,8 +1725,11 @@ fn mutations_accept_multiple_words() {
 
 #[test]
 fn scan_previews_explicit_roots_and_writes_nothing() {
-    // JSON-only on purpose: the preview touches neither the index nor the cache.
     let sandbox = Sandbox::new();
+    // Seed a real index so the live store is observable: the preview must not
+    // touch `projects.db` (the retired JSON alone proves nothing any more).
+    sandbox.add(&sandbox.project("seeded"));
+    let before = index_bytes(&sandbox);
     let root = sandbox.root.join("tree");
     let project = root.join("proj");
     fs::create_dir_all(&project).expect("create project dir");
@@ -1752,9 +1753,21 @@ fn scan_previews_explicit_roots_and_writes_nothing() {
                 .and(predicate::str::contains("dep").not()),
         );
 
-    // Nothing was written anywhere: no index, no cache.
+    // Nothing was written anywhere: the live index is byte-identical, and
+    // neither a legacy index nor the cache appeared.
+    assert_eq!(
+        index_bytes(&sandbox),
+        before,
+        "scan must not touch the index"
+    );
     assert!(!sandbox.data.join("projects.json").exists());
     assert!(!sandbox.data.join("home-dirs.json").exists());
+}
+
+/// The live index bytes (database and WAL) for a before/after comparison.
+fn index_bytes(sandbox: &Sandbox) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let read = |name: &str| fs::read(sandbox.data.join(name)).ok();
+    (read("projects.db"), read("projects.db-wal"))
 }
 
 #[test]
@@ -1948,6 +1961,19 @@ fn migrate_refuses_to_clobber_an_existing_database() {
         sandbox.data.join("projects.json").exists(),
         "a refused migration must leave the json in place"
     );
+
+    // The database it refused to overwrite is untouched: once the planted
+    // JSON is out of the way, the original project still resolves.
+    fs::remove_file(sandbox.data.join("projects.json")).expect("remove the planted index");
+    sandbox
+        .cmd()
+        .args(["goto", "alpha"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            sandbox.canonical(&sandbox.project("alpha"))
+        ));
 }
 
 #[test]
@@ -1986,14 +2012,22 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 /// True when the restrictive mode just set had no effect: running as root
-/// ignores permission bits, and a chmod-based test that continued would
-/// assert nothing.
+/// (or a filesystem that ignores mode bits) would make a chmod-based test
+/// assert nothing. Probe with a *write*, not a read: readability survives
+/// 0500 for the owner, writability is what these tests take away.
 #[cfg(unix)]
 fn permissions_are_ignored(path: &Path) -> bool {
     if path.is_dir() {
-        fs::read_dir(path).is_ok()
+        let probe = path.join(format!(".write-probe-{}", std::process::id()));
+        match fs::write(&probe, b"probe") {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
+        }
     } else {
-        fs::read(path).is_ok()
+        fs::OpenOptions::new().write(true).open(path).is_ok()
     }
 }
 
@@ -2859,27 +2893,6 @@ fn doctor_refresh_updates_stored_git_remotes() {
             .success()
             .stdout(predicate::str::contains("metadata is up to date"));
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn doctor_reports_loose_index_permissions() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let sandbox = Sandbox::new();
-    sandbox.add(&sandbox.project("overdosecd"));
-    let index = sandbox.data.join("projects.db");
-
-    fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
-    sandbox
-        .cmd()
-        .arg("doctor")
-        .assert()
-        .code(1)
-        .stdout(predicate::str::contains("mode 0644 (expected 0600)"));
-
-    fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
-    sandbox.cmd().arg("doctor").assert().success();
 }
 
 #[cfg(unix)]

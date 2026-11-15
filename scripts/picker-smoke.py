@@ -93,9 +93,6 @@ class Screen:
     def lines(self):
         return ["".join(row).rstrip() for row in self.grid]
 
-    def text(self):
-        return "\n".join(self.lines())
-
     def _escape_end(self, text, start):
         """The index just past the escape sequence at `start`, or None when
         the sequence is not complete yet."""
@@ -210,7 +207,10 @@ class Harness:
         return rows
 
     def by_name(self, name):
-        return next(p for p in self.index() if p["name"] == name)
+        for project in self.index():
+            if project["name"] == name:
+                return project
+        raise AssertionError(f"no indexed project named {name!r}")
 
     def run(
         self,
@@ -236,7 +236,8 @@ class Harness:
         With `answer_queries=False`, the emulated terminal stays silent and the
         picker must survive on its fallback anchor.
         """
-        out_path = tempfile.mktemp(dir=self.root)
+        out_fd, out_path = tempfile.mkstemp(dir=self.root)
+        os.close(out_fd)
         pid, fd = pty.fork()
         if pid == 0:
             # Deterministic pane geometry: rows=30, cols=100.
@@ -332,8 +333,11 @@ class Harness:
                     if snapshot_at is not None and index + 1 == snapshot_at:
                         pump(0.3)
                         self.snapshot = self.screen.lines()
-            except OSError:
-                pass
+            except OSError as err:
+                # A dead/broken pty would otherwise silently drop every later
+                # key and fail the scenario much later with an unrelated
+                # assertion; record the real reason instead.
+                return None, f"WRITE FAILED: {err}", pty_bytes
             if signal_at is not None:
                 try:
                     pump(0.2)
@@ -352,6 +356,7 @@ class Harness:
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
             self.final_screen = self.screen.lines()
+            os.close(fd)
             return None, "TIMEOUT", pty_bytes
 
         # The child is gone: drain whatever it left on the pty instead of
@@ -372,7 +377,10 @@ class Harness:
 
         self.final_screen = self.screen.lines()
         with open(out_path) as handle:
-            return os.waitstatus_to_exitcode(status), handle.read(), pty_bytes
+            result = os.waitstatus_to_exitcode(status), handle.read(), pty_bytes
+        # The master fd is a descriptor, not garbage: close it on every path.
+        os.close(fd)
+        return result
 
     def screen_has(self, needle, lines=None):
         """Whether the emulated screen (final by default) shows `needle`."""
@@ -547,6 +555,14 @@ class Harness:
         self.check(
             "wheel scrolls the list",
             code == 0 and out == gamma + "\n",
+            f"code={code} out={out!r}",
+        )
+
+        self.setup(mouse_setup)
+        code, out, _ = self.run([binary, "ui"], [WHEEL_DOWN, WHEEL_DOWN, WHEEL_UP, b"\r"])
+        self.check(
+            "wheel up scrolls back",
+            code == 0 and out == alpha + "\n",
             f"code={code} out={out!r}",
         )
 

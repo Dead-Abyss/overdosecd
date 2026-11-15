@@ -9,8 +9,9 @@
 //! Run with `cargo bench`; the recorded numbers live in `plan.md` and
 //! `CHANGELOG.md`.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use chrono::{DateTime, Duration, Utc};
@@ -34,6 +35,8 @@ struct Fixture {
     bin: PathBuf,
     /// The name of the project at `count / 2`, used for exact-match benches.
     exact: String,
+    /// How many projects the fixture holds.
+    count: usize,
 }
 
 /// On-disk envelope of `projects.json`, mirroring `store::json::StoreFile`.
@@ -57,6 +60,9 @@ struct FixtureProject {
     use_count: u64,
     pinned: bool,
     git: Option<FixtureGit>,
+    kind: String,
+    env: BTreeMap<String, String>,
+    enter_cmd: Option<String>,
 }
 
 /// Mirror of `project::GitInfo`; no real `.git` directory is needed because
@@ -106,6 +112,9 @@ impl Fixture {
                     remote_name: Some("origin".to_owned()),
                     remote_url: Some(format!("git@github.com:dead-abyss/proj-{index:05}.git")),
                 }),
+                kind: "unknown".to_owned(),
+                env: BTreeMap::new(),
+                enter_cmd: None,
             });
         }
 
@@ -120,6 +129,7 @@ impl Fixture {
         let fixture = Self {
             bin: PathBuf::from(env!("CARGO_BIN_EXE_overdosecd")),
             exact: format!("proj-{:05}", count / 2),
+            count,
             data_dir,
             root,
         };
@@ -138,29 +148,99 @@ impl Fixture {
     /// Fails loudly when the fixture does not round-trip, so a silently
     /// quarantined index cannot turn every benchmark into an error path.
     fn sanity_check(&self) {
-        let output = self.run(&["goto", &self.exact, "--no-track"]);
-        assert!(
-            output.status.success(),
-            "fixture sanity check failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+        let output = checked(
+            self.run(&["goto", &self.exact, "--no-track"]),
+            "fixture goto",
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains(&self.exact),
             "expected the exact query to resolve, got: {stdout}"
         );
+        // A partially migrated fixture would still resolve one exact match;
+        // the row count proves every project landed.
+        let listed = checked(self.run(&["list", "--all"]), "fixture list");
+        let lines = String::from_utf8_lossy(&listed.stdout).lines().count();
+        assert_eq!(
+            lines,
+            self.count + 1,
+            "the fixture must hold every project plus the header"
+        );
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(&self.bin)
-            .args(args)
+    /// Runs the binary with the fixture's environment.
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.bin);
+        command
             .env("OVERDOSECD_DATA_DIR", &self.data_dir)
             .env("HOME", self.root.path())
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("NO_COLOR", "1")
-            .stdin(Stdio::null())
+            .stdin(Stdio::null());
+        command
+    }
+
+    /// A private copy of the index a mutating bench can write to, so the
+    /// measured iterations do not drift the fixture they measure.
+    fn fresh_data_dir(&self) -> PathBuf {
+        let dir = self.root.path().join("mutable");
+        remove_dir_if_present(&dir);
+        fs::create_dir_all(&dir).expect("create mutable data dir");
+        for suffix in ["", "-wal", "-shm"] {
+            let mut from = self.data_dir.join("projects.db").into_os_string();
+            from.push(suffix);
+            let from = PathBuf::from(from);
+            if from.exists() {
+                let mut to = dir.join("projects.db").into_os_string();
+                to.push(suffix);
+                fs::copy(&from, PathBuf::from(to)).expect("copy the bench index");
+            }
+        }
+        dir
+    }
+
+    /// [`Self::run`] against an explicit data directory (the mutable copy).
+    fn run_in(&self, data_dir: &Path, args: &[&str]) -> Output {
+        self.command()
+            .env("OVERDOSECD_DATA_DIR", data_dir)
+            .args(args)
             .output()
             .expect("run overdosecd")
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().expect("run overdosecd")
+    }
+}
+
+/// Fails loudly when the binary did not succeed: a silently failing command
+/// would make the "faster" error path look like a benchmark win.
+fn checked(output: Output, what: &str) -> Output {
+    assert!(
+        output.status.success(),
+        "{what} failed (status {:?}): {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+/// Removes a stale database file, but only tolerates "already gone": a
+/// permission or mount error must fail the bench, not silently measure the
+/// idempotent "nothing new" path.
+fn remove_file_if_present(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => panic!("could not remove {}: {err}", path.display()),
+    }
+}
+
+fn remove_dir_if_present(path: &Path) {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => panic!("could not remove {}: {err}", path.display()),
     }
 }
 
@@ -179,25 +259,60 @@ fn bench_cli(c: &mut Criterion) {
         }
 
         group.bench_function("list", |b| {
-            b.iter(|| fixture.run(&["list"]));
+            b.iter(|| checked(fixture.run(&["list"]), "list"));
         });
         group.bench_function("goto-exact-no-track", |b| {
-            b.iter(|| fixture.run(&["goto", &fixture.exact, "--no-track"]));
+            b.iter(|| {
+                checked(
+                    fixture.run(&["goto", &fixture.exact, "--no-track"]),
+                    "goto exact",
+                )
+            });
         });
         group.bench_function("goto-prefix-no-track", |b| {
-            b.iter(|| fixture.run(&["goto", PREFIX_QUERY, "--no-track"]));
+            b.iter(|| {
+                checked(
+                    fixture.run(&["goto", PREFIX_QUERY, "--no-track"]),
+                    "goto prefix",
+                )
+            });
         });
         group.bench_function("goto-no-match-no-track", |b| {
-            b.iter(|| fixture.run(&["goto", NO_MATCH_QUERY, "--no-track"]));
+            b.iter(|| {
+                checked(
+                    fixture.run(&["goto", NO_MATCH_QUERY, "--no-track"]),
+                    "goto no-match",
+                )
+            });
         });
         // The tracked jump is the mutation budget: one row update plus a
-        // usage row, under the write lock.
-        group.bench_function("goto-exact-tracked", |b| {
-            b.iter(|| fixture.run(&["goto", &fixture.exact]));
-        });
+        // usage row, under the write lock. It mutates its index, so run it
+        // against a fresh copy per iteration (a 100k copy per iteration would
+        // dominate the measured operation, so that size keeps the shortcut and
+        // the drift is a bounded single-row update).
+        if count == largest {
+            // shortcut: the 100k tracked bench measures against a drifting
+            // index; only use_count/last_used_at and one usage row change.
+            group.bench_function("goto-exact-tracked", |b| {
+                b.iter(|| checked(fixture.run(&["goto", &fixture.exact]), "goto tracked"));
+            });
+        } else {
+            group.bench_function("goto-exact-tracked", |b| {
+                b.iter_batched(
+                    || fixture.fresh_data_dir(),
+                    |data_dir| {
+                        checked(
+                            fixture.run_in(&data_dir, &["goto", &fixture.exact]),
+                            "goto tracked",
+                        )
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
         // One TAB press: the completion helper stats every project.
         group.bench_function("complete", |b| {
-            b.iter(|| fixture.run(&["complete", "proj"]));
+            b.iter(|| checked(fixture.run(&["complete", "proj"]), "complete"));
         });
 
         group.finish();
@@ -232,26 +347,17 @@ fn bench_import(c: &mut Criterion) {
                 for suffix in ["", "-wal", "-shm", "-journal"] {
                     let mut name = fixture.data_dir.join("projects.db").into_os_string();
                     name.push(suffix);
-                    let _ = fs::remove_file(PathBuf::from(name));
+                    remove_file_if_present(&PathBuf::from(name));
                 }
             },
             |()| {
-                let output = Command::new(&fixture.bin)
-                    .args(["import", "autojump"])
-                    .env("OVERDOSECD_DATA_DIR", &fixture.data_dir)
+                let output = fixture
+                    .command()
                     .env("AUTOJUMP_DATA_DIR", &store)
-                    .env("HOME", fixture.root.path())
-                    .env("XDG_CONFIG_HOME", fixture.root.path().join("config"))
-                    .env("NO_COLOR", "1")
-                    .stdin(Stdio::null())
+                    .args(["import", "autojump"])
                     .output()
                     .expect("run import");
-                assert!(
-                    output.status.success(),
-                    "import failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                output
+                checked(output, "import autojump")
             },
             BatchSize::SmallInput,
         );

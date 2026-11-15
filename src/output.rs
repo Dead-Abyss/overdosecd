@@ -175,7 +175,12 @@ pub fn completion_script(shell: Shell) -> String {
     let generator: clap_complete::Shell = shell.into();
     let mut script = Vec::new();
     clap_complete::generate(generator, &mut command, name, &mut script);
-    String::from_utf8(script).expect("clap_complete emits UTF-8")
+    // `clap_complete` writes text, so this cannot fail; a normal command path
+    // must not panic even if that ever changes.
+    match String::from_utf8(script) {
+        Ok(script) => script,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    }
 }
 
 /// Subcommands and flags the wrapper forwards to the binary instead of

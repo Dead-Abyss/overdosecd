@@ -18,6 +18,10 @@ refresh (rusqlite 0.42, bundled SQLite 3.54.1) and the MSRV/toolchain move to
 The CLI is complete for its original job — index, organize, inspect, jump.
 Everything below adds new capability or pays down an accepted debt.
 
+Unreleased on `fix/ocr-full-scan-2026-11`: the fixes for the full-repository
+review (OCR session `3c611478`, 154 findings). See CHANGELOG.md for the
+user-visible list; the review triage lives in the branch history.
+
 ## Guiding principles
 
 - **Local-first**: no cloud, no account, no telemetry.
@@ -164,6 +168,18 @@ Definition of done:
   database plus the switch is code execution on the next wrapper jump —
   accepted, because the switch and the display notice are the boundary
   (SECURITY.md).
+- The output funnel's SGR whitelist is the set `colored`/the theme can emit
+  (colours, bold/dim, resets): blink, conceal, reverse, underline and strike
+  are foreign even well-formed, because hiding or inverting text is exactly
+  what a leaked value wants.
+- Palette `j`/`k` are navigation, not query characters (documented as a
+  `shortcut:`): consistency with every other view wins over filtering on two
+  more letters.
+- `SqliteStore::update` detects changed rows with a 64-bit fingerprint instead
+  of deep-cloning the index; a collision can only skip one row's rewrite
+  (never corrupt another row), and every mutation re-verifies by id anyway.
+- The cd hook's visit counters take a non-blocking `flock` on a dedicated
+  lock file and fail open: losing one visit beats blocking a `cd`.
 
 ## Known limitations
 

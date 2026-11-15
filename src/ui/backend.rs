@@ -37,7 +37,7 @@ pub struct TtyBackend {
 }
 
 impl TtyBackend {
-    pub fn new(drawing: File, query: File) -> Self {
+    pub(crate) fn new(drawing: File, query: File) -> Self {
         Self {
             inner: CrosstermBackend::new(drawing),
             query,

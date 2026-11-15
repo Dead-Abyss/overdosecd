@@ -193,7 +193,8 @@ fn parse_zoxide(bytes: &[u8], path: &Path) -> Result<Parsed> {
         if len > (bytes.len() - at) as u64 {
             return Err(corrupted("entry length exceeds the buffer"));
         }
-        let raw = take(bytes, &mut at, len as usize).expect("bounds checked above");
+        let raw = take(bytes, &mut at, len as usize)
+            .ok_or_else(|| corrupted("entry length exceeds the buffer"))?;
         let rank = take_f64(bytes, &mut at).ok_or_else(|| corrupted("missing rank"))?;
         let last = take_u64(bytes, &mut at).ok_or_else(|| corrupted("missing timestamp"))?;
         match std::str::from_utf8(raw) {

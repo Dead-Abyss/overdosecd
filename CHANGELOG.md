@@ -4,6 +4,78 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Full-repository review fixes (OCR session `3c611478`): 154 findings triaged,
+every confirmed defect fixed in one branch.
+
+### Fixed
+
+- A failed migration is retryable: the legacy `projects.json` moves aside
+  before the database is written and is restored if the write fails, instead
+  of leaving "populated database + live JSON" behind (a permanent
+  `MigrationClash` for every later command).
+- The cd hook can no longer be poisoned by one non-UTF-8 directory: such a
+  visit is skipped, the counters keep persisting, future timestamps are
+  clamped on load, and the read-modify-write is serialized with `flock` so two
+  shells' jumps cannot lose an update.
+- Configuration: `[matching]` weights and `discovery.max_entries` have upper
+  bounds (an absurd value used to overflow a debug build and silently invert
+  the ranking in release), and scoring saturates as defense in depth;
+  `--min-score` refuses `NaN`/`inf`; `color+12` is no longer a valid color.
+- The output funnel now fails closed for every dangerous class: leaked `CR`,
+  `TAB`, newlines on line-oriented sinks, DEL, C1 controls, bidi marks
+  (`U+061C` included) and invisible characters are refused, and only the SGR
+  parameters `colored`/the theme emit pass (blink, conceal, reverse,
+  underline and strike are foreign).
+- The picker no longer stats every visible row per frame (the missing cache is
+  filled on every refilter), honours hide-missing for typed queries too, keeps
+  marks when a home row is highlighted, clamps the highlight when home results
+  are cleared, and every detail-pane line clips to the pane's fixed height.
+- The cursor-position query drains stale reports before asking, parses the
+  last complete report, and surfaces real I/O errors instead of anchoring as
+  if the terminal had simply not answered.
+- `doctor --fix` escapes the relocation target it echoes; health rows sanitize
+  their labels; `goto`/`ui`/`print_path` refuse a non-UTF-8 path instead of
+  printing a lossy one.
+- `add --force` can no longer steal another project's name and keeps the
+  stored remote when detection yields `None`; `project::insert` normalizes
+  name/aliases/tags for every caller; `~` expansion no longer round-trips
+  through `to_string_lossy`.
+- `.git` reads open with `O_NOFOLLOW|O_NONBLOCK` and check the handle (a
+  swapped-in FIFO can no longer block), `HEAD` contributes only its first
+  line, branch names are capped, `[core "x"]` no longer counts as
+  `core.bare`, the worktree listing is bounded, and include reads are capped
+  by the remaining byte budget.
+- Import: a directory with no derivable name is counted as `unnameable` while
+  planning, git/kind detection runs only for entries that survive `--limit`,
+  and the under-lock re-verify uses a set instead of a full scan.
+- The picker's cursor query no longer desyncs the terminal, and the worktree
+  `name:branch` fast path checks that the checkout still exists.
+- Shell completion dies only on a real stat for projects with a matching
+  candidate; the `owner/repo` slug comparison no longer allocates per term.
+- `cargo package` no longer ships the test suite, scripts, and CI files;
+  release re-runs from the same tag skip an already-uploaded version and an
+  existing GitHub release; the MSRV check parses `Cargo.toml` with
+  `tomllib` and fails loudly when the field is missing.
+
+### Changed
+
+- The direct `signal-hook` dependency is replaced by `signal-hook-registry`
+  (both 0.3/0.4 majors in the graph share it), and `libc` is a single unix
+  runtime dependency for `flock(2)`.
+- `completions` now runs before the strict config load, like `init`.
+- Palette `j`/`k` stay navigation on purpose (documented as `shortcut:`), so
+  the palette query cannot contain those two letters.
+- `list --json` keeps pretty-printing through the raw output sink.
+
+### Performance
+
+- `SqliteStore::update` diffs against per-row fingerprints instead of
+  deep-cloning the whole index; the migration checks emptiness with one
+  `EXISTS` query; `doctor --refresh` applies metadata with a hash lookup per
+  project; the picker's mark/selection paths use sets.
+
 ## [0.4.3] - 2026-11-15
 
 Bound the remote URL after `insteadOf` rewriting.

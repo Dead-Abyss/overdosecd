@@ -55,6 +55,12 @@ pub fn draw(
 
     // The detail pane only makes sense over the project list.
     let details = picker.details_visible();
+    // A box shorter than the input row plus the status row has no room for
+    // either; drawing a partial layout would leave an invisible confirmation
+    // armed.
+    if inner.height < 2 {
+        return;
+    }
     // The box keeps its height: the pane takes rows from the list.
     let detail_rows = if details {
         DETAIL_ROWS.min(inner.height.saturating_sub(3))
@@ -405,6 +411,16 @@ fn draw_details(
             palette.dim(),
         )));
     }
+    // The pane's height is fixed for the session (the inline viewport cannot
+    // grow), so clip instead of letting `Paragraph` silently drop the tail,
+    // and mark the clip so a hidden branch/history is not mistaken for none.
+    let capacity = area.height as usize;
+    if lines.len() > capacity {
+        lines.truncate(capacity);
+        if let Some(last) = lines.last_mut() {
+            *last = Line::from(Span::styled("…", palette.dim()));
+        }
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -458,10 +474,12 @@ fn draw_input(frame: &mut Frame, area: Rect, picker: &Picker, palette: &Palette)
     if cursor {
         let offset =
             UnicodeWidthStr::width(prompt.as_str()) + UnicodeWidthStr::width(text.as_str());
+        // Clamp to the input column, not the whole row: the counter column
+        // beside it must never receive the cursor.
         let x = area
             .x
             .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX))
-            .min(area.right().saturating_sub(1));
+            .min(columns[0].right().saturating_sub(1));
         frame.set_cursor_position((x, area.y));
     }
 }
@@ -501,7 +519,7 @@ fn hint(mode: Mode) -> &'static str {
             "j/k move · g/G ends · m mark · enter jump · ^p pin · ^a add · ^x remove · : palette · ? help · esc cancel"
         }
         Mode::Prompt => "enter: apply · esc: back",
-        Mode::Palette => "type to filter actions · j/k move · enter: run · esc: close",
+        Mode::Palette => "type to filter actions (no j/k) · j/k move · enter: run · esc: close",
         Mode::Help => "esc: back",
         Mode::Health => "j/k move · enter: relocate · x: remove · r: re-check · esc: back",
     }

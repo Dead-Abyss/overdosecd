@@ -348,8 +348,11 @@ impl Picker {
     /// Enables or disables the fallback (`[discovery] home`).
     pub fn set_home_enabled(&mut self, enabled: bool) {
         self.home_enabled = enabled;
-        if !enabled {
+        if !enabled && !self.home.is_empty() {
             self.home.clear();
+            // Clearing rows shrinks `total_len`; the highlight must not stay
+            // out of range.
+            self.selected = self.selected.min(self.total_len().saturating_sub(1));
         }
     }
 
@@ -437,18 +440,24 @@ impl Picker {
     /// the best row wins.
     pub fn refilter(&mut self, preserve: Option<&str>) {
         let query = self.query.trim().to_owned();
-        if query.is_empty() {
+        // Refresh the whole missing cache once, before either branch reads it:
+        // the renderer calls `is_missing` per row per frame, and a lazy cache
+        // made the default view stat the filesystem on every frame.
+        let missing = self.missing_flags().to_vec();
+        let mut entries: Vec<usize> = if query.is_empty() {
             let mut entries: Vec<usize> = (0..self.projects.len()).collect();
-            if !self.show_missing {
-                let missing: Vec<bool> = self.missing_flags().to_vec();
-                entries.retain(|&index| !missing[index]);
-            }
             let sort = self.sort;
             entries.sort_by_cached_key(|&index| project::sort_key(&self.projects[index], sort));
-            self.entries = entries;
+            entries
         } else {
-            self.entries = matcher::rank_indices(&query, &self.projects, &self.matching);
+            matcher::rank_indices(&query, &self.projects, &self.matching)
+        };
+        // `show missing` is a filter, not an ordering detail: honour it for
+        // ranked queries too, not just the empty-query listing.
+        if !self.show_missing {
+            entries.retain(|&index| !missing[index]);
         }
+        self.entries = entries;
 
         // Home matches only when the index has nothing (or when the user
         // asked for them), and never for a directory that is already indexed.
@@ -485,9 +494,14 @@ impl Picker {
     /// Replaces the in-memory index, e.g. after a mutation elsewhere.
     pub fn set_projects(&mut self, projects: Vec<Project>, preserve: Option<&str>) {
         self.projects = projects;
+        // The paths (and therefore the missing flags) may have changed.
         self.missing.clear();
-        self.marks
-            .retain(|id| self.projects.iter().any(|project| &project.id == id));
+        let live: std::collections::HashSet<&str> = self
+            .projects
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect();
+        self.marks.retain(|id| live.contains(id.as_str()));
         self.details_info = None;
         self.refilter(preserve);
     }
@@ -499,8 +513,9 @@ impl Picker {
 
     /// Applies a confirmed pin flip to the in-memory copies.
     pub fn set_pinned_ids(&mut self, ids: &[String], pinned: bool) {
+        let ids: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
         for project in self.projects.iter_mut() {
-            if ids.contains(&project.id) {
+            if ids.contains(project.id.as_str()) {
                 project.pinned = pinned;
             }
         }
@@ -759,6 +774,9 @@ impl Picker {
                 }
                 None => Outcome::Continue,
             },
+            // shortcut: j/k stay navigation in the palette on purpose (the
+            // same chords as every other view), so the palette query cannot
+            // contain those two letters; the help line says so.
             KeyCode::Char('j') | KeyCode::Down => self.move_palette(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_palette(-1),
             KeyCode::Char(ch) if !ctrl => {
@@ -1029,21 +1047,14 @@ impl Picker {
     /// The ids a mutation applies to: the marked rows when any are marked,
     /// otherwise the highlighted project. A highlighted *home* row has no id.
     pub(crate) fn targets(&self) -> Vec<String> {
-        if self.selected_home().is_some() {
-            return Vec::new();
+        // Marks are an explicit selection and survive filtering: a batch
+        // applies to every mark, even while the query hides some of them.
+        if !self.marks.is_empty() {
+            return self.marks.iter().cloned().collect();
         }
-        if self.marks.is_empty() {
-            return self
-                .selected_project()
-                .map(|project| project.id.clone())
-                .into_iter()
-                .collect();
-        }
-        self.entries
-            .iter()
-            .map(|&index| &self.projects[index])
-            .filter(|project| self.marks.contains(&project.id))
+        self.selected_project()
             .map(|project| project.id.clone())
+            .into_iter()
             .collect()
     }
 
@@ -1189,6 +1200,7 @@ pub(super) fn sort_label(sort: SortBy) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::home_tests::home_dir;
     use super::*;
 
     /// Shared with `home_tests`.
@@ -1662,15 +1674,62 @@ mod tests {
         assert_eq!(picker.entries().len(), 2, "missing ones show by default");
         assert!(!picker.is_missing(0));
         assert!(picker.is_missing(1));
+        assert_eq!(
+            picker.missing.len(),
+            2,
+            "the cache is filled even while nothing is hidden"
+        );
 
         run_palette(&mut picker, "missing");
         assert!(!picker.show_missing());
         assert_eq!(visible(&picker), ["alpha"]);
         assert!(picker.status().expect("status").text.contains("hiding"));
 
+        // The filter also applies to a typed query, not just the listing.
+        picker.set_query("beta".into());
+        assert!(
+            visible(&picker).is_empty(),
+            "the missing match stays hidden"
+        );
+        assert!(picker.home_matches().is_empty());
+
+        picker.set_query(String::new());
         run_palette(&mut picker, "missing");
         assert!(picker.show_missing());
         assert_eq!(picker.entries().len(), 2);
+    }
+
+    #[test]
+    fn marks_survive_a_highlighted_home_row() {
+        let mut picker = fixture(&["alpha"]);
+        picker.set_query("notes".into());
+        picker.set_home_dirs(vec![home_dir("notes", false)]);
+        assert_eq!(picker.total_len(), 1, "only the home row is visible");
+        assert!(picker.selected_home().is_some());
+
+        picker.marks.insert("alpha".to_owned());
+        assert_eq!(
+            picker.targets(),
+            vec!["alpha".to_owned()],
+            "marks are the explicit selection, home row or not"
+        );
+    }
+
+    #[test]
+    fn disabling_home_clamps_the_selection() {
+        let mut picker = fixture(&["overdosecd"]);
+        picker.set_query("notes".into());
+        picker.set_home_dirs(vec![home_dir("notes", false), home_dir("notes-old", false)]);
+        let _ = picker.move_selection(1);
+        assert_eq!(picker.selected(), 1);
+
+        picker.set_home_enabled(false);
+        assert_eq!(picker.total_len(), 0);
+        assert_eq!(
+            picker.selected(),
+            0,
+            "the highlight cannot stay out of range"
+        );
     }
 
     #[test]
@@ -1851,7 +1910,7 @@ mod home_tests {
     use super::tests::{fixture, key};
     use super::*;
 
-    fn dir(name: &str, project_like: bool) -> Dir {
+    pub(super) fn home_dir(name: &str, project_like: bool) -> Dir {
         Dir {
             path: PathBuf::from(format!("/home/user/{name}")),
             name: name.to_owned(),
@@ -1870,9 +1929,9 @@ mod home_tests {
         assert!(picker.home_matches().is_empty(), "cache not loaded yet");
 
         picker.set_home_dirs(vec![
-            dir("notes", false),
-            dir("notes-old", false),
-            dir("other", false),
+            home_dir("notes", false),
+            home_dir("notes-old", false),
+            home_dir("other", false),
         ]);
         assert_eq!(picker.entries().len(), 0);
         assert_eq!(picker.home_matches().len(), 2, "notes and notes-old match");
@@ -1883,7 +1942,7 @@ mod home_tests {
     #[test]
     fn home_results_stay_hidden_when_the_index_matches() {
         let mut picker = fixture(&["overdosecd"]);
-        picker.set_home_dirs(vec![dir("overdosecd", true)]);
+        picker.set_home_dirs(vec![home_dir("overdosecd", true)]);
         picker.set_query("over".into());
         assert!(!picker.entries().is_empty(), "the index matches");
         assert!(picker.home_matches().is_empty(), "no fallback needed");
@@ -1892,9 +1951,9 @@ mod home_tests {
     #[test]
     fn indexed_paths_are_not_offered_twice() {
         let mut picker = fixture(&["alpha"]);
-        let mut indexed = dir("alpha", true);
+        let mut indexed = home_dir("alpha", true);
         indexed.path = PathBuf::from("/x/alpha");
-        picker.set_home_dirs(vec![indexed, dir("alphabeta", true)]);
+        picker.set_home_dirs(vec![indexed, home_dir("alphabeta", true)]);
         picker.set_query("alphab".into());
         assert!(picker.entries().is_empty(), "no index match for alphab");
         assert_eq!(
@@ -1908,7 +1967,7 @@ mod home_tests {
     #[test]
     fn enter_on_a_home_row_jumps_to_its_path() {
         let mut picker = fixture(&["overdosecd"]);
-        picker.set_home_dirs(vec![dir("notes", false)]);
+        picker.set_home_dirs(vec![home_dir("notes", false)]);
         picker.set_query("notes".into());
         assert_eq!(picker.total_len(), 1);
         assert_eq!(
@@ -1922,7 +1981,7 @@ mod home_tests {
     #[test]
     fn navigation_spans_index_and_home_rows() {
         let mut picker = fixture(&["alpha"]);
-        picker.set_home_dirs(vec![dir("alpha-notes", false)]);
+        picker.set_home_dirs(vec![home_dir("alpha-notes", false)]);
         picker.set_query("alpha".into());
         assert_eq!(picker.total_len(), 1, "the index match stands alone");
 
@@ -1951,7 +2010,7 @@ mod home_tests {
     #[test]
     fn home_rows_cannot_be_pinned_or_removed_but_can_be_added() {
         let mut picker = fixture(&["overdosecd"]);
-        picker.set_home_dirs(vec![dir("notes", false)]);
+        picker.set_home_dirs(vec![home_dir("notes", false)]);
         picker.set_query("notes".into());
 
         assert_eq!(
@@ -1977,7 +2036,7 @@ mod home_tests {
     #[test]
     fn the_palette_can_force_home_results() {
         let mut picker = fixture(&["alpha"]);
-        picker.set_home_dirs(vec![dir("alpha-notes", false)]);
+        picker.set_home_dirs(vec![home_dir("alpha-notes", false)]);
         picker.set_query("alpha".into());
         assert!(picker.home_matches().is_empty(), "index match wins");
 
@@ -2000,7 +2059,7 @@ mod home_tests {
     #[test]
     fn disabling_home_clears_the_results() {
         let mut picker = fixture(&["overdosecd"]);
-        picker.set_home_dirs(vec![dir("notes", false)]);
+        picker.set_home_dirs(vec![home_dir("notes", false)]);
         picker.set_query("notes".into());
         assert_eq!(picker.total_len(), 1);
         picker.set_home_enabled(false);

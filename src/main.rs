@@ -469,6 +469,14 @@ fn cmd_goto(
             && (!confident || found.all_confident())
             && let Some(path) = worktree_for(&projects[found.index].path, branch)
         {
+            // Same existence rule as the normal path: a registrations file
+            // can name a checkout that no longer exists.
+            if !path.exists() {
+                return Err(Error::StaleDirectory {
+                    name: format!("{}:{branch}", found.name),
+                    path,
+                });
+            }
             return print_path(&path);
         }
     }
@@ -533,10 +541,15 @@ fn worktree_for(project: &Path, branch: &str) -> Option<PathBuf> {
 /// so a path a terminal would mangle is refused rather than escaped: an
 /// escaped path would be a wrong path.
 fn print_path(path: &Path) -> Result<()> {
-    if sanitize::contains_dangerous(&path.to_string_lossy()) {
+    // `goto` is machine output: an escaped or lossy path is a wrong path, so
+    // a dangerous or non-UTF-8 one is refused rather than rendered.
+    let Some(rendered) = path.to_str() else {
         return Err(Error::UnsafePath(sanitize::path(path)));
+    };
+    if sanitize::contains_dangerous(rendered) {
+        return Err(Error::UnsafePath(sanitize::text(rendered)));
     }
-    output::print_line(&path.display().to_string())
+    output::print_line(rendered)
 }
 
 fn cmd_info(store: &SqliteStore, query: &str, matching: &MatcherConfig, debug: bool) -> Result<()> {

@@ -83,6 +83,33 @@ pub fn sibling_backup(path: &Path, tag: &str) -> PathBuf {
     candidate
 }
 
+/// Opens a regular file for reading, refusing symlinks and special files.
+///
+/// The open itself is `O_NOFOLLOW | O_NONBLOCK`: a metadata check followed by
+/// a separate open re-resolves the path, so a cloned repository that swaps a
+/// `.git` file for a FIFO between the two calls blocks the read (or streams a
+/// device). The type and size are checked on the handle, after which a swap
+/// can no longer change what is read. `Ok(None)` means "not a usable file";
+/// `Err` is the open/metadata failure (NotFound included).
+pub(crate) fn open_regular_io(path: &Path, cap: u64) -> io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > cap {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+/// [`open_regular_io`] for callers that treat every failure as absent.
+pub(crate) fn open_regular(path: &Path, cap: u64) -> Option<std::fs::File> {
+    open_regular_io(path, cap).ok().flatten()
+}
+
 /// Reads a rebuildable JSON file through the hostile-file gate: a small
 /// regular file, not a symlink, the size cap enforced by the read itself,
 /// valid UTF-8 and JSON. `None` on any failure: the caller rebuilds.
@@ -90,16 +117,8 @@ pub fn read_rebuildable_json<T: serde::de::DeserializeOwned>(
     path: &Path,
     max_bytes: u64,
 ) -> Option<T> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    if metadata.len() > max_bytes {
-        return None;
-    }
     let mut raw = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
+    open_regular(path, max_bytes)?
         .take(max_bytes + 1)
         .read_to_end(&mut raw)
         .ok()?;

@@ -33,18 +33,23 @@ const MAX_WORKTREES: usize = 64;
 const MAX_REMOTE_NAME: usize = 4 * 1024;
 const MAX_REMOTE_URL: usize = 8 * 1024;
 
+/// A branch name read from a repository's `HEAD` is displayed live; cap it
+/// like the remote fields instead of letting one line fill the pane.
+const MAX_BRANCH_NAME: usize = 4 * 1024;
+
+/// Worktree registrations read from `worktrees/` before sorting; a planted
+/// tree with thousands of entries must not become a sort of thousands.
+const MAX_WORKTREE_ENTRIES: usize = 256;
+
 /// Reads a small text file, refusing anything that is not a regular file or
 /// that exceeds `cap`. `None` means "treat as absent", which is how every
 /// caller already handles a missing or unreadable `.git` file.
 fn read_small(path: &Path, cap: u64) -> Option<String> {
-    // Metadata first: opening a FIFO for reading blocks until a writer
-    // appears, and a cloned repository can plant one (`.git/HEAD`, an
-    // `include.path` target).
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > cap {
-        return None;
-    }
-    let file = std::fs::File::open(path).ok()?;
+    // `open_regular` opens with `O_NOFOLLOW | O_NONBLOCK` and checks the
+    // handle: opening a FIFO for reading would block until a writer appears,
+    // and a metadata check before a separate open could be raced by a
+    // repository that swaps the file in between.
+    let file = crate::paths::open_regular(path, cap)?;
     let mut bytes = Vec::new();
     file.take(cap + 1).read_to_end(&mut bytes).ok()?;
     if bytes.len() as u64 > cap {
@@ -100,6 +105,9 @@ pub fn worktrees_in(admin: &Path) -> Vec<Worktree> {
     let own = admin.canonicalize().unwrap_or_else(|_| admin.to_path_buf());
 
     let mut dirs: Vec<PathBuf> = entries
+        // Bounded before collecting: an attacker-sized `worktrees/` must not
+        // be materialized and sorted whole.
+        .take(MAX_WORKTREE_ENTRIES)
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
@@ -210,8 +218,11 @@ fn core_bare(config: &str) -> bool {
             continue;
         }
         if line.starts_with('[') {
-            in_core = parse_section_header(line)
-                .is_some_and(|(name, _)| name.eq_ignore_ascii_case("core"));
+            // `[core "x"]` is a subsection, not the `[core]` section: it must
+            // not turn `bare = true` into a bare-repository signal.
+            in_core = parse_section_header(line).is_some_and(|(name, subsection)| {
+                name.eq_ignore_ascii_case("core") && subsection.is_none()
+            });
             continue;
         }
         if !in_core {
@@ -263,6 +274,9 @@ fn read_remote_dir_with(git_dir: &Path, home: Option<&Path>) -> Option<Remote> {
         bytes_left: MAX_CONFIG_TOTAL,
         steps_left: MAX_WILDMATCH_STEPS,
         seen: Vec::new(),
+        resolved_git_dir: git_dir
+            .canonicalize()
+            .unwrap_or_else(|_| git_dir.to_path_buf()),
     };
     let contents = read_config(&config_path, git_dir, &mut includes)?;
     let parsed = parse_config(&contents);
@@ -283,6 +297,10 @@ struct Includes<'a> {
     bytes_left: u64,
     steps_left: usize,
     seen: Vec<PathBuf>,
+    /// The canonical `git_dir`, resolved once: `gitdir:` conditions are
+    /// evaluated per `includeIf` line, and canonicalizing the same path for
+    /// every one of them is repeated filesystem work a config can multiply.
+    resolved_git_dir: PathBuf,
 }
 
 /// Reads `path`, splicing the files that `include.path` and
@@ -303,7 +321,11 @@ fn read_config(path: &Path, git_dir: &Path, includes: &mut Includes<'_>) -> Opti
     if includes.seen.contains(&key) {
         return None;
     }
-    let text = read_small(path, MAX_CONFIG_BYTES)?;
+    // Cap this file's read by the remaining include budget, not by the
+    // per-file maximum: a config tree could otherwise read a full 16 MiB
+    // include before noticing the budget was already spent.
+    let cap = MAX_CONFIG_BYTES.min(includes.bytes_left);
+    let text = read_small(path, cap)?;
     let size = text.len() as u64;
     if size > includes.bytes_left {
         return None;
@@ -362,16 +384,28 @@ fn include_target(
     if !key.trim().eq_ignore_ascii_case("path") {
         return None;
     }
-    if let IncludeSection::Conditional(condition) = section
-        && !condition_matches(
-            condition,
-            git_dir,
-            base,
-            includes.home,
-            &mut includes.steps_left,
-        )
-    {
-        return None;
+    if let IncludeSection::Conditional(condition) = section {
+        // Split the borrow: the cached canonical path is read, the wildmatch
+        // budget is decremented.
+        let matches = {
+            let Includes {
+                resolved_git_dir,
+                steps_left,
+                home,
+                ..
+            } = includes;
+            condition_matches(
+                condition,
+                git_dir,
+                resolved_git_dir,
+                base,
+                *home,
+                steps_left,
+            )
+        };
+        if !matches {
+            return None;
+        }
     }
     let target = include_path(value.trim(), base, includes.home)?;
     read_config(&target, git_dir, includes)
@@ -402,15 +436,16 @@ fn include_path(value: &str, base: &Path, home: Option<&Path>) -> Option<PathBuf
 fn condition_matches(
     condition: &str,
     git_dir: &Path,
+    resolved_git_dir: &Path,
     base: &Path,
     home: Option<&Path>,
     steps: &mut usize,
 ) -> bool {
     if let Some(pattern) = strip_prefix_ci(condition, "gitdir/i:") {
-        return gitdir_matches(pattern, git_dir, base, home, true, steps);
+        return gitdir_matches(pattern, git_dir, resolved_git_dir, base, home, true, steps);
     }
     if let Some(pattern) = strip_prefix_ci(condition, "gitdir:") {
-        return gitdir_matches(pattern, git_dir, base, home, false, steps);
+        return gitdir_matches(pattern, git_dir, resolved_git_dir, base, home, false, steps);
     }
     false
 }
@@ -430,6 +465,7 @@ fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 fn gitdir_matches(
     pattern: &str,
     git_dir: &Path,
+    resolved_git_dir: &Path,
     base: &Path,
     home: Option<&Path>,
     icase: bool,
@@ -438,10 +474,7 @@ fn gitdir_matches(
     let Some(pattern) = prepare_pattern(pattern, base, home) else {
         return false;
     };
-    let resolved = git_dir
-        .canonicalize()
-        .unwrap_or_else(|_| git_dir.to_path_buf());
-    wildmatch(&pattern, &resolved.to_string_lossy(), icase, steps)
+    wildmatch(&pattern, &resolved_git_dir.to_string_lossy(), icase, steps)
         || wildmatch(&pattern, &git_dir.to_string_lossy(), icase, steps)
 }
 
@@ -553,7 +586,12 @@ pub fn current_branch(path: &Path) -> Option<Branch> {
 /// with [`git_dir`].
 pub fn current_branch_in(git_dir: &Path) -> Option<Branch> {
     let head = read_small(&git_dir.join("HEAD"), MAX_HEAD_BYTES)?;
-    let head = head.trim();
+    // Only the first line is the ref (or the hash); `trim` on the whole file
+    // would fold a planted trailing line into the branch name.
+    let head = head.lines().next().unwrap_or("").trim();
+    if head.len() > MAX_BRANCH_NAME {
+        return None;
+    }
 
     if let Some(reference) = head.strip_prefix("ref:") {
         let reference = reference.trim();
@@ -998,6 +1036,29 @@ mod tests {
     }
 
     #[test]
+    fn only_the_first_head_line_is_the_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkout = checkout(
+            dir.path(),
+            "ref: refs/heads/main\nref: refs/heads/injected\n",
+            "[core]\n",
+        );
+        assert_eq!(
+            current_branch(&checkout),
+            Some(Branch::Named("main".to_owned())),
+            "a trailing line must not become part of the branch"
+        );
+    }
+
+    #[test]
+    fn an_overlong_branch_name_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let long = "x".repeat(MAX_BRANCH_NAME + 1);
+        let checkout = checkout(dir.path(), &format!("ref: refs/heads/{long}\n"), "[core]\n");
+        assert_eq!(current_branch(&checkout), None);
+    }
+
+    #[test]
     fn skips_a_dirty_remote_for_a_clean_one() {
         let config = "[remote \"origin\"]\n\turl = https://x.example/\u{1b}[31m\n[remote \"upstream\"]\n\turl = https://x.example/up/stream.git\n";
         let remote = parse_remote(config).expect("the clean remote");
@@ -1377,6 +1438,18 @@ mod tests {
         let configured = dir.path().join("configured");
         write(&configured.join("config"), "[core]\n\tbare = true\n");
         assert!(git_dir(&configured).is_some());
+
+        // `[core "x"]` is a subsection, not `[core]`: its `bare` key must
+        // not mark the repository bare.
+        let subsection = dir.path().join("subsection");
+        write(
+            &subsection.join("config"),
+            "[core \"worktree\"]\n\tbare = true\n",
+        );
+        assert!(
+            git_dir(&subsection).is_none(),
+            "a core subsection must not make a plain directory a repository"
+        );
     }
 
     #[test]

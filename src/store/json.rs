@@ -47,14 +47,25 @@ pub fn read_legacy(path: &Path) -> Result<Vec<Project>> {
     use std::io::Read;
 
     crate::paths::refuse_symlink(path, "legacy JSON index")?;
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
+    let file = match crate::paths::open_regular_io(path, MAX_LEGACY_BYTES) {
+        Ok(Some(file)) => file,
+        Ok(None) => {
+            return Err(Error::Storage(format!(
+                "{} is not a readable regular file within the {MAX_LEGACY_BYTES} byte cap",
+                path.display()
+            )));
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err.into()),
+        Err(err) => {
+            return Err(Error::Storage(format!(
+                "could not open {}: {err}",
+                path.display()
+            )));
+        }
     };
     let mut raw = String::new();
-    // The cap is enforced by the read itself: a file that grows after a
-    // stat check still cannot exceed it.
+    // The cap is enforced by the read itself: a file that grows after the
+    // handle check still cannot exceed it.
     file.take(MAX_LEGACY_BYTES + 1)
         .read_to_string(&mut raw)
         .map_err(|err| Error::Storage(format!("could not read {}: {err}", path.display())))?;

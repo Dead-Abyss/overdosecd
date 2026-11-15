@@ -744,26 +744,55 @@ pub fn format_projects_with_missing(
     };
 
     let mut out = String::new();
+    // Final clamp: `shrink_to_budget` can give every column down to one cell
+    // and the separators still exceed an absurdly narrow budget. This keeps
+    // the hard promise — nothing wider than the terminal — by clipping while
+    // the line is assembled (a colored string cannot be re-measured after the
+    // fact, so the plain text is what gets truncated).
+    let mut used = 0usize;
     for (index, title) in header.iter().enumerate() {
+        let separator = if index > 0 { 2 } else { 0 };
+        let room = width.map(|budget| budget.saturating_sub(used + separator));
+        if room == Some(0) {
+            break;
+        }
         if index > 0 {
             out.push_str("  ");
+            used += separator;
         }
-        let truncated = truncate(index, title, widths[index]);
-        let padding = widths[index].saturating_sub(display_width(&truncated));
+        let max = room.map_or(widths[index], |room| widths[index].min(room));
+        let truncated = truncate(index, title, max);
+        let padding = widths[index]
+            .min(max)
+            .saturating_sub(display_width(&truncated));
         out.push_str(&truncated.bold().to_string());
         out.push_str(&" ".repeat(padding));
+        used += display_width(&truncated) + padding;
     }
+    let end = out.trim_end().len();
+    out.truncate(end);
     out.push('\n');
 
     for row in &rows {
+        let mut used = 0usize;
         for (index, cell) in row.iter().enumerate() {
+            let separator = if index > 0 { 2 } else { 0 };
+            let room = width.map(|budget| budget.saturating_sub(used + separator));
+            if room == Some(0) {
+                break;
+            }
             if index > 0 {
                 out.push_str("  ");
+                used += separator;
             }
-            let truncated = truncate(index, &cell.plain, widths[index]);
-            let padding = widths[index].saturating_sub(display_width(&truncated));
+            let max = room.map_or(widths[index], |room| widths[index].min(room));
+            let truncated = truncate(index, &cell.plain, max);
+            let padding = widths[index]
+                .min(max)
+                .saturating_sub(display_width(&truncated));
             out.push_str(&cell.tone.paint(&truncated));
             out.push_str(&" ".repeat(padding));
+            used += display_width(&truncated) + padding;
         }
         let end = out.trim_end().len();
         out.truncate(end);
@@ -1556,6 +1585,25 @@ mod tests {
             vec![10, 16, 10],
             "the path gives up space first, and LAST USED never shrinks"
         );
+    }
+
+    #[test]
+    fn a_tiny_budget_never_renders_a_wider_row() {
+        no_color();
+        let projects = vec![
+            Project::for_test("alpha", "/home/user/alpha"),
+            Project::for_test("beta", "/home/user/beta"),
+        ];
+        let missing = vec![false, false];
+        for budget in 1..12 {
+            let rendered = format_projects_with_missing(&projects, &missing, None, Some(budget));
+            for line in rendered.lines() {
+                assert!(
+                    display_width(line) <= budget,
+                    "budget {budget} overflowed: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]

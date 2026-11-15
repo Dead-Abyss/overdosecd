@@ -6,7 +6,8 @@ use crate::error::{Error, Result};
 ///
 /// Accepted forms: a relative duration (`30m`, `48h`, `7d`, `2w`, `1y`) or an
 /// absolute date/timestamp (`2026-09-01`, or any RFC 3339 value, which is
-/// normalized to UTC). `now` is injected so tests do not depend on the clock.
+/// normalized to UTC). `m` is minutes and `y` is 365 days. `now` is injected
+/// so tests do not depend on the clock.
 pub fn parse_since(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
     let value = raw.trim();
     if value.is_empty() {
@@ -40,10 +41,10 @@ pub fn parse_since(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
 
 /// Splits `7d` into `(7, 'd')`; the unit letter is lowercased so `7D` works.
 fn split_duration(value: &str) -> Option<(i64, char)> {
-    let mut chars = value.chars();
-    let unit = chars.next_back()?;
-    let digits: String = chars.collect();
-    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+    let unit = value.chars().next_back()?;
+    // Slice the digit prefix instead of collecting it into a `String`.
+    let digits = &value[..value.len() - unit.len_utf8()];
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     Some((digits.parse().ok()?, unit.to_ascii_lowercase()))

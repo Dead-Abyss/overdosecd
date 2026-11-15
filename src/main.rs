@@ -24,6 +24,7 @@ mod ui;
 #[cfg(not(target_os = "linux"))]
 compile_error!("overdosecd only supports Linux (see README.md)");
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -176,6 +177,11 @@ fn run(cli: Cli) -> Result<i32> {
             output::print(&output::init_script(shell, hooks))?;
             Ok(0)
         }
+        // Static scripts need no settings; like `init`, they work with a
+        // broken config.
+        Command::Completions { shell } => {
+            output::print(&output::completion_script(shell)).map(|()| 0)
+        }
         command => {
             let config = config?;
             let matching = MatcherConfig::from(&config.matching);
@@ -226,7 +232,9 @@ fn run(cli: Cli) -> Result<i32> {
                 Command::Migrate => cmd_migrate(&data_dir)?,
                 Command::Import(args) => cmd_import(&store, args)?,
                 Command::Scan(args) => cmd_scan(&data_dir, &config.discovery, args)?,
-                Command::Completions { shell } => output::print(&output::completion_script(shell))?,
+                Command::Completions { .. } => {
+                    unreachable!("completions is dispatched before the config load")
+                }
                 // Handled in the outer match, before the config is required.
                 Command::Doctor(_) => unreachable!("doctor is dispatched before the config load"),
                 Command::Complete { .. } => {
@@ -1028,7 +1036,7 @@ fn cmd_import(store: &SqliteStore, args: ImportArgs) -> Result<()> {
         rows.extend(import::preview(&plan)?);
         // Same order and table as a `list` run would show afterwards.
         sort_projects(&mut rows, None);
-        let missing = vec![false; rows.len()];
+        let missing: Vec<bool> = rows.iter().map(|project| !project.path.exists()).collect();
         let width = output::terminal_width();
         output::print(&output::format_projects_with_missing(
             &rows,
@@ -1160,16 +1168,24 @@ fn cmd_doctor(
             .collect();
         let (total, changed) = store.update(move |projects| {
             let mut changed = 0;
-            for (id, path, git, kind) in &detected {
-                let Some(project) = projects
-                    .iter_mut()
-                    .find(|project| project.id == *id && project.path == *path)
-                else {
-                    // Repathed or removed while planning; the next run sees it.
+            let detected: HashMap<&str, (&Path, &Option<project::GitInfo>, project::Kind)> =
+                detected
+                    .iter()
+                    .map(|(id, path, git, kind)| (id.as_str(), (path.as_path(), git, *kind)))
+                    .collect();
+            // One lookup per project instead of scanning `detected` each time
+            // (the old pass was O(n²) on a large index).
+            for project in projects.iter_mut() {
+                let Some((path, git, kind)) = detected.get(project.id.as_str()) else {
+                    // Removed while planning; the next run sees it.
                     continue;
                 };
-                if project.git != *git || project.kind != *kind {
-                    project.git = git.clone();
+                if project.path != *path {
+                    // Repathed while planning; the next run sees it.
+                    continue;
+                }
+                if project.git != **git || project.kind != *kind {
+                    project.git = (*git).clone();
                     project.kind = *kind;
                     changed += 1;
                 }

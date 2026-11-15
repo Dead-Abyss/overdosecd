@@ -75,6 +75,25 @@ pub fn path(value: &Path) -> String {
     text(&value.to_string_lossy())
 }
 
+/// A quoted, fully escaped rendering of an arbitrary path, including bytes
+/// that are not UTF-8 (`\xNN`). [`path`] goes through `to_string_lossy`, which
+/// would replace exactly the bytes [`quoted_path`] exists to show.
+pub fn quoted_path(value: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut out = String::from("\"");
+    for &byte in value.as_os_str().as_bytes() {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            0x20..=0x7e => out.push(char::from(byte)),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// A quoted, fully escaped rendering for diagnostics: always one line, and
 /// unambiguous even when the value contains quotes, backslashes, or control
 /// characters. Rust's debug formatting escapes everything a terminal could

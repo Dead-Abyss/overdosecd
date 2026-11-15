@@ -333,7 +333,19 @@ pub fn completion_candidates(projects: &[Project], prefix: &str) -> Vec<String> 
     let prefix = prefix.trim().to_lowercase();
     let mut candidates: Vec<String> = projects
         .iter()
-        .filter(|project| project.path.exists())
+        // Cheap prefix/danger checks first: the stat for a stale project is
+        // the expensive part, so only a project with an interesting
+        // candidate pays for it (a TAB press runs on every shell prompt).
+        .filter(|project| {
+            let interesting = std::iter::once(&project.name)
+                .chain(project.aliases.iter())
+                .chain(project.tags.iter())
+                .any(|value| {
+                    !crate::sanitize::contains_dangerous(value)
+                        && value.to_lowercase().starts_with(&prefix)
+                });
+            interesting && project.path.exists()
+        })
         .flat_map(|project| {
             std::iter::once(&project.name)
                 .chain(project.aliases.iter())
@@ -538,7 +550,12 @@ fn signal_score(
 
         // The owner only counts as part of the full `owner/repo` slug,
         // so an org name cannot match every repository on its own.
-        if !owner.is_empty() && format!("{owner}/{repo}") == query {
+        if !owner.is_empty()
+            && query.len() == owner.len() + 1 + repo.len()
+            && query.starts_with(owner.as_str())
+            && query.as_bytes().get(owner.len()) == Some(&b'/')
+            && &query[owner.len() + 1..] == repo
+        {
             improve(&mut best, EXACT_SLUG, Reason::GitRemote);
         }
     }

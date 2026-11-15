@@ -268,9 +268,9 @@ fn read_remote_dir_with(git_dir: &Path, home: Option<&Path>) -> Option<Remote> {
     let parsed = parse_config(&contents);
     let mut remote = parsed.remote?;
     remote.url = rewrite_instead_of(&remote.url, &parsed.instead_of);
-    // The URL is attacker-controlled even after a rewrite; the result must
-    // still survive the terminal guard.
-    if crate::sanitize::contains_dangerous(&remote.url) {
+    // The rewrite can inflate the URL past the parse-time cap, and the result
+    // is attacker-controlled; it must still survive both guards.
+    if remote.url.len() > MAX_REMOTE_URL || crate::sanitize::contains_dangerous(&remote.url) {
         return None;
     }
     Some(remote)
@@ -1334,6 +1334,21 @@ mod tests {
             parsed.remote.map(|remote| remote.url),
             Some("https://evil.example/repo.git".to_owned())
         );
+    }
+
+    #[test]
+    fn instead_of_rewrite_cannot_exceed_the_url_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = "x".repeat(MAX_REMOTE_URL + 1);
+        let checkout = checkout(
+            dir.path(),
+            "ref: refs/heads/main\n",
+            &format!(
+                "[url \"{base}\"]\n\tinsteadOf = https://x.example/\n\
+                 [remote \"origin\"]\n\turl = https://x.example/repo.git\n"
+            ),
+        );
+        assert_eq!(read_remote(&checkout), None);
     }
 
     #[test]

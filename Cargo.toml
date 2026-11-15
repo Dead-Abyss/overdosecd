@@ -9,6 +9,10 @@ repository = "https://github.com/Dead-Abyss/overdosecd"
 readme = "README.md"
 keywords = ["cli", "cd", "jump", "projects"]
 categories = ["command-line-utilities"]
+# `cargo install` needs the binary, its README, and the changes; the test
+# suite, scripts, and CI files are repository material only. `benches/` stays
+# because the manifest declares that target.
+exclude = ["/tests", "/scripts", "/.github", "/.opencodereview", "/deny.toml", "/AGENTS.md"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
@@ -40,9 +44,6 @@ proptest = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 predicates = "3"
 tempfile = "3"
-# `setsid` for the picker's no-terminal test: spawn the binary in a fresh
-# session so /dev/tty is unavailable even when the suite runs in a terminal.
-libc = "0.2"
 
 [[bench]]
 name = "cli"

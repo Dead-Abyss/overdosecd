@@ -105,6 +105,12 @@ impl FromStr for ColorSpec {
         }
 
         if let Some(index) = value.strip_prefix("color") {
+            // `u8::from_str` accepts a leading `+` (and whitespace), so
+            // `color+12` would parse; require plain digits, which is the
+            // documented `color0`..`color255` form.
+            if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("`{value}` is not color0..color255"));
+            }
             let index: u8 = index
                 .parse()
                 .map_err(|_| format!("`{value}` is not color0..color255"))?;
@@ -391,6 +397,21 @@ mod tests {
         let err = resolve(&config, Some("neon")).expect_err("rejected");
         assert_eq!(err.exit_code(), 3);
         assert!(err.to_string().contains("OVERDOSECD_THEME"), "{err}");
+    }
+
+    #[test]
+    fn color_index_parsing_is_strict() {
+        assert_eq!(
+            "color12".parse::<ColorSpec>().expect("indexed"),
+            ColorSpec::Indexed(12)
+        );
+        // `u8::from_str` alone would accept all of these.
+        for value in ["color+12", "color 12", "color", "color256", "color-1"] {
+            assert!(
+                value.parse::<ColorSpec>().is_err(),
+                "`{value}` should be rejected"
+            );
+        }
     }
 
     #[test]

@@ -354,8 +354,20 @@ pub fn apply_color(mode: ColorMode) {
     }
 }
 
+/// Upper bound for every `[matching]` weight. The scoring path sums and
+/// multiplies these values in `i64`; the ceiling keeps even an absurd config
+/// from overflowing (the defaults are three orders of magnitude smaller).
+const MAX_WEIGHT: i64 = 1_000_000;
+
+/// Upper bound for `[discovery] max_entries`. The walk multiplies this by
+/// `WALK_BUDGET_FACTOR` and the cache is serialized whole, so an unbounded
+/// value would size both.
+const MAX_DISCOVERY_ENTRIES: usize = 1_000_000;
+
 fn parse(text: &str) -> std::result::Result<Config, String> {
-    let config: Config = toml::from_str(text).map_err(|err| err.message().to_owned())?;
+    // `Display` keeps the TOML span (line, column, source line); `message()`
+    // alone would throw away everything but the bare reason.
+    let config: Config = toml::from_str(text).map_err(|err| err.to_string())?;
     config.validate()?;
     Ok(config)
 }
@@ -370,8 +382,10 @@ impl Config {
             ("matching.ambiguity_margin", matching.ambiguity_margin),
             ("matching.depth_penalty", matching.depth_penalty),
         ] {
-            if value < 0 {
-                return Err(format!("{name} must be >= 0 (got {value})"));
+            if !(0..=MAX_WEIGHT).contains(&value) {
+                return Err(format!(
+                    "{name} must be between 0 and {MAX_WEIGHT} (got {value})"
+                ));
             }
         }
         if self.ui.height < 3 {
@@ -383,9 +397,9 @@ impl Config {
         if self.discovery.max_depth < 1 {
             return Err("discovery.max_depth must be at least 1".to_owned());
         }
-        if self.discovery.max_entries < 100 {
+        if !(100..=MAX_DISCOVERY_ENTRIES).contains(&self.discovery.max_entries) {
             return Err(format!(
-                "discovery.max_entries must be at least 100 (got {})",
+                "discovery.max_entries must be between 100 and {MAX_DISCOVERY_ENTRIES} (got {})",
                 self.discovery.max_entries
             ));
         }
@@ -455,6 +469,48 @@ mod tests {
     fn tiny_ui_heights_are_rejected() {
         let err = parse("[ui]\nheight = 2\n").expect_err("height must be constructible");
         assert!(err.contains("ui.height"), "error was: {err}");
+    }
+
+    #[test]
+    fn absurd_matching_weights_are_rejected() {
+        // The scoring path sums these in `i64`; before the ceiling, a value
+        // like this one overflowed a debug build and wrapped in release.
+        for name in [
+            "recency_max",
+            "frequency_max",
+            "pinned_bonus",
+            "ambiguity_margin",
+            "depth_penalty",
+        ] {
+            for value in ["-1", "9223372036854775807"] {
+                let text = format!("[matching]\n{name} = {value}\n");
+                let err = parse(&text).expect_err("out-of-range weight");
+                assert!(err.contains(name), "error for {name}={value} was: {err}");
+            }
+            let text = format!("[matching]\n{name} = 1000001\n");
+            let err = parse(&text).expect_err("one over the ceiling");
+            assert!(err.contains(name), "error for {name} was: {err}");
+            let text = format!("[matching]\n{name} = 1000000\n");
+            parse(&text).expect("a value at the ceiling parses");
+        }
+    }
+
+    #[test]
+    fn absurd_discovery_budgets_are_rejected() {
+        let err = parse("[discovery]\nmax_entries = 1000000000\n")
+            .expect_err("max_entries has no cheap answer above the ceiling");
+        assert!(err.contains("max_entries"), "error was: {err}");
+        let err = parse("[discovery]\nmax_entries = 99\n").expect_err("lower bound");
+        assert!(err.contains("max_entries"), "error was: {err}");
+    }
+
+    #[test]
+    fn toml_errors_keep_their_span() {
+        let err = parse("[ui]\nheight = \"ten\"\n").expect_err("wrong type");
+        assert!(
+            err.contains("line 2") || err.contains("column"),
+            "span lost: {err}"
+        );
     }
 
     #[test]

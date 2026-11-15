@@ -360,7 +360,7 @@ pub struct ImportArgs {
     pub dry_run: bool,
 
     /// Drop entries whose mapped use count is below this value
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", value_parser = parse_min_score)]
     pub min_score: Option<f64>,
 
     /// Import at most this many entries (highest scores first)
@@ -376,6 +376,19 @@ pub enum ImportSource {
     Autojump,
     /// zsh-z's data file, the rupa/z `path|rank|epoch` format
     ZshZ,
+}
+
+/// Parses `--min-score`. The comparison is against a non-negative use count,
+/// so `NaN` would silently filter nothing and `inf` would filter everything;
+/// both are refused instead of being accepted by clap's bare `f64` parser.
+fn parse_min_score(raw: &str) -> std::result::Result<f64, String> {
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a number"))?;
+    if !value.is_finite() {
+        return Err(format!("`{raw}` is not a finite number"));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Args)]

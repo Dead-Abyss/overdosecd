@@ -400,7 +400,7 @@ fn best_of(query: &str, scored: Vec<Scored>, projects: &[Project], margin: i64) 
 
     let ambiguous = scored
         .get(1)
-        .is_some_and(|second| scored[0].score - second.score <= margin);
+        .is_some_and(|second| scored[0].score.saturating_sub(second.score) <= margin);
     if ambiguous {
         return Err(Error::Ambiguous {
             query: query.trim().to_owned(),
@@ -430,7 +430,7 @@ pub(crate) fn best_of_ranked(query: &str, mut ranked: Vec<Match>, margin: i64) -
 
     let ambiguous = ranked
         .get(1)
-        .is_some_and(|second| ranked[0].score - second.score <= margin);
+        .is_some_and(|second| ranked[0].score.saturating_sub(second.score) <= margin);
     if ambiguous {
         ranked.truncate(MAX_CANDIDATES);
         return Err(Error::Ambiguous {
@@ -549,16 +549,24 @@ fn signal_score(
 /// The bonuses a project earns regardless of which term matched; they are
 /// applied once to the combined signal score.
 fn apply_bonuses(base: i64, project: &Project, config: &MatcherConfig, now: DateTime<Utc>) -> i64 {
+    // Saturating on purpose: `MatcherConfig` comes from the user's config
+    // file, and a hand-edited absurd weight used to overflow (a debug panic,
+    // a silently inverted ranking in release). `config.rs` caps the values;
+    // this is the defense in depth that keeps a directly built config safe.
     let mut total = base;
     if project.pinned {
-        total += config.pinned_bonus;
+        total = total.saturating_add(config.pinned_bonus);
     }
     if project.git.is_some() {
-        total += GIT_BONUS;
+        total = total.saturating_add(GIT_BONUS);
     }
-    total -= config.depth_penalty * project.path.components().count() as i64;
-    total += config.frequency_bonus(project.use_count);
-    total += config.recency_bonus(project.last_used_at, now);
+    total = total.saturating_sub(
+        config
+            .depth_penalty
+            .saturating_mul(project.path.components().count() as i64),
+    );
+    total = total.saturating_add(config.frequency_bonus(project.use_count));
+    total = total.saturating_add(config.recency_bonus(project.last_used_at, now));
     total
 }
 
@@ -996,6 +1004,43 @@ mod tests {
             vec!["Σ"],
             "non-ASCII case folds collapse too"
         );
+    }
+
+    #[test]
+    fn absurd_weights_saturate_instead_of_overflowing() {
+        // A directly built `MatcherConfig` skips config validation; scoring
+        // must still neither panic (debug) nor wrap into an inverted order.
+        let mut pinned = project("over", "/a/over");
+        pinned.pinned = true;
+        let projects = vec![project("over", "/b/over"), pinned];
+
+        let huge_bonus = MatcherConfig {
+            pinned_bonus: i64::MAX,
+            ..MatcherConfig::DEFAULT
+        };
+        let ranked = super::rank("over", &projects, &huge_bonus);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].index, 1, "the pinned project wins");
+        assert!(
+            ranked[0].score > ranked[1].score,
+            "saturated scores keep the order: {} vs {}",
+            ranked[0].score,
+            ranked[1].score
+        );
+        assert!(ranked[0].score > 0);
+
+        // A penalty that cannot be represented saturates down instead of
+        // overflowing the other way; ordering stays deterministic.
+        let absurd = MatcherConfig {
+            pinned_bonus: i64::MAX,
+            depth_penalty: i64::MAX,
+            ..MatcherConfig::DEFAULT
+        };
+        let first = super::rank("over", &projects, &absurd);
+        let second = super::rank("over", &projects, &absurd);
+        assert_eq!(first.len(), 2);
+        let scores: Vec<i64> = first.iter().map(|m| m.score).collect();
+        assert_eq!(scores, second.iter().map(|m| m.score).collect::<Vec<_>>());
     }
 
     #[test]

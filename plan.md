@@ -9,18 +9,18 @@ and [README.md](README.md).
 
 ## Current state
 
-0.4.3 (2026-11-15) is the latest release — the remote-URL cap now holds after
-`url.<base>.insteadOf` rewrites. 0.4.2 (2026-11-13) was correctness, safety,
-and terminal fixes from a full repository audit. 0.4.1 was the dependency
-refresh (rusqlite 0.42, bundled SQLite 3.54.1) and the MSRV/toolchain move to
-1.100. 0.4.0 added themes and worktrees.
+0.4.4 (2026-11-15) is the latest release — the full-repository review fixes
+(OCR session `3c611478`, 154 findings): bounded scoring and config, a stricter
+display-safety funnel, a crash-safe migration, locked visit counters,
+fingerprint row diffing, picker state/rendering fixes, and CI/release
+hardening. 0.4.3 was the remote-URL cap after `url.<base>.insteadOf`
+rewrites. 0.4.2 (2026-11-13) was correctness, safety, and terminal fixes from
+a full repository audit. 0.4.1 was the dependency refresh (rusqlite 0.42,
+bundled SQLite 3.54.1) and the MSRV/toolchain move to 1.100. 0.4.0 added
+themes and worktrees.
 
 The CLI is complete for its original job — index, organize, inspect, jump.
 Everything below adds new capability or pays down an accepted debt.
-
-Unreleased on `fix/ocr-full-scan-2026-11`: the fixes for the full-repository
-review (OCR session `3c611478`, 154 findings). See CHANGELOG.md for the
-user-visible list; the review triage lives in the branch history.
 
 ## Guiding principles
 

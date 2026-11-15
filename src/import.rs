@@ -59,6 +59,12 @@ pub(crate) struct Plan {
     /// the `--limit` overflow, and duplicates within the source itself.
     pub excluded: usize,
     pub malformed: usize,
+    /// A directory whose final component yields no usable project name; it
+    /// cannot be added, so it is reported instead of failing under the lock.
+    pub unnameable: usize,
+    /// Entries that passed planning but failed to insert for a reason other
+    /// than a race (reported instead of silently counted as imported).
+    pub failed: usize,
 }
 
 /// The store location for `source`, honouring the tool's own override.
@@ -109,25 +115,23 @@ pub fn parse_at(source: ImportSource, path: &Path) -> Result<Parsed> {
         message,
     };
 
-    // The store is hostile input. Check the name *before* opening so a FIFO
-    // cannot block the command and a device cannot stream forever
-    // (`metadata()` follows symlinks, so the target type is what decides),
-    // then read through the handle with the cap enforced by construction: a
-    // file that grows after the check still cannot exceed it.
-    let meta = fs::metadata(path).map_err(|err| {
-        source_err(match err.kind() {
-            std::io::ErrorKind::NotFound => "not found".to_owned(),
-            _ => err.to_string(),
-        })
-    })?;
-    if !meta.is_file() {
-        return Err(source_err("not a regular file".to_owned()));
-    }
-    if meta.len() > MAX_STORE {
-        return Err(source_err(oversized_message()));
-    }
-
-    let file = fs::File::open(path).map_err(|err| source_err(err.to_string()))?;
+    // The store is hostile input. Open non-blocking and check the *handle*:
+    // a FIFO in its place must not block the command (a metadata check before
+    // a separate open could be raced), and the read cap is enforced by the
+    // read itself, so a file that grows afterwards still cannot exceed it.
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|err| {
+                source_err(match err.kind() {
+                    std::io::ErrorKind::NotFound => "not found".to_owned(),
+                    _ => err.to_string(),
+                })
+            })?
+    };
     let handle = file.metadata().map_err(|err| source_err(err.to_string()))?;
     if !handle.is_file() {
         return Err(source_err("not a regular file".to_owned()));
@@ -192,7 +196,8 @@ fn parse_zoxide(bytes: &[u8], path: &Path) -> Result<Parsed> {
         if len > (bytes.len() - at) as u64 {
             return Err(corrupted("entry length exceeds the buffer"));
         }
-        let raw = take(bytes, &mut at, len as usize).expect("bounds checked above");
+        let raw = take(bytes, &mut at, len as usize)
+            .ok_or_else(|| corrupted("entry length exceeds the buffer"))?;
         let rank = take_f64(bytes, &mut at).ok_or_else(|| corrupted("missing rank"))?;
         let last = take_u64(bytes, &mut at).ok_or_else(|| corrupted("missing timestamp"))?;
         match std::str::from_utf8(raw) {
@@ -297,7 +302,7 @@ pub fn plan(
         ..Plan::default()
     };
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut candidates: Vec<NewProject> = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
     // Membership in the index, checked once per record instead of scanning
     // the whole project list per record.
     let indexed: HashSet<&Path> = projects
@@ -339,15 +344,20 @@ pub fn plan(
             plan.excluded += 1;
             continue;
         }
-        // Detected here, before the store lock is taken.
-        let git = project::GitInfo::detect(&canonical);
-        let kind = project::kind_of(&canonical);
-        candidates.push(NewProject {
+        // The name comes from the final component; validate it exactly the
+        // way `insert` will (non-empty, trimmed, no control characters) so a
+        // directory like `/` or `" "` is counted here instead of failing
+        // later under the store lock.
+        let named = project::default_name(&canonical)
+            .and_then(|name| project::sanitize_value("project name", &name));
+        if named.is_err() {
+            plan.unnameable += 1;
+            continue;
+        }
+        candidates.push(Candidate {
             path: canonical,
             use_count,
             last_used_at: record.visited,
-            git,
-            kind,
         });
     }
 
@@ -362,8 +372,26 @@ pub fn plan(
         plan.excluded += candidates.len() - limit;
         candidates.truncate(limit);
     }
-    plan.to_add = candidates;
+    // `.git` and marker detection is filesystem work per candidate; only the
+    // entries that survived `--limit` need it.
+    plan.to_add = candidates
+        .into_iter()
+        .map(|candidate| NewProject {
+            git: project::GitInfo::detect(&candidate.path),
+            kind: project::kind_of(&candidate.path),
+            path: candidate.path,
+            use_count: candidate.use_count,
+            last_used_at: candidate.last_used_at,
+        })
+        .collect();
     plan
+}
+
+/// A planned entry before the filesystem detection pass.
+struct Candidate {
+    path: PathBuf,
+    use_count: u64,
+    last_used_at: Option<DateTime<Utc>>,
 }
 
 /// Frecency → `use_count`: a rounded jump count, at least 1. Autojump weights
@@ -431,14 +459,20 @@ pub fn preview(plan: &Plan) -> Result<Vec<Project>> {
 /// Applies a plan under the store lock, re-checking every path; returns
 /// `(imported, raced)` where `raced` entries were added by someone else
 /// between planning and the lock.
-pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usize) {
-    let (mut imported, mut raced) = (0, 0);
+pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usize, usize) {
+    let mut indexed: HashSet<PathBuf> = projects
+        .iter()
+        .map(|project| project.path.clone())
+        .collect();
+    let (mut imported, mut raced, mut failed) = (0, 0, 0);
     for entry in to_add {
-        if projects.iter().any(|project| project.path == entry.path) {
+        // Membership is a set lookup, not a scan of every project per entry
+        // while the store lock is held.
+        if !indexed.insert(entry.path.clone()) {
             raced += 1;
             continue;
         }
-        if project::insert(
+        match project::insert(
             projects,
             entry.path.clone(),
             None,
@@ -446,20 +480,28 @@ pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usiz
             Vec::new(),
             false,
             (entry.git.clone(), entry.kind),
-        )
-        .is_err()
-        {
-            raced += 1;
-            continue;
+        ) {
+            // Only a path that appeared between planning and the lock is a
+            // race; anything else did not land and must not be reported as
+            // imported.
+            Err(Error::Duplicate { .. }) => {
+                raced += 1;
+            }
+            Err(_) => {
+                indexed.remove(&entry.path);
+                failed += 1;
+            }
+            Ok(_) => {
+                // `insert` pushed the new entry last.
+                if let Some(project) = projects.last_mut() {
+                    project.use_count = entry.use_count;
+                    project.last_used_at = entry.last_used_at;
+                }
+                imported += 1;
+            }
         }
-        // `insert` pushed the new entry last.
-        if let Some(project) = projects.last_mut() {
-            project.use_count = entry.use_count;
-            project.last_used_at = entry.last_used_at;
-        }
-        imported += 1;
     }
-    (imported, raced)
+    (imported, raced, failed)
 }
 
 /// One line for stdout: what happened (or would), and the skip counters.
@@ -484,6 +526,12 @@ pub fn summary(plan: &Plan, dry_run: bool) -> String {
     }
     if plan.malformed > 0 {
         skipped.push(format!("{} malformed", plan.malformed));
+    }
+    if plan.unnameable > 0 {
+        skipped.push(format!("{} unnameable", plan.unnameable));
+    }
+    if plan.failed > 0 {
+        skipped.push(format!("{} failed", plan.failed));
     }
     if !skipped.is_empty() {
         line.push_str(&format!(" (skipped {})", skipped.join(", ")));
@@ -757,13 +805,16 @@ mod tests {
         };
 
         let mut projects = Vec::new();
-        assert_eq!(apply(&mut projects, std::slice::from_ref(&entry)), (1, 0));
+        assert_eq!(
+            apply(&mut projects, std::slice::from_ref(&entry)),
+            (1, 0, 0)
+        );
         assert_eq!(projects[0].use_count, 7);
         assert_eq!(projects[0].last_used_at, None);
 
         assert_eq!(
             apply(&mut projects, &[entry]),
-            (0, 1),
+            (0, 1, 0),
             "re-verified under the lock"
         );
         assert_eq!(projects.len(), 1);
@@ -783,19 +834,39 @@ mod tests {
             missing: 1,
             excluded: 0,
             malformed: 3,
+            unnameable: 4,
+            failed: 0,
         };
         assert_eq!(
             summary(&plan, false),
-            "imported 1 project (skipped 2 already indexed, 1 missing, 3 malformed)"
+            "imported 1 project (skipped 2 already indexed, 1 missing, 3 malformed, 4 unnameable)"
         );
         assert_eq!(
             summary(&plan, true),
-            "dry run: would import 1 project (skipped 2 already indexed, 1 missing, 3 malformed)"
+            "dry run: would import 1 project (skipped 2 already indexed, 1 missing, 3 malformed, 4 unnameable)"
         );
         plan.to_add.clear();
         assert_eq!(
             summary(&plan, false),
-            "nothing to import (skipped 2 already indexed, 1 missing, 3 malformed)"
+            "nothing to import (skipped 2 already indexed, 1 missing, 3 malformed, 4 unnameable)"
+        );
+    }
+
+    #[test]
+    fn the_root_directory_is_counted_as_unnameable() {
+        let parsed = Parsed {
+            records: vec![Record {
+                path: "/".into(),
+                score: 5.0,
+                visited: None,
+            }],
+            ..Parsed::default()
+        };
+        let plan = plan(&parsed, &[], None, None, None);
+        assert_eq!(plan.unnameable, 1);
+        assert!(
+            plan.to_add.is_empty(),
+            "nothing can be added for a nameless dir"
         );
     }
 

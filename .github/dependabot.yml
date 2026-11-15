@@ -7,6 +7,24 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
+      # Pre-1.0 crates treat a *minor* bump as breaking (ratatui 0.30 -> 0.31,
+      # rusqlite 0.42 -> 0.43), so the direct 0.x dependencies get their own
+      # PR instead of riding along with a week of additive updates. Dependabot
+      # assigns the first matching group, so 0.x -> 1.0+ bumps land here too;
+      # `cargo-major` covers the post-1.0 crates' true majors.
+      cargo-breaking-pre1:
+        patterns:
+          - "chrono"
+          - "criterion"
+          - "fuzzy-matcher"
+          - "libc"
+          - "ratatui*"
+          - "rusqlite"
+          - "unicode-width"
+        update-types: ["minor", "major"]
+      cargo-major:
+        patterns: ["*"]
+        update-types: ["major"]
       cargo:
         patterns: ["*"]
     ignore:

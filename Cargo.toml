@@ -9,6 +9,10 @@ repository = "https://github.com/Dead-Abyss/overdosecd"
 readme = "README.md"
 keywords = ["cli", "cd", "jump", "projects"]
 categories = ["command-line-utilities"]
+# `cargo install` needs the binary, its README, and the changes; the test
+# suite, scripts, and CI files are repository material only. `benches/` stays
+# because the manifest declares that target.
+exclude = ["/tests", "/scripts", "/.github", "/.opencodereview", "/deny.toml", "/AGENTS.md", "/plan.md"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
@@ -20,10 +24,15 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 rusqlite = { version = "0.42", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-signal-hook = "0.4"
+signal-hook-registry = "1"
 thiserror = "2"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 unicode-width = "0.2.2"
+
+# The crate is Linux-only; `flock(2)` for the cd hook's visit counter is the
+# one libc call in the runtime path (tests also use it for `setsid`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -35,9 +44,6 @@ proptest = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 predicates = "3"
 tempfile = "3"
-# `setsid` for the picker's no-terminal test: spawn the binary in a fresh
-# session so /dev/tty is unavailable even when the suite runs in a terminal.
-libc = "0.2"
 
 [[bench]]
 name = "cli"

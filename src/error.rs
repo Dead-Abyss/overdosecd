@@ -72,7 +72,7 @@ pub enum Error {
 
     /// Unix paths can carry bytes that are not UTF-8; the index stores
     /// strings, and a lossy round-trip would silently point somewhere else.
-    #[error("path is not valid UTF-8: {}", sanitize::path(.0))]
+    #[error("path is not valid UTF-8: {}", sanitize::quoted_path(.0))]
     NonUtf8Path(PathBuf),
 
     /// A store file that is a symbolic link could point into a directory the
@@ -413,7 +413,7 @@ mod tests {
         .to_string();
         assert_eq!(rendered.lines().count(), 2, "template newline only");
         assert!(
-            crate::sanitize::foreign_escape(&rendered).is_none(),
+            crate::sanitize::foreign_escape_multiline(&rendered).is_none(),
             "no terminal escapes: {rendered:?}"
         );
     }

@@ -20,16 +20,25 @@ jobs:
   publish:
     name: publish to crates.io and create the GitHub release
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
+      # The publish job has a write token; it must not survive in the local
+      # git config of a checkout that builds third-party code.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Check that the tag matches Cargo.toml
         run: |
-          version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          # `cargo metadata` reads the manifest instead of a regex on it: a
+          # `rust-version.workspace`/single-quote future cannot silently pass.
+          version="$(cargo metadata --no-deps --format-version 1 |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          test -n "$version" || { echo "Cargo.toml has no package version" >&2; exit 1; }
           tag="${GITHUB_REF_NAME#v}"
           if [ "$version" != "$tag" ]; then
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
@@ -52,10 +61,26 @@ jobs:
             exit 1
           fi
 
-      - name: Publish to crates.io
-        run: cargo publish --locked
+      - name: Publish to crates.io (idempotent re-runs)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # A cancelled run (or a later step failing) must be retryable from
+          # the same tag; `cargo publish` always fails for an uploaded version.
+          # Only a 404 means "not published": a 429/5xx or a network blip must
+          # fail loudly instead of pretending the version is missing.
+          status="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 --retry-delay 2 --max-time 30 \
+            -A "overdosecd-release-ci (https://github.com/Dead-Abyss/overdosecd)" \
+            "https://crates.io/api/v1/crates/overdosecd/$version")"
+          case "$status" in
+            200) echo "overdosecd $version is already on crates.io; skipping the publish" ;;
+            404) cargo publish --locked ;;
+            *)
+              echo "crates.io returned HTTP $status for overdosecd $version; refusing to guess" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Create the GitHub release
         env:
@@ -63,6 +88,10 @@ jobs:
         run: |
           notes="$RUNNER_TEMP/release-notes.md"
           summary="$(awk 'NF { print; exit }' "$notes")"
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME — $summary" \
-            --notes-file "$notes"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; skipping"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME — $summary" \
+              --notes-file "$notes"
+          fi

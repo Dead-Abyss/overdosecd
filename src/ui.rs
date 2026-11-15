@@ -139,11 +139,14 @@ pub fn run(
     // Like `goto`: the jump itself must never fail because of bookkeeping, so
     // print the path first and degrade recording failures to a warning. And
     // like `goto`, the line is captured by `cd "$(…)`": a dangerous path is
-    // refused, never escaped.
-    if sanitize::contains_dangerous(&path.to_string_lossy()) {
-        return Err(Error::UnsafePath(sanitize::path(&path)));
+    // refused, never escaped, and a lossy rendering is not a path.
+    let Some(rendered) = path.to_str() else {
+        return Err(Error::NonUtf8Path(path.clone()));
+    };
+    if sanitize::contains_dangerous(rendered) {
+        return Err(Error::UnsafePath(sanitize::text(rendered)));
     }
-    output::print_line(&path.display().to_string())?;
+    output::print_line(rendered)?;
     if let Some(id) = record
         && !options.no_track
         && let Err(err) = store.record_use(&id, Utc::now())
@@ -169,13 +172,17 @@ fn pick(
     // `Session::enter` enables anything: a signal during startup must take the
     // cancel path too.
     let interrupted = Arc::new(AtomicBool::new(false));
-    let terminate = [
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGHUP,
-    ];
+    let terminate = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
     for signal in terminate {
-        signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
+        let flag = Arc::clone(&interrupted);
+        // SAFETY: the handler only stores into an atomic, which is
+        // async-signal-safe; the registry keeps it registered for the
+        // process and both `signal-hook` majors in the tree share it.
+        unsafe {
+            signal_hook_registry::register(signal, move || {
+                flag.store(true, Ordering::Relaxed);
+            })?;
+        }
     }
 
     let mut session = Session::enter(options)?;
@@ -329,7 +336,15 @@ fn refresh_details(store: &SqliteStore, picker: &mut Picker) -> bool {
         .iter()
         .find(|project| project.id == id)
         .and_then(|project| git::current_branch(&project.path).map(git::Branch::label));
-    let history = store.recent_uses(&id, 5).unwrap_or_default();
+    let history = match store.recent_uses(&id, 5) {
+        Ok(history) => history,
+        Err(err) => {
+            // An empty list would claim the project was never used; say what
+            // actually happened.
+            picker.set_status(error_status(&err), true);
+            Vec::new()
+        }
+    };
     picker.set_details_info(id, branch, history);
     true
 }
@@ -438,7 +453,8 @@ fn pin(store: &SqliteStore, picker: &mut Picker, ids: &[String], pinned: bool) {
     match result {
         Ok(applied) => {
             let verb = if pinned { "pinned" } else { "unpinned" };
-            let message = batch_message(verb, applied, ids, &picker.name_of(&ids[0]));
+            let single = ids.first().map(|id| picker.name_of(id));
+            let message = batch_message(verb, applied, ids, single.as_deref().unwrap_or_default());
             picker.set_pinned_ids(ids, pinned);
             let preserve = picker.selected_project().map(|project| project.id.clone());
             picker.refilter(preserve.as_deref());
@@ -458,9 +474,18 @@ fn remove(store: &SqliteStore, picker: &mut Picker, ids: &[String]) {
 
     match result {
         Ok(applied) => {
-            let message = batch_message("removed", applied, ids, &picker.name_of(&ids[0]));
-            reload(store, picker, None);
-            picker.set_status(message, false);
+            let single = ids.first().map(|id| picker.name_of(id));
+            let message = batch_message(
+                "removed",
+                applied,
+                ids,
+                single.as_deref().unwrap_or_default(),
+            );
+            // A failed reload already put the store error in the status; a
+            // success message must not overwrite it.
+            if reload(store, picker, None) {
+                picker.set_status(message, false);
+            }
         }
         Err(err) => picker.set_status(error_status(&err), true),
     }
@@ -500,12 +525,13 @@ fn rename(store: &SqliteStore, picker: &mut Picker, id: String, name: String, fo
 
     match result {
         Ok(old_name) => {
-            reload(store, picker, Some(&confirmed_id));
             // The mutation is done; leaving the prompt open would re-send it
-            // on a second Enter. Set the mode before the status: changing
-            // mode clears it.
+            // on a second Enter. Close it before the reload, whose error
+            // status must then survive (and be the last word on failure).
             picker.set_mode(picker::Mode::Search);
-            picker.set_status(format!("renamed `{old_name}` -> `{name}`"), false);
+            if reload(store, picker, Some(&confirmed_id)) {
+                picker.set_status(format!("renamed `{old_name}` -> `{name}`"), false);
+            }
         }
         Err(Error::NameTaken { name, .. }) => picker.ask_rename_force(confirmed_id, name),
         Err(err) => picker.set_status(error_status(&err), true),
@@ -538,12 +564,12 @@ fn set_term(
 
     match result {
         Ok(message) => {
-            reload(store, picker, None);
-            // The mutation is done; leaving the prompt open would re-send it
-            // on a second Enter. Set the mode before the status: changing
-            // mode clears it.
+            // Close the prompt even when the reload fails: a second Enter
+            // must not re-send a mutation that already happened.
             picker.set_mode(picker::Mode::Search);
-            picker.set_status(message, false);
+            if reload(store, picker, None) {
+                picker.set_status(message, false);
+            }
         }
         Err(err) => picker.set_status(error_status(&err), true),
     }
@@ -551,8 +577,10 @@ fn set_term(
 
 /// Moves a stale project to a validated new path.
 fn repath(store: &SqliteStore, picker: &mut Picker, id: &str, raw: &str, home: Option<&Path>) {
-    let projects = picker.projects().to_vec();
-    let path = match doctor::validate_target(&projects, id, raw, home) {
+    // Borrow the list for the validation only; a `to_vec()` deep-cloned every
+    // project just to look at one id.
+    let validated = doctor::validate_target(picker.projects(), id, raw, home);
+    let path = match validated {
         Ok(path) => path,
         Err(err) => {
             picker.set_status(error_status(&err), true);
@@ -691,10 +719,18 @@ fn migrate_index(context: &Context, picker: &mut Picker) {
 }
 
 /// Replaces the in-memory index from the store.
-fn reload(store: &SqliteStore, picker: &mut Picker, preserve: Option<&str>) {
+/// Reloads the index into the picker; reports whether it succeeded (a failed
+/// load sets an error status and must not be overwritten by a success note).
+fn reload(store: &SqliteStore, picker: &mut Picker, preserve: Option<&str>) -> bool {
     match store.load() {
-        Ok(projects) => picker.set_projects(projects, preserve),
-        Err(err) => picker.set_status(error_status(&err), true),
+        Ok(projects) => {
+            picker.set_projects(projects, preserve);
+            true
+        }
+        Err(err) => {
+            picker.set_status(error_status(&err), true);
+            false
+        }
     }
 }
 

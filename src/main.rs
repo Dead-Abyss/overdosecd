@@ -24,6 +24,7 @@ mod ui;
 #[cfg(not(target_os = "linux"))]
 compile_error!("overdosecd only supports Linux (see README.md)");
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -50,8 +51,11 @@ fn main() {
         Err(err) => {
             let code = err.exit_code();
             // The error's Display already escapes every value; the funnel is a
-            // second net for a renderer that slipped.
-            if output::print_stderr_line(&format!("error: {err}")).is_err() {
+            // second net for a renderer that slipped. Several variants are
+            // multi-line by design (the ambiguity candidate list, the
+            // `--force` hint), so this sink is the raw one — and it adds no
+            // trailing newline, which the payload carries.
+            if output::print_stderr(&format!("error: {err}\n")).is_err() {
                 let _ = output::print_stderr_line("error: refusing to print an unsafe message");
             }
             std::process::exit(code);
@@ -67,7 +71,7 @@ fn run(cli: Cli) -> Result<i32> {
     let data_dir = paths::resolve_data_dir(cli.data_dir.as_deref())?;
 
     let location = config::locate(config::env_path(), config::platform_path());
-    let config = config::load(&location);
+    let (config, config_status) = config::load_status(&location);
 
     // The one-shot migration of a 0.2.0 `projects.json` runs before anything
     // touches the index. `doctor` and the shell-integration commands keep
@@ -151,13 +155,7 @@ fn run(cli: Cli) -> Result<i32> {
                 .as_ref()
                 .ok()
                 .is_some_and(|config| config.storage.backend.is_some());
-            cmd_doctor(
-                &store,
-                &data_dir,
-                args,
-                config::status(&location, config),
-                retired_storage,
-            )
+            cmd_doctor(&store, &data_dir, args, config_status, retired_storage)
         }
         // Completion runs on every TAB press and uses no matcher knobs, so it
         // deliberately does not fail on a broken config.
@@ -179,6 +177,11 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Init { shell } => {
             output::print(&output::init_script(shell, hooks))?;
             Ok(0)
+        }
+        // Static scripts need no settings; like `init`, they work with a
+        // broken config.
+        Command::Completions { shell } => {
+            output::print(&output::completion_script(shell)).map(|()| 0)
         }
         command => {
             let config = config?;
@@ -230,7 +233,9 @@ fn run(cli: Cli) -> Result<i32> {
                 Command::Migrate => cmd_migrate(&data_dir)?,
                 Command::Import(args) => cmd_import(&store, args)?,
                 Command::Scan(args) => cmd_scan(&data_dir, &config.discovery, args)?,
-                Command::Completions { shell } => output::print(&output::completion_script(shell))?,
+                Command::Completions { .. } => {
+                    unreachable!("completions is dispatched before the config load")
+                }
                 // Handled in the outer match, before the config is required.
                 Command::Doctor(_) => unreachable!("doctor is dispatched before the config load"),
                 Command::Complete { .. } => {
@@ -325,7 +330,11 @@ fn cmd_list(store: &SqliteStore, args: ListArgs) -> Result<()> {
 
     if args.json {
         let file = StoreFile::new(visible);
-        output::print_line(&serde_json::to_string_pretty(&file)?)
+        // Pretty JSON is multi-line by design; the raw sink keeps the
+        // trailing newline a line-oriented `curl | head` expects.
+        let mut body = serde_json::to_string_pretty(&file)?;
+        body.push('\n');
+        output::print(&body)
     } else if visible.is_empty() {
         if let Some(kind) = args.kind {
             output::print_line(&format!("no {} projects indexed", kind.label()))
@@ -418,9 +427,18 @@ fn cmd_hook(store: &SqliteStore, data_dir: &Path, hooks: output::HookSettings) {
         return;
     }
     let path = hook::file_path(data_dir);
+    // Two shells can cd at once; the lock covers the whole read-modify-write.
+    // A contended lock loses this one visit instead of blocking the cd.
+    let Some(_guard) = hook::lock(data_dir) else {
+        warn("cd hook skipped the visit counter: could not lock the visit store".to_owned());
+        return;
+    };
     let mut visits = hook::Visits::load(&path).unwrap_or_default();
     let now = Utc::now();
-    let count = visits.record_visit(&current, now);
+    let Some(count) = visits.record_visit(&current, now) else {
+        warn("cd hook skipped the visit counter: the path is not valid UTF-8".to_owned());
+        return;
+    };
     if visits.hint_due(&current, now) {
         visits.mark_hinted(&current, now);
         let name = project::default_name(&current)
@@ -460,6 +478,14 @@ fn cmd_goto(
             && (!confident || found.all_confident())
             && let Some(path) = worktree_for(&projects[found.index].path, branch)
         {
+            // Same existence rule as the normal path: a registrations file
+            // can name a checkout that no longer exists.
+            if !path.exists() {
+                return Err(Error::StaleDirectory {
+                    name: format!("{}:{branch}", found.name),
+                    path,
+                });
+            }
             return print_path(&path);
         }
     }
@@ -524,10 +550,15 @@ fn worktree_for(project: &Path, branch: &str) -> Option<PathBuf> {
 /// so a path a terminal would mangle is refused rather than escaped: an
 /// escaped path would be a wrong path.
 fn print_path(path: &Path) -> Result<()> {
-    if sanitize::contains_dangerous(&path.to_string_lossy()) {
-        return Err(Error::UnsafePath(sanitize::path(path)));
+    // `goto` is machine output: an escaped or lossy path is a wrong path, so
+    // a dangerous or non-UTF-8 one is refused rather than rendered.
+    let Some(rendered) = path.to_str() else {
+        return Err(Error::NonUtf8Path(path.to_path_buf()));
+    };
+    if sanitize::contains_dangerous(rendered) {
+        return Err(Error::UnsafePath(sanitize::text(rendered)));
     }
-    output::print_line(&path.display().to_string())
+    output::print_line(rendered)
 }
 
 fn cmd_info(store: &SqliteStore, query: &str, matching: &MatcherConfig, debug: bool) -> Result<()> {
@@ -1006,7 +1037,7 @@ fn cmd_import(store: &SqliteStore, args: ImportArgs) -> Result<()> {
         rows.extend(import::preview(&plan)?);
         // Same order and table as a `list` run would show afterwards.
         sort_projects(&mut rows, None);
-        let missing = vec![false; rows.len()];
+        let missing: Vec<bool> = rows.iter().map(|project| !project.path.exists()).collect();
         let width = output::terminal_width();
         output::print(&output::format_projects_with_missing(
             &rows,
@@ -1017,9 +1048,15 @@ fn cmd_import(store: &SqliteStore, args: ImportArgs) -> Result<()> {
         return output::print_line(&import::summary(&plan, true));
     }
 
-    let (imported, raced) = store.update(|projects| Ok(import::apply(projects, &plan.to_add)))?;
+    let (imported, raced, failed) =
+        store.update(|projects| Ok(import::apply(projects, &plan.to_add)))?;
     if raced > 0 {
         plan.existing += raced;
+    }
+    if failed > 0 {
+        plan.failed += failed;
+    }
+    if raced > 0 || failed > 0 {
         plan.to_add.truncate(imported);
     }
     output::print_line(&import::summary(&plan, false))
@@ -1138,16 +1175,24 @@ fn cmd_doctor(
             .collect();
         let (total, changed) = store.update(move |projects| {
             let mut changed = 0;
-            for (id, path, git, kind) in &detected {
-                let Some(project) = projects
-                    .iter_mut()
-                    .find(|project| project.id == *id && project.path == *path)
-                else {
-                    // Repathed or removed while planning; the next run sees it.
+            let detected: HashMap<&str, (&Path, &Option<project::GitInfo>, project::Kind)> =
+                detected
+                    .iter()
+                    .map(|(id, path, git, kind)| (id.as_str(), (path.as_path(), git, *kind)))
+                    .collect();
+            // One lookup per project instead of scanning `detected` each time
+            // (the old pass was O(n²) on a large index).
+            for project in projects.iter_mut() {
+                let Some((path, git, kind)) = detected.get(project.id.as_str()) else {
+                    // Removed while planning; the next run sees it.
                     continue;
                 };
-                if project.git != *git || project.kind != *kind {
-                    project.git = git.clone();
+                if project.path != *path {
+                    // Repathed while planning; the next run sees it.
+                    continue;
+                }
+                if project.git != **git || project.kind != *kind {
+                    project.git = (*git).clone();
                     project.kind = *kind;
                     changed += 1;
                 }

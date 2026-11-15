@@ -15,6 +15,8 @@ ignore = [
     # builds the byte-exact zoxide fixtures the hand-written parser is
     # verified against (see AGENTS.md, "bincode is a dev-dependency oracle").
     # Replacing it means hand-encoding the framing in the tests too.
+    # Note: cargo-deny matches advisories by ID regardless of dependency
+    # kind, so this ignore is global to the graph.
     { id = "RUSTSEC-2025-0141", reason = "dev-dependency fixture oracle; never ships in the binary" },
 ]
 

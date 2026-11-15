@@ -1,3 +1,4 @@
-# Keep the checkout byte-identical everywhere: normalize line endings to LF so
-# no editor or platform rewrites CRLF into fixture files.
+# Normalize source line endings to LF everywhere. Fixtures whose exact bytes
+# matter (escape sequences, embedded CR) are marked `-text` at their paths
+# when they are added; `text=auto eol=lf` alone would still rewrite CRLF.
 * text=auto eol=lf

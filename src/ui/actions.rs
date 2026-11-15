@@ -176,7 +176,7 @@ pub const HELP: [(&str, &str); 16] = [
     ("tab", "search mode / list mode"),
     (
         "j k ↑ ↓",
-        "move the highlight (list mode); arrows work while typing",
+        "move the highlight (list, palette, health); arrows work while typing",
     ),
     ("g G", "first / last row"),
     ("u d PgUp PgDn", "half-page moves"),

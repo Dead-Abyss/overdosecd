@@ -331,9 +331,23 @@ pub(crate) fn rank_indices(
 /// alphabetically. Missing directories are skipped, matching `list` default.
 pub fn completion_candidates(projects: &[Project], prefix: &str) -> Vec<String> {
     let prefix = prefix.trim().to_lowercase();
+    // One predicate for both the pre-filter and the flat_map: a mismatch
+    // would silently drop candidates for projects the stat ran on.
+    fn is_candidate(value: &str, prefix: &str) -> bool {
+        !crate::sanitize::contains_dangerous(value) && value.to_lowercase().starts_with(prefix)
+    }
     let mut candidates: Vec<String> = projects
         .iter()
-        .filter(|project| project.path.exists())
+        // Cheap prefix/danger checks first: the stat for a stale project is
+        // the expensive part, so only a project with an interesting
+        // candidate pays for it (a TAB press runs on every shell prompt).
+        .filter(|project| {
+            let interesting = std::iter::once(&project.name)
+                .chain(project.aliases.iter())
+                .chain(project.tags.iter())
+                .any(|value| is_candidate(value, &prefix));
+            interesting && project.path.exists()
+        })
         .flat_map(|project| {
             std::iter::once(&project.name)
                 .chain(project.aliases.iter())
@@ -342,8 +356,7 @@ pub fn completion_candidates(projects: &[Project], prefix: &str) -> Vec<String> 
         // Completion candidates are written straight into the shell's
         // COMPREPLY/COMPLIST on a TAB press; a value with control or
         // invisible characters must never make that trip.
-        .filter(|value| !crate::sanitize::contains_dangerous(value))
-        .filter(|value| value.to_lowercase().starts_with(&prefix))
+        .filter(|value| is_candidate(value, &prefix))
         .cloned()
         .collect();
 
@@ -400,7 +413,7 @@ fn best_of(query: &str, scored: Vec<Scored>, projects: &[Project], margin: i64) 
 
     let ambiguous = scored
         .get(1)
-        .is_some_and(|second| scored[0].score - second.score <= margin);
+        .is_some_and(|second| scored[0].score.saturating_sub(second.score) <= margin);
     if ambiguous {
         return Err(Error::Ambiguous {
             query: query.trim().to_owned(),
@@ -430,7 +443,7 @@ pub(crate) fn best_of_ranked(query: &str, mut ranked: Vec<Match>, margin: i64) -
 
     let ambiguous = ranked
         .get(1)
-        .is_some_and(|second| ranked[0].score - second.score <= margin);
+        .is_some_and(|second| ranked[0].score.saturating_sub(second.score) <= margin);
     if ambiguous {
         ranked.truncate(MAX_CANDIDATES);
         return Err(Error::Ambiguous {
@@ -538,7 +551,12 @@ fn signal_score(
 
         // The owner only counts as part of the full `owner/repo` slug,
         // so an org name cannot match every repository on its own.
-        if !owner.is_empty() && format!("{owner}/{repo}") == query {
+        if !owner.is_empty()
+            && query.len() == owner.len() + 1 + repo.len()
+            && query.starts_with(owner.as_str())
+            && query.as_bytes().get(owner.len()) == Some(&b'/')
+            && &query[owner.len() + 1..] == repo
+        {
             improve(&mut best, EXACT_SLUG, Reason::GitRemote);
         }
     }
@@ -549,16 +567,24 @@ fn signal_score(
 /// The bonuses a project earns regardless of which term matched; they are
 /// applied once to the combined signal score.
 fn apply_bonuses(base: i64, project: &Project, config: &MatcherConfig, now: DateTime<Utc>) -> i64 {
+    // Saturating on purpose: `MatcherConfig` comes from the user's config
+    // file, and a hand-edited absurd weight used to overflow (a debug panic,
+    // a silently inverted ranking in release). `config.rs` caps the values;
+    // this is the defense in depth that keeps a directly built config safe.
     let mut total = base;
     if project.pinned {
-        total += config.pinned_bonus;
+        total = total.saturating_add(config.pinned_bonus);
     }
     if project.git.is_some() {
-        total += GIT_BONUS;
+        total = total.saturating_add(GIT_BONUS);
     }
-    total -= config.depth_penalty * project.path.components().count() as i64;
-    total += config.frequency_bonus(project.use_count);
-    total += config.recency_bonus(project.last_used_at, now);
+    total = total.saturating_sub(
+        config
+            .depth_penalty
+            .saturating_mul(project.path.components().count() as i64),
+    );
+    total = total.saturating_add(config.frequency_bonus(project.use_count));
+    total = total.saturating_add(config.recency_bonus(project.last_used_at, now));
     total
 }
 
@@ -996,6 +1022,51 @@ mod tests {
             vec!["Σ"],
             "non-ASCII case folds collapse too"
         );
+    }
+
+    #[test]
+    fn absurd_weights_saturate_instead_of_overflowing() {
+        // A directly built `MatcherConfig` skips config validation; scoring
+        // must still neither panic (debug) nor wrap into an inverted order.
+        let mut pinned = project("over", "/a/over");
+        pinned.pinned = true;
+        let projects = vec![project("over", "/b/over"), pinned];
+
+        let huge_bonus = MatcherConfig {
+            pinned_bonus: i64::MAX,
+            ..MatcherConfig::DEFAULT
+        };
+        let ranked = super::rank("over", &projects, &huge_bonus);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].index, 1, "the pinned project wins");
+        assert!(
+            ranked[0].score > ranked[1].score,
+            "saturated scores keep the order: {} vs {}",
+            ranked[0].score,
+            ranked[1].score
+        );
+        assert!(ranked[0].score > 0);
+
+        // A penalty that cannot be represented saturates down instead of
+        // overflowing the other way; ordering stays deterministic.
+        let absurd = MatcherConfig {
+            pinned_bonus: i64::MAX,
+            depth_penalty: i64::MAX,
+            ..MatcherConfig::DEFAULT
+        };
+        let first = super::rank("over", &projects, &absurd);
+        assert_eq!(first.len(), 2);
+        // The saturated scores are ordered, not wrapped: the pinned project
+        // still ranks first (before the fix this wrapped into an inversion).
+        assert!(
+            first[0].score >= first[1].score,
+            "saturated scores keep the order: {} vs {}",
+            first[0].score,
+            first[1].score
+        );
+        let second = super::rank("over", &projects, &absurd);
+        let scores: Vec<i64> = first.iter().map(|m| m.score).collect();
+        assert_eq!(scores, second.iter().map(|m| m.score).collect::<Vec<_>>());
     }
 
     #[test]

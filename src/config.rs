@@ -241,14 +241,20 @@ pub fn platform_path() -> Option<PathBuf> {
     crate::dirs::config_dir().map(|dir| dir.join("config.toml"))
 }
 
-/// Reads the config file.
+/// Reads the config file and classifies what happened, in one pass.
 ///
-/// A missing file at the platform path is not an error; built-in defaults
-/// apply. A missing file that `$OVERDOSECD_CONFIG` pointed at is, because the
-/// user asked for that file explicitly.
-pub fn load(location: &Location) -> Result<Config> {
+/// `doctor` needs both the value (or the reason it is unusable) and a status
+/// that says whether a file was actually read. Deriving the status from a
+/// second `exists()` check after the load was both redundant and racy: a file
+/// created in between would report `Loaded` for defaults that were already
+/// applied.
+pub fn load_status(location: &Location) -> (Result<Config>, Status) {
     let Some(path) = &location.path else {
-        return Ok(Config::default());
+        return (Ok(Config::default()), Status::Defaults { path: None });
+    };
+    let invalid = |message: String| Status::Invalid {
+        path: path.clone(),
+        message,
     };
 
     // A relative path resolves against the current directory, so a planted
@@ -261,28 +267,50 @@ pub fn load(location: &Location) -> Result<Config> {
     } else {
         "the platform config path"
     };
-    crate::paths::absolute(kind, path)?;
+    if let Err(err) = crate::paths::absolute(kind, path) {
+        let status = invalid(err.to_string());
+        return (Err(err), status);
+    }
 
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             if location.explicit {
-                return Err(Error::ConfigNotFound(path.clone()));
+                let error = Error::ConfigNotFound(path.clone());
+                let status = invalid(format!("not found (from {ENV_CONFIG})"));
+                return (Err(error), status);
             }
-            return Ok(Config::default());
+            return (
+                Ok(Config::default()),
+                Status::Defaults {
+                    path: Some(path.clone()),
+                },
+            );
         }
         Err(err) => {
-            return Err(Error::Config {
+            let message = err.to_string();
+            let error = Error::Config {
                 origin: path.display().to_string(),
-                message: err.to_string(),
-            });
+                message,
+            };
+            // `Doctor` already prints the path; keep only the reason (the
+            // parse branch below does the same).
+            let status = invalid(err.to_string());
+            return (Err(error), status);
         }
     };
 
-    parse(&text).map_err(|message| Error::Config {
-        origin: path.display().to_string(),
-        message,
-    })
+    match parse(&text) {
+        Ok(config) => (Ok(config), Status::Loaded { path: path.clone() }),
+        Err(message) => {
+            let status = invalid(message.clone());
+            let error = Error::Config {
+                origin: path.display().to_string(),
+                message,
+            };
+            (Err(error), status)
+        }
+    }
 }
 
 /// What `doctor` reports about the config file, without failing on problems.
@@ -296,33 +324,6 @@ pub enum Status {
 
     /// The file (or `$OVERDOSECD_CONFIG`) is unusable.
     Invalid { path: PathBuf, message: String },
-}
-
-/// Classifies an already-loaded config, for the `doctor` report.
-pub fn status(location: &Location, loaded: Result<Config>) -> Status {
-    let Some(path) = &location.path else {
-        return Status::Defaults { path: None };
-    };
-
-    match loaded {
-        Ok(_) if path.exists() => Status::Loaded { path: path.clone() },
-        Ok(_) => Status::Defaults {
-            path: Some(path.clone()),
-        },
-        // The report already prints the path, so keep only the reason.
-        Err(Error::Config { message, .. }) => Status::Invalid {
-            path: path.clone(),
-            message,
-        },
-        Err(Error::ConfigNotFound(_)) => Status::Invalid {
-            path: path.clone(),
-            message: format!("not found (from {ENV_CONFIG})"),
-        },
-        Err(err) => Status::Invalid {
-            path: path.clone(),
-            message: err.to_string(),
-        },
-    }
 }
 
 /// Resolves the effective color mode: flag, then `$OVERDOSECD_COLOR`, then the
@@ -354,10 +355,43 @@ pub fn apply_color(mode: ColorMode) {
     }
 }
 
+/// Upper bound for every `[matching]` weight. The scoring path sums and
+/// multiplies these values in `i64`; the ceiling keeps even an absurd config
+/// from overflowing (the defaults are three orders of magnitude smaller).
+const MAX_WEIGHT: i64 = 1_000_000;
+
+/// Upper bound for `[discovery] max_entries`. The walk multiplies this by
+/// `WALK_BUDGET_FACTOR` and the cache is serialized whole, so an unbounded
+/// value would size both.
+const MAX_DISCOVERY_ENTRIES: usize = 1_000_000;
+
 fn parse(text: &str) -> std::result::Result<Config, String> {
-    let config: Config = toml::from_str(text).map_err(|err| err.message().to_owned())?;
+    let config: Config = toml::from_str(text).map_err(|err| describe_toml_error(text, &err))?;
     config.validate()?;
     Ok(config)
+}
+
+/// Renders a TOML error as one line (`line N, column M: reason`).
+///
+/// `Display` would keep the multi-line span with the source excerpt, but every
+/// human-facing sink is line-oriented (the funnel refuses embedded newlines),
+/// so the position is folded into a prefix instead.
+fn describe_toml_error(text: &str, err: &toml::de::Error) -> String {
+    let message = err.message();
+    let Some(span) = err.span() else {
+        return message.to_owned();
+    };
+    let start = span.start.min(text.len());
+    if !text.is_char_boundary(start) {
+        return message.to_owned();
+    }
+    let before = &text[..start];
+    let line = before.bytes().filter(|&byte| byte == b'\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(1, |line| line.chars().count() + 1);
+    format!("line {line}, column {column}: {message}")
 }
 
 impl Config {
@@ -370,8 +404,10 @@ impl Config {
             ("matching.ambiguity_margin", matching.ambiguity_margin),
             ("matching.depth_penalty", matching.depth_penalty),
         ] {
-            if value < 0 {
-                return Err(format!("{name} must be >= 0 (got {value})"));
+            if !(0..=MAX_WEIGHT).contains(&value) {
+                return Err(format!(
+                    "{name} must be between 0 and {MAX_WEIGHT} (got {value})"
+                ));
             }
         }
         if self.ui.height < 3 {
@@ -383,9 +419,9 @@ impl Config {
         if self.discovery.max_depth < 1 {
             return Err("discovery.max_depth must be at least 1".to_owned());
         }
-        if self.discovery.max_entries < 100 {
+        if !(100..=MAX_DISCOVERY_ENTRIES).contains(&self.discovery.max_entries) {
             return Err(format!(
-                "discovery.max_entries must be at least 100 (got {})",
+                "discovery.max_entries must be between 100 and {MAX_DISCOVERY_ENTRIES} (got {})",
                 self.discovery.max_entries
             ));
         }
@@ -458,6 +494,48 @@ mod tests {
     }
 
     #[test]
+    fn absurd_matching_weights_are_rejected() {
+        // The scoring path sums these in `i64`; before the ceiling, a value
+        // like this one overflowed a debug build and wrapped in release.
+        for name in [
+            "recency_max",
+            "frequency_max",
+            "pinned_bonus",
+            "ambiguity_margin",
+            "depth_penalty",
+        ] {
+            for value in ["-1", "9223372036854775807"] {
+                let text = format!("[matching]\n{name} = {value}\n");
+                let err = parse(&text).expect_err("out-of-range weight");
+                assert!(err.contains(name), "error for {name}={value} was: {err}");
+            }
+            let text = format!("[matching]\n{name} = 1000001\n");
+            let err = parse(&text).expect_err("one over the ceiling");
+            assert!(err.contains(name), "error for {name} was: {err}");
+            let text = format!("[matching]\n{name} = 1000000\n");
+            parse(&text).expect("a value at the ceiling parses");
+        }
+    }
+
+    #[test]
+    fn absurd_discovery_budgets_are_rejected() {
+        let err = parse("[discovery]\nmax_entries = 1000000000\n")
+            .expect_err("max_entries has no cheap answer above the ceiling");
+        assert!(err.contains("max_entries"), "error was: {err}");
+        let err = parse("[discovery]\nmax_entries = 99\n").expect_err("lower bound");
+        assert!(err.contains("max_entries"), "error was: {err}");
+    }
+
+    #[test]
+    fn toml_errors_keep_their_span() {
+        let err = parse("[ui]\nheight = \"ten\"\n").expect_err("wrong type");
+        assert!(
+            err.contains("line 2") || err.contains("column"),
+            "span lost: {err}"
+        );
+    }
+
+    #[test]
     fn partial_files_keep_the_other_defaults() {
         let config = parse("[matching]\nfuzzy = false\n").expect("partial config parses");
         assert!(!config.matching.fuzzy);
@@ -520,7 +598,8 @@ mod tests {
             explicit: true,
         };
         assert_eq!(
-            load(&location)
+            load_status(&location)
+                .0
                 .expect("config loads")
                 .matching
                 .ambiguity_margin,
@@ -535,7 +614,10 @@ mod tests {
             path: Some(path),
             explicit: false,
         };
-        assert_eq!(load(&location).expect("missing is fine"), Config::default());
+        assert_eq!(
+            load_status(&location).0.expect("missing is fine"),
+            Config::default()
+        );
     }
 
     #[test]
@@ -545,7 +627,7 @@ mod tests {
             path: Some(path.clone()),
             explicit: true,
         };
-        match load(&location) {
+        match load_status(&location).0 {
             Err(Error::ConfigNotFound(error_path)) => assert_eq!(error_path, path),
             other => panic!("expected ConfigNotFound, got {other:?}"),
         }
@@ -559,7 +641,7 @@ mod tests {
             path: Some(path.clone()),
             explicit: true,
         };
-        match load(&location) {
+        match load_status(&location).0 {
             Err(Error::Config { origin, .. }) => assert_eq!(origin, path.display().to_string()),
             other => panic!("expected a config error, got {other:?}"),
         }
@@ -571,15 +653,16 @@ mod tests {
             path: Some(PathBuf::from("config.toml")),
             explicit: true,
         };
-        let err = load(&location).expect_err("refused");
+        let err = load_status(&location).0.expect_err("refused");
         assert!(matches!(err, Error::RelativePath { .. }), "{err:?}");
 
         // No path at all still means built-in defaults.
         assert!(
-            load(&Location {
+            load_status(&Location {
                 path: None,
                 explicit: false
             })
+            .0
             .is_ok()
         );
     }
@@ -646,14 +729,14 @@ mod tests {
             path: Some(missing.clone()),
             explicit: false,
         };
-        let defaults = status(&location, load(&location));
+        let defaults = load_status(&location).1;
         assert!(matches!(defaults, Status::Defaults { .. }));
 
         let location = Location {
             path: Some(missing),
             explicit: true,
         };
-        let explicit_missing = status(&location, load(&location));
+        let explicit_missing = load_status(&location).1;
         match explicit_missing {
             Status::Invalid { message, .. } => {
                 assert!(message.contains("not found"), "message was: {message}");
@@ -668,7 +751,7 @@ mod tests {
             path: Some(path.clone()),
             explicit: true,
         };
-        let loaded = status(&location, load(&location));
+        let loaded = load_status(&location).1;
         assert_eq!(loaded, Status::Loaded { path });
 
         let (_dir, broken) = temp_path("config.toml");
@@ -677,7 +760,7 @@ mod tests {
             path: Some(broken.clone()),
             explicit: true,
         };
-        let invalid = status(&location, load(&location));
+        let invalid = load_status(&location).1;
         match invalid {
             Status::Invalid { path, message } => {
                 assert_eq!(path, broken);

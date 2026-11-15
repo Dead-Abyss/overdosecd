@@ -76,7 +76,17 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Assert the toolchain is the declared MSRV
         run: |
-          declared="$(grep -m1 '^rust-version = ' Cargo.toml | cut -d'"' -f2)"
+          # Parse the manifest instead of grepping it: a `rust-version.workspace`
+          # or single-quoted value would make `grep` yield empty, and an empty
+          # declared version must fail loudly, never pass the case below.
+          # `cargo metadata` is the same mechanism release.yml uses (no second
+          # manifest parser tied to the runner's Python version).
+          declared="$(cargo metadata --no-deps --format-version 1 |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0].get("rust_version") or "")')"
+          if [ -z "$declared" ]; then
+            echo "Cargo.toml has no package.rust-version" >&2
+            exit 1
+          fi
           actual="$(rustc --version | cut -d' ' -f2)"
           case "$actual" in
             "$declared"|"$declared".*) ;;

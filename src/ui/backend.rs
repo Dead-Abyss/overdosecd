@@ -9,7 +9,7 @@
 //! that never answers must not hang the picker.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,11 +19,12 @@ use ratatui::layout::{Position, Size};
 
 /// How long the terminal gets to answer a cursor report before the query is
 /// treated as unsupported. Generous on purpose: over a slow SSH link a round
-/// trip can take a moment, and this is paid once at startup.
+/// trip can take a moment. It is paid at startup and again on every resize
+/// (ratatui re-anchors the inline viewport).
 const CURSOR_QUERY_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// Longest cursor report worth buffering: `ESC [ 65535 ; 65535 R`.
-const MAX_REPORT_BYTES: usize = 32;
+/// Longest buffer worth keeping for reports: two of `ESC [ 65535 ; 65535 R`.
+const MAX_REPORT_BYTES: usize = 64;
 
 pub struct TtyBackend {
     /// Drawing and every other escape sequence.
@@ -36,7 +37,7 @@ pub struct TtyBackend {
 }
 
 impl TtyBackend {
-    pub fn new(drawing: File, query: File) -> Self {
+    pub(crate) fn new(drawing: File, query: File) -> Self {
         Self {
             inner: CrosstermBackend::new(drawing),
             query,
@@ -65,16 +66,19 @@ impl Backend for TtyBackend {
     fn get_cursor_position(&mut self) -> io::Result<Position> {
         match query_cursor_position(&mut self.query) {
             Ok(Some(position)) => Ok(position),
-            Ok(None) | Err(_) => {
-                // A terminal that does not answer must not end the session
-                // (ratatui's inline viewport asks again on every resize).
-                // Anchor at the bottom edge instead of failing the draw.
+            // A terminal that does not answer must not end the session
+            // (ratatui's inline viewport asks again on every resize). Anchor
+            // at the bottom edge instead of failing the draw.
+            Ok(None) => {
                 let size = self.inner.size()?;
                 Ok(Position {
                     x: 0,
                     y: size.height.saturating_sub(1),
                 })
             }
+            // A genuinely broken handle is different from a silent terminal:
+            // hiding it as a normal position masked EIO on a dead tty.
+            Err(err) => Err(err),
         }
     }
 
@@ -111,49 +115,124 @@ impl Backend for TtyBackend {
 /// `ESC [ row ; col R` reply. The handle is non-blocking (see `open_tty`), so
 /// the timeout is a deadline loop rather than a reader thread: a thread could
 /// outlive the query and steal the user's typed input.
+///
+/// Anything already queued is discarded *before* the query: a late answer to
+/// an earlier (timed-out) query would otherwise be read as this one's reply
+/// and the fresh answer would be left for crossterm to interpret as keys.
+/// Reading stops after the first complete report so a keystroke arriving
+/// right behind it is not swallowed.
 fn query_cursor_position(tty: &mut File) -> io::Result<Option<Position>> {
-    tty.write_all(b"\x1b[6n")?;
-    tty.flush()?;
+    drain_queued(tty);
 
+    // A full output queue (Ctrl-S flow control) is backpressure, not a dead
+    // terminal: retry the remaining bytes under the shared query deadline
+    // instead of abandoning a partial `ESC [ 6 n` in its parser.
     let deadline = Instant::now() + CURSOR_QUERY_TIMEOUT;
+    if !write_query(tty, deadline)? {
+        return Ok(None);
+    }
+
     let mut reply = Vec::with_capacity(MAX_REPORT_BYTES);
     let mut byte = [0u8; 1];
+    let mut saw_report = false;
     while reply.len() < MAX_REPORT_BYTES {
         match tty.read(&mut byte) {
-            Ok(0) => return Ok(None),
+            // EOF before any answer means an unsupported query; after one,
+            // the last complete report is still usable.
+            Ok(0) => break,
             Ok(_) => {
                 reply.push(byte[0]);
                 if byte[0] == b'R' {
+                    saw_report = true;
                     break;
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
-                    return Ok(None);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(if saw_report {
+        parse_cursor_report(&reply)
+    } else {
+        None
+    })
+}
+
+/// Writes `ESC [ 6 n`, retrying a non-blocking writer until `deadline`.
+///
+/// Returns `false` when the whole sequence could not be written in time (or
+/// the handle closed); the caller then treats the query as unanswered, so a
+/// flow-controlled terminal degrades to the fallback anchor.
+fn write_query(tty: &mut impl std::io::Write, deadline: Instant) -> io::Result<bool> {
+    let query = b"\x1b[6n";
+    let mut written = 0;
+    while written < query.len() {
+        match tty.write(&query[written..]) {
+            Ok(0) => return Ok(false),
+            Ok(count) => written += count,
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::Interrupted =>
+            {
+                if Instant::now() >= deadline {
+                    return Ok(false);
                 }
                 thread::sleep(Duration::from_millis(2));
             }
             Err(err) => return Err(err),
         }
     }
-    Ok(parse_cursor_report(&reply))
+    tty.flush()?;
+    Ok(true)
+}
+
+/// Reads and discards up to one report's worth of bytes already queued on the
+/// tty.
+///
+/// Only bytes that are already there are touched, so the drain cannot eat
+/// input typed after the query; input queued *before* it may be discarded
+/// (the read loop always tolerated junk in front of the report), and the
+/// byte bound keeps a terminal spewing output from stalling the query.
+fn drain_queued(tty: &mut File) {
+    let mut byte = [0u8; 1];
+    for _ in 0..MAX_REPORT_BYTES {
+        match tty.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
 }
 
 /// Parses the last complete `ESC [ row ; col R` in `reply` into a zero-based
-/// position. Taking the last one tolerates typed input that reached the tty
-/// before the answer (and a second, stale report).
+/// position. Every candidate is tried (an incomplete report before the answer
+/// must not hide it), and taking the last one tolerates typed input that
+/// reached the tty before the answer plus a second, stale report.
 fn parse_cursor_report(reply: &[u8]) -> Option<Position> {
-    let start = reply.windows(2).rposition(|pair| pair == b"\x1b[")?;
-    let rest = &reply[start + 2..];
-    let end = rest.iter().position(|&byte| byte == b'R')?;
-    let body = std::str::from_utf8(&rest[..end]).ok()?;
-    let (row, column) = body.split_once(';')?;
-    let row: u16 = row.parse().ok()?;
-    let column: u16 = column.parse().ok()?;
-    Some(Position {
-        x: column.saturating_sub(1),
-        y: row.saturating_sub(1),
-    })
+    let mut best = None;
+    let mut search = 0;
+    while let Some(offset) = reply[search..].windows(2).position(|pair| pair == b"\x1b[") {
+        let start = search + offset + 2;
+        if let Some(end) = reply[start..].iter().position(|&byte| byte == b'R')
+            && let Ok(body) = std::str::from_utf8(&reply[start..start + end])
+            && let Some((row, column)) = body.split_once(';')
+            && let (Ok(row), Ok(column)) = (row.parse::<u16>(), column.parse::<u16>())
+        {
+            best = Some(Position {
+                x: column.saturating_sub(1),
+                y: row.saturating_sub(1),
+            });
+        }
+        search = start;
+    }
+    best
 }
 
 #[cfg(test)]
@@ -187,6 +266,17 @@ mod tests {
             Some(Position { x: 2, y: 1 }),
             "the last report wins"
         );
+        // A stale, incomplete report in front of the answer must not hide it
+        // (the old parser took the last ESC[ and gave up on this buffer).
+        assert_eq!(
+            parse_cursor_report(b"\x1b[1;1\x1b[9;9R"),
+            Some(Position { x: 8, y: 8 })
+        );
+        // ... and a partial report after it must not hide an earlier one.
+        assert_eq!(
+            parse_cursor_report(b"\x1b[4;7R\x1b[9;9"),
+            Some(Position { x: 6, y: 3 })
+        );
     }
 
     #[test]
@@ -206,5 +296,57 @@ mod tests {
                 assert_eq!(parsed, None, "reply: {reply:?}");
             }
         }
+    }
+
+    /// A writer that reports backpressure for the first `stalls` calls, then
+    /// accepts at most `chunk` bytes per call.
+    struct FlakyWriter {
+        stalls: usize,
+        chunk: usize,
+        out: Vec<u8>,
+    }
+
+    impl std::io::Write for FlakyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.stalls > 0 {
+                self.stalls -= 1;
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            let count = buf.len().min(self.chunk);
+            self.out.extend_from_slice(&buf[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_query_write_survives_backpressure() {
+        let mut writer = FlakyWriter {
+            stalls: 2,
+            chunk: 2,
+            out: Vec::new(),
+        };
+        assert!(
+            write_query(&mut writer, Instant::now() + Duration::from_secs(1)).expect("write"),
+            "a partial write is retried to completion"
+        );
+        assert_eq!(
+            writer.out, b"\x1b[6n",
+            "no truncated escape is left in the parser"
+        );
+
+        let mut stalled = FlakyWriter {
+            stalls: usize::MAX,
+            chunk: 1,
+            out: Vec::new(),
+        };
+        assert!(
+            !write_query(&mut stalled, Instant::now()).expect("timeout is not an error"),
+            "an expired deadline means the query is unanswered"
+        );
+        assert!(stalled.out.is_empty(), "nothing partial is written");
     }
 }

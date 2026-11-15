@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -83,6 +83,54 @@ pub fn sibling_backup(path: &Path, tag: &str) -> PathBuf {
     candidate
 }
 
+/// Opens a regular file for reading, refusing symlinks and special files.
+///
+/// The open itself is `O_NOFOLLOW | O_NONBLOCK`: a metadata check followed by
+/// a separate open re-resolves the path, so a cloned repository that swaps a
+/// `.git` file for a FIFO between the two calls blocks the read (or streams a
+/// device). The type and size are checked on the handle, after which a swap
+/// can no longer change what is read. `Ok(None)` means "not a usable file";
+/// `Err` is the open/metadata failure (NotFound included).
+pub(crate) fn open_regular_io(path: &Path, cap: u64) -> io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > cap {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+/// [`open_regular_io`] for callers that treat every failure as absent.
+pub(crate) fn open_regular(path: &Path, cap: u64) -> Option<std::fs::File> {
+    open_regular_io(path, cap).ok().flatten()
+}
+
+/// Opens a regular file for reading, *following* a final-component symlink.
+///
+/// The store files must never follow a link, but a repository's `.git` files
+/// and git's `include.path` targets are legitimately symlinked by dotfile
+/// managers. The open is still `O_NONBLOCK` and the type/size are still
+/// checked on the handle, so a FIFO or a giant file stays bounded; only the
+/// `O_NOFOLLOW` refusal is dropped.
+pub(crate) fn open_follow_io(path: &Path, cap: u64) -> io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > cap {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
 /// Reads a rebuildable JSON file through the hostile-file gate: a small
 /// regular file, not a symlink, the size cap enforced by the read itself,
 /// valid UTF-8 and JSON. `None` on any failure: the caller rebuilds.
@@ -90,16 +138,8 @@ pub fn read_rebuildable_json<T: serde::de::DeserializeOwned>(
     path: &Path,
     max_bytes: u64,
 ) -> Option<T> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    if metadata.len() > max_bytes {
-        return None;
-    }
     let mut raw = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
+    open_regular(path, max_bytes)?
         .take(max_bytes + 1)
         .read_to_end(&mut raw)
         .ok()?;
@@ -135,12 +175,23 @@ pub(crate) fn write_private(path: &Path, body: &[u8]) -> Result<()> {
         ensure_dir(parent)?;
     }
 
-    // A pid-suffixed name plus `create_new`: a crashed write can leave a
-    // leftover behind, and a planted file or symlink (in a data directory
-    // someone else can write) must never be opened and truncated.
+    // A pid-suffixed name built from the full file name plus `create_new`: a
+    // crashed write can leave a leftover behind, and a planted file or symlink
+    // (in a data directory someone else can write) must never be opened and
+    // truncated. Building from the file name (not `with_extension`) keeps
+    // `projects.json` and `projects.db` from ever mapping to one temp name.
     // `remove_file` unlinks the name itself, it does not follow a symlink.
-    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -249,7 +300,68 @@ mod tests {
                 read_rebuildable_json::<serde_json::Value>(&link, 1024).is_none(),
                 "a symlink is absent"
             );
+
+            // The whole point of `O_NONBLOCK | O_NOFOLLOW`: a FIFO must be
+            // refused without blocking this thread forever.
+            let fifo = dir.path().join("cache-fifo.json");
+            make_fifo(&fifo);
+            assert!(
+                read_rebuildable_json::<serde_json::Value>(&fifo, 1024).is_none(),
+                "a FIFO is absent, not a blocking read"
+            );
         }
+
+        std::fs::write(&path, "{\"dirs\":[]}").expect("grow past the cap");
+        assert!(
+            read_rebuildable_json::<serde_json::Value>(&path, 4).is_none(),
+            "a file over the cap is absent"
+        );
+    }
+
+    /// A plain `mkfifo(2)` on a fresh temp path.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw = CString::new(path.as_os_str().as_bytes()).expect("path");
+        // SAFETY: the path is a fresh temp file name.
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0, "mkfifo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_follow_io_follows_symlinks_but_refuses_special_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A symlinked small regular file is followed (dotfile managers do
+        // this to `.git`/`include.path`); the type and size are still checked
+        // on the followed target.
+        let target = dir.path().join("target.json");
+        std::fs::write(&target, b"ok").expect("target");
+        let link = dir.path().join("target-link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(
+            open_follow_io(&link, 1024).expect("open").is_some(),
+            "a symlinked regular file is followed"
+        );
+        assert!(
+            open_follow_io(&link, 1).expect("open").is_none(),
+            "an over-cap followed target is refused"
+        );
+
+        let fifo = dir.path().join("follow-fifo");
+        make_fifo(&fifo);
+        let fifo_link = dir.path().join("follow-fifo-link");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).expect("symlink");
+        assert!(
+            open_follow_io(&fifo_link, 1024).expect("open").is_none(),
+            "a symlink to a FIFO is not a regular file"
+        );
+        assert!(
+            open_regular_io(&fifo, 1024).expect("open").is_none(),
+            "the strict variant refuses a FIFO without blocking"
+        );
     }
 
     #[test]

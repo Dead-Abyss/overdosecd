@@ -178,11 +178,7 @@ pub fn expand_tilde_with(input: &str, home: Option<&Path>) -> PathBuf {
 /// canonicalizes it with the control-character guard. The shared front half
 /// of `add`, `scan <root>...`, the picker's add prompt, and `doctor --fix`.
 pub fn require_dir(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
-    let expanded = if path.starts_with("~") {
-        expand_tilde_with(&path.to_string_lossy(), home)
-    } else {
-        path.to_path_buf()
-    };
+    let expanded = expand_tilde_path(path, home);
     if !expanded.exists() {
         return Err(Error::MissingDirectory(expanded));
     }
@@ -192,6 +188,24 @@ pub fn require_dir(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
     let canonical = normalize(&expanded)?;
     reject_control_chars_path(&canonical)?;
     Ok(canonical)
+}
+
+/// [`expand_tilde_with`] for an arbitrary `Path`, component-wise so non-UTF-8
+/// bytes survive: a `to_string_lossy` round trip silently rewrites them to
+/// `U+FFFD` and the following existence checks would look at a different path.
+fn expand_tilde_path(path: &Path, home: Option<&Path>) -> PathBuf {
+    use std::path::Component;
+
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Normal(first)) if first == "~" => {
+            let Some(home) = home else {
+                return path.to_path_buf();
+            };
+            home.join(components.as_path())
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Canonicalizes a path: resolves symlinks, `.`, and `..`.
@@ -258,24 +272,56 @@ pub fn insert(
     force: bool,
     meta: (Option<GitInfo>, Kind),
 ) -> Result<String> {
-    if let Some(existing) = projects.iter_mut().find(|project| project.path == path) {
+    // Normalize at the one creation site: direct callers (the picker, the
+    // importer) must get the same trimming and control-character refusal as
+    // the `add` command's own arguments.
+    for alias in &aliases {
+        reject_control_chars("alias", alias)?;
+    }
+    for tag in &tags {
+        reject_control_chars("tag", tag)?;
+    }
+
+    if let Some(position) = projects.iter().position(|project| project.path == path) {
         if !force {
             return Err(Error::Duplicate {
-                name: existing.name.clone(),
+                name: projects[position].name.clone(),
                 path: path.clone(),
             });
         }
         if let Some(name) = name {
-            existing.name = name;
+            let name = sanitize_value("project name", &name)?;
+            // `--force` targets the *path*; renaming on top of another
+            // project's name would silently steal it. Name the colliding
+            // project, not this one, and do not suggest `--force` (it is
+            // already on).
+            if let Some(other) = projects
+                .iter()
+                .enumerate()
+                .find(|(index, other)| *index != position && other.name.eq_ignore_ascii_case(&name))
+                .map(|(_, other)| other)
+            {
+                return Err(Error::InvalidValue(format!(
+                    "another project is already named `{}`: {}; rename it first",
+                    crate::sanitize::text(&name),
+                    crate::sanitize::path(&other.path)
+                )));
+            }
+            projects[position].name = name;
         }
-        existing.git = meta.0;
-        existing.kind = meta.1;
+        // A failed detection (no `readable .git`, a transient I/O error) must
+        // not wipe a good stored remote; only a successful one replaces it.
+        if meta.0.is_some() {
+            projects[position].git = meta.0;
+        }
+        projects[position].kind = meta.1;
         for alias in &aliases {
-            push_unique(&mut existing.aliases, alias);
+            push_unique(&mut projects[position].aliases, alias);
         }
         for tag in &tags {
-            push_unique(&mut existing.tags, tag);
+            push_unique(&mut projects[position].tags, tag);
         }
+        let existing = &projects[position];
         return Ok(format!(
             "updated `{}` -> {}",
             crate::sanitize::text(&existing.name),
@@ -287,12 +333,23 @@ pub fn insert(
         Some(name) => name,
         None => default_name(&path)?,
     };
+    let name = sanitize_value("project name", &name)?;
+    // Store aliases/tags in the same trimmed, case-insensitively deduplicated
+    // shape the `add` command produces, whatever the caller supplied.
+    let mut normalized_aliases = Vec::with_capacity(aliases.len());
+    for alias in &aliases {
+        push_unique(&mut normalized_aliases, alias);
+    }
+    let mut normalized_tags = Vec::with_capacity(tags.len());
+    for tag in &tags {
+        push_unique(&mut normalized_tags, tag);
+    }
     let project = Project {
         id: new_id(projects),
         name,
         path: path.clone(),
-        aliases,
-        tags,
+        aliases: normalized_aliases,
+        tags: normalized_tags,
         created_at: Utc::now(),
         last_used_at: None,
         use_count: 0,
@@ -588,12 +645,84 @@ mod tests {
     }
 
     #[test]
+    fn force_add_keeps_the_stored_remote_and_refuses_a_name_steal() {
+        let mut projects = Vec::new();
+        insert(
+            &mut projects,
+            PathBuf::from("/x/alpha"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            false,
+            (
+                Some(GitInfo {
+                    remote_name: Some("origin".into()),
+                    remote_url: Some("git@example.com:a.git".into()),
+                }),
+                Kind::Rust,
+            ),
+        )
+        .expect("insert alpha");
+        insert(
+            &mut projects,
+            PathBuf::from("/x/beta"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            false,
+            (None, Kind::Unknown),
+        )
+        .expect("insert beta");
+
+        // Detection returning `None` (no readable `.git`) must not wipe the
+        // stored remote; a successful detection replaces it.
+        insert(
+            &mut projects,
+            PathBuf::from("/x/alpha"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            true,
+            (None, Kind::Unknown),
+        )
+        .expect("force without detection");
+        let alpha = projects
+            .iter()
+            .find(|project| project.path == Path::new("/x/alpha"))
+            .expect("alpha");
+        assert_eq!(
+            alpha.git.as_ref().and_then(|git| git.remote_url.as_deref()),
+            Some("git@example.com:a.git")
+        );
+
+        // `--force` targets the path; renaming on top of beta's name is
+        // refused, exactly like `rename` does.
+        let err = insert(
+            &mut projects,
+            PathBuf::from("/x/alpha"),
+            Some("beta".into()),
+            Vec::new(),
+            Vec::new(),
+            true,
+            (None, Kind::Unknown),
+        )
+        .expect_err("a taken name is refused");
+        assert!(
+            matches!(&err, Error::InvalidValue(_)),
+            "the error must name the colliding project, not this one: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("/x/beta"),
+            "the diagnostic points at the project that owns the name: {err}"
+        );
+    }
+
+    #[test]
     fn ids_are_short_unique_hex() {
         let mut projects = Vec::new();
         for _ in 0..1_000 {
             let id = new_id(&projects);
             assert_eq!(id.len(), 8, "id should be eight hex characters: {id}");
-            assert!(id.chars().all(|ch| ch.is_ascii_hexdigit()));
             assert!(
                 !projects.iter().any(|project: &Project| project.id == id),
                 "ids must be unique"

@@ -359,8 +359,8 @@ pub struct ImportArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Drop entries whose mapped use count is below this value
-    #[arg(long, value_name = "N")]
+    /// Drop entries whose mapped use count is below this value (negative keeps all)
+    #[arg(long, value_name = "N", value_parser = parse_min_score)]
     pub min_score: Option<f64>,
 
     /// Import at most this many entries (highest scores first)
@@ -376,6 +376,19 @@ pub enum ImportSource {
     Autojump,
     /// zsh-z's data file, the rupa/z `path|rank|epoch` format
     ZshZ,
+}
+
+/// Parses `--min-score`. The comparison is against a non-negative use count,
+/// so `NaN` would silently filter nothing and `inf` would filter everything;
+/// both are refused instead of being accepted by clap's bare `f64` parser.
+fn parse_min_score(raw: &str) -> std::result::Result<f64, String> {
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a number"))?;
+    if !value.is_finite() {
+        return Err(format!("`{raw}` is not a finite number"));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Args)]
@@ -429,5 +442,21 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn min_score_requires_a_finite_number() {
+        assert_eq!(parse_min_score("3.5").expect("number"), 3.5);
+        assert_eq!(parse_min_score("0").expect("zero"), 0.0);
+        // A negative minimum is accepted (it reads as "keep everything"),
+        // but `NaN`/infinity, which would silently filter nothing or
+        // everything, are refused.
+        assert_eq!(parse_min_score("-1").expect("negative"), -1.0);
+        for bad in ["nan", "NaN", "inf", "-inf", "1e400", "many"] {
+            assert!(
+                parse_min_score(bad).is_err(),
+                "`{bad}` must be refused by --min-score"
+            );
+        }
     }
 }

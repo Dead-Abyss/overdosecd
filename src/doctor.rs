@@ -315,7 +315,7 @@ pub fn fix_session(
                 }
                 Answer::Path(raw) => match validate_target(projects, &project.id, &raw, home) {
                     Ok(path) => {
-                        writeln!(output, "  -> {}", path.display())?;
+                        writeln!(output, "  -> {}", crate::sanitize::path(&path))?;
                         repairs.push(Repair::Relocate {
                             id: project.id.clone(),
                             path,

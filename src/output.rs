@@ -20,9 +20,18 @@ use crate::theme::{self, Role};
 ///
 /// Renderers escape values before they get here ([`sanitize::text`]); this is
 /// the backstop that turns a missed one into a refusal instead of a terminal
-/// escape. A failed check means a renderer bug, so the error says so.
-fn guard(text: &str) -> Result<()> {
-    match sanitize::foreign_escape(text) {
+/// escape. A failed check means a renderer bug, so the error says so. The
+/// line-oriented writers refuse embedded newlines too — a leaked `\n` would
+/// break `goto`'s "only the path on stdout" contract — while the raw writers
+/// accept them (the shell scripts and the debug/table listings are multi-line
+/// by design).
+fn guard(text: &str, allow_newlines: bool) -> Result<()> {
+    let offending = if allow_newlines {
+        sanitize::foreign_escape_multiline(text)
+    } else {
+        sanitize::foreign_escape(text)
+    };
+    match offending {
         Some(_) => Err(Error::UnsafeOutput),
         None => Ok(()),
     }
@@ -30,9 +39,14 @@ fn guard(text: &str) -> Result<()> {
 
 /// The one writer behind every stdout/stderr funnel: the guard runs first, so
 /// a missed renderer fails closed instead of leaking an escape.
-fn write_to(mut stream: impl std::io::Write, text: &str, newline: bool) -> Result<()> {
-    guard(text)?;
-    if newline {
+fn write_to(
+    mut stream: impl std::io::Write,
+    text: &str,
+    trailing_newline: bool,
+    allow_newlines: bool,
+) -> Result<()> {
+    guard(text, allow_newlines)?;
+    if trailing_newline {
         writeln!(stream, "{text}")?;
     } else {
         stream.write_all(text.as_bytes())?;
@@ -43,23 +57,23 @@ fn write_to(mut stream: impl std::io::Write, text: &str, newline: bool) -> Resul
 /// Writes a line to stdout, turning broken pipes into an error that `main`
 /// can exit quietly on.
 pub fn print_line(text: &str) -> Result<()> {
-    write_to(std::io::stdout().lock(), text, true)
+    write_to(std::io::stdout().lock(), text, true, false)
 }
 
 /// Writes raw text (no trailing newline added) to stdout.
 pub fn print(text: &str) -> Result<()> {
-    write_to(std::io::stdout().lock(), text, false)
+    write_to(std::io::stdout().lock(), text, false, true)
 }
 
 /// Writes raw text (no trailing newline added) to stderr through the same
 /// guard as stdout.
 pub fn print_stderr(text: &str) -> Result<()> {
-    write_to(std::io::stderr().lock(), text, false)
+    write_to(std::io::stderr().lock(), text, false, true)
 }
 
 /// Writes a line to stderr through the same guard as stdout.
 pub fn print_stderr_line(text: &str) -> Result<()> {
-    write_to(std::io::stderr().lock(), text, true)
+    write_to(std::io::stderr().lock(), text, true, false)
 }
 
 /// The terminal's width in columns, or `None` when stdout is not a tty (or the
@@ -811,6 +825,11 @@ pub(crate) fn join_or_dash(values: &[String]) -> String {
 const INFO_LABEL_WIDTH: usize = 10;
 
 /// A dimmed, fixed-width label followed by a plain value, for `info` lines.
+/// Formats one `info` row: a dim label column and the value.
+///
+/// Both halves are interpolated raw, so callers escape live values with
+/// [`sanitize::text`]/[`sanitize::path`] first (pre-painted values keep their
+/// SGR); the output funnel refuses a missed one instead of printing it.
 pub fn info_line(label: &str, value: &str) -> String {
     let padding = INFO_LABEL_WIDTH.saturating_sub(display_width(label)) + 1;
     format!("{}{}{value}", role(Role::Dim, label), " ".repeat(padding))
@@ -1549,11 +1568,54 @@ mod tests {
             "hyperlink\u{1b}]8;;http://evil.example\u{1b}\\",
             "clear\u{1b}[2J",
             "bell\u{7}",
+            // A leaked newline would break goto's one-path-per-line contract.
+            "two\nlines",
+            "carriage\rreturn",
+            "tab\there",
+            "del\u{7f}",
+            "c1\u{9b}",
+            "bidi\u{202e}",
+            "conceal\u{1b}[8m",
         ] {
             assert!(
                 matches!(print_line(bad), Err(Error::UnsafeOutput)),
                 "the funnel must refuse {bad:?}"
             );
+        }
+        // The raw writers accept the multi-line documents they exist for,
+        // but not a stray carriage return or tab.
+        assert!(guard("line one\nline two", true).is_ok());
+        assert!(guard("line one\rline two", true).is_err());
+    }
+
+    #[test]
+    fn the_sgr_whitelist_covers_what_the_theme_emits() {
+        // What `colored` produces from the theme's roles.
+        for fine in [
+            "\u{1b}[31mred\u{1b}[0m",
+            "\u{1b}[1;38;5;196mbold",
+            "\u{1b}[38;2;1;2;3mtruecolor\u{1b}[0m",
+            "\u{1b}[22mnormal",
+            "\u{1b}[m",
+        ] {
+            assert!(guard(fine, false).is_ok(), "{fine:?} must pass");
+        }
+        // Well-formed SGR that hides or inverts text is still foreign.
+        for bad in [
+            "\u{1b}[8mconceal",
+            "\u{1b}[5mblink",
+            "\u{1b}[6mblink",
+            "\u{1b}[7mreverse",
+            "\u{1b}[4munderline",
+            "\u{1b}[9mstrike",
+            "\u{1b}[53moverline",
+            // Malformed or out-of-range channels.
+            "\u{1b}[38;5;300m",
+            "\u{1b}[38;2;1;2m",
+            "\u{1b}[38;7;1m",
+            "\u{1b}[;;m",
+        ] {
+            assert!(guard(bad, false).is_err(), "{bad:?} must be refused");
         }
     }
 }

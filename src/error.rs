@@ -413,7 +413,7 @@ mod tests {
         .to_string();
         assert_eq!(rendered.lines().count(), 2, "template newline only");
         assert!(
-            crate::sanitize::foreign_escape(&rendered).is_none(),
+            crate::sanitize::foreign_escape_multiline(&rendered).is_none(),
             "no terminal escapes: {rendered:?}"
         );
     }

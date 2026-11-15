@@ -365,11 +365,32 @@ const MAX_WEIGHT: i64 = 1_000_000;
 const MAX_DISCOVERY_ENTRIES: usize = 1_000_000;
 
 fn parse(text: &str) -> std::result::Result<Config, String> {
-    // `Display` keeps the TOML span (line, column, source line); `message()`
-    // alone would throw away everything but the bare reason.
-    let config: Config = toml::from_str(text).map_err(|err| err.to_string())?;
+    let config: Config = toml::from_str(text).map_err(|err| describe_toml_error(text, &err))?;
     config.validate()?;
     Ok(config)
+}
+
+/// Renders a TOML error as one line (`line N, column M: reason`).
+///
+/// `Display` would keep the multi-line span with the source excerpt, but every
+/// human-facing sink is line-oriented (the funnel refuses embedded newlines),
+/// so the position is folded into a prefix instead.
+fn describe_toml_error(text: &str, err: &toml::de::Error) -> String {
+    let message = err.message();
+    let Some(span) = err.span() else {
+        return message.to_owned();
+    };
+    let start = span.start.min(text.len());
+    if !text.is_char_boundary(start) {
+        return message.to_owned();
+    }
+    let before = &text[..start];
+    let line = before.bytes().filter(|&byte| byte == b'\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(1, |line| line.chars().count() + 1);
+    format!("line {line}, column {column}: {message}")
 }
 
 impl Config {

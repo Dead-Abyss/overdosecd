@@ -50,8 +50,10 @@ fn main() {
         Err(err) => {
             let code = err.exit_code();
             // The error's Display already escapes every value; the funnel is a
-            // second net for a renderer that slipped.
-            if output::print_stderr_line(&format!("error: {err}")).is_err() {
+            // second net for a renderer that slipped. Several variants are
+            // multi-line by design (the ambiguity candidate list, the
+            // `--force` hint), so this sink is the raw one.
+            if output::print_stderr(&format!("error: {err}")).is_err() {
                 let _ = output::print_stderr_line("error: refusing to print an unsafe message");
             }
             std::process::exit(code);
@@ -325,7 +327,11 @@ fn cmd_list(store: &SqliteStore, args: ListArgs) -> Result<()> {
 
     if args.json {
         let file = StoreFile::new(visible);
-        output::print_line(&serde_json::to_string_pretty(&file)?)
+        // Pretty JSON is multi-line by design; the raw sink keeps the
+        // trailing newline a line-oriented `curl | head` expects.
+        let mut body = serde_json::to_string_pretty(&file)?;
+        body.push('\n');
+        output::print(&body)
     } else if visible.is_empty() {
         if let Some(kind) = args.kind {
             output::print_line(&format!("no {} projects indexed", kind.label()))

@@ -320,7 +320,7 @@ fn draw_health(frame: &mut Frame, area: Rect, picker: &mut Picker, palette: &Pal
                         palette.dim()
                     },
                 ),
-                Span::styled(row.label.clone(), Style::default()),
+                Span::styled(crate::sanitize::text(&row.label), Style::default()),
             ]);
             if position == selected {
                 line = line.style(Style::default().add_modifier(Modifier::REVERSED));

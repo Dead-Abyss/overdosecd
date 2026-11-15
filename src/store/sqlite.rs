@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -155,9 +156,16 @@ impl SqliteStore {
             .map_err(|err| self.map_rusqlite(err))?;
 
         let before = self.load_projects(&transaction)?;
-        let mut after = before.clone();
+        // Fingerprints instead of a deep clone of the whole index: the clone
+        // duplicated every string, vector, and note just to answer "did this
+        // row change?" one statement later.
+        let baseline: HashMap<String, u64> = before
+            .iter()
+            .map(|project| (project.id.clone(), project_fingerprint(project)))
+            .collect();
+        let mut after = before;
         let output = f(&mut after)?;
-        self.apply_diff(&transaction, &before, &after)?;
+        self.apply_diff(&transaction, &baseline, &after)?;
 
         transaction.commit().map_err(|err| self.map_rusqlite(err))?;
         Ok(output)
@@ -200,7 +208,7 @@ impl SqliteStore {
                 .prepare(UPSERT_PROJECT)
                 .map_err(|err| self.map_rusqlite(err))?;
             for project in projects {
-                execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
+                execute_project(&mut upsert, project)?;
             }
         }
         // `save` is a whole-index write: every project's notes are rewritten.
@@ -257,8 +265,11 @@ impl SqliteStore {
             )
             .map_err(|err| self.map_rusqlite(err))?;
         if has_meta == 0 {
+            // `BEGIN IMMEDIATE` under the busy wait: two processes racing on
+            // a fresh database both saw "no meta" and the loser of the race
+            // then failed on the duplicate DDL inside a deferred transaction.
             conn.execute_batch(&format!(
-                "BEGIN;\n{SCHEMA}\nINSERT OR IGNORE INTO meta (key, value) \
+                "BEGIN IMMEDIATE;\n{SCHEMA}\nINSERT OR IGNORE INTO meta (key, value) \
                  VALUES ('schema_version', '{CURRENT_VERSION}');\nCOMMIT;"
             ))
             .map_err(|err| self.map_rusqlite(err))?;
@@ -287,7 +298,17 @@ impl SqliteStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
+            // The copy is forensic material; a readable-by-others backup is
+            // not acceptable, and a failed chmod must abort the migration
+            // instead of silently leaving it exposed.
+            std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)).map_err(
+                |err| {
+                    self.storage_err(format!(
+                        "could not restrict the migration backup {}: {err}",
+                        backup.display()
+                    ))
+                },
+            )?;
         }
 
         match from {
@@ -334,12 +355,11 @@ impl SqliteStore {
 
     /// `VACUUM INTO` a fresh sibling copy of the database. `sibling_backup`
     /// only *suggests* a name, so two first opens in the same second can pick
-    /// the same one; the loser retries once with the suffix the winner's copy
-    /// now forces.
+    /// the same one; the loser retries with the suffix the winner's copy now
+    /// forces (bounded, so a stuck file cannot loop forever).
     fn consistent_copy(&self, conn: &Connection, from: u32) -> Result<PathBuf> {
-        let mut backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
-        let mut retried = false;
-        loop {
+        for _ in 0..8 {
+            let backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
             let Some(target) = backup.to_str() else {
                 return Err(
                     self.storage_err("cannot back up the database to a non-UTF-8 path".to_owned())
@@ -347,13 +367,17 @@ impl SqliteStore {
             };
             match conn.execute("VACUUM INTO ?1", [target]) {
                 Ok(_) => return Ok(backup),
-                Err(_) if !retried && backup.exists() => {
-                    retried = true;
-                    backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
+                Err(err) => {
+                    // Only a lost naming race is retryable; a broken VACUUM
+                    // (unsupported, disk full) is the real error.
+                    if backup.exists() {
+                        continue;
+                    }
+                    return Err(self.map_rusqlite(err));
                 }
-                Err(err) => return Err(self.map_rusqlite(err)),
             }
         }
+        Err(self.storage_err("could not find a free backup name".to_owned()))
     }
 
     /// The stored schema version, parsed; an unparsable value is a storage
@@ -428,26 +452,22 @@ impl SqliteStore {
         Ok(projects)
     }
 
-    /// Writes the difference between `before` and `after`. Unchanged rows are
-    /// left alone, and removed rows cascade their `usage` entries away.
-    fn apply_diff(&self, conn: &Connection, before: &[Project], after: &[Project]) -> Result<()> {
-        let after_ids: HashMap<&str, &Project> = after
-            .iter()
-            .map(|project| (project.id.as_str(), project))
-            .collect();
+    /// Writes the difference between the fingerprint baseline and `after`.
+    /// Unchanged rows are left alone, and removed rows cascade their `usage`
+    /// entries away.
+    fn apply_diff(
+        &self,
+        conn: &Connection,
+        before: &HashMap<String, u64>,
+        after: &[Project],
+    ) -> Result<()> {
+        let after_ids: HashSet<&str> = after.iter().map(|project| project.id.as_str()).collect();
 
-        for stale in before
-            .iter()
-            .filter(|project| !after_ids.contains_key(project.id.as_str()))
-        {
-            conn.execute("DELETE FROM projects WHERE id = ?1", [&stale.id])
+        for stale in before.keys().filter(|id| !after_ids.contains(id.as_str())) {
+            conn.execute("DELETE FROM projects WHERE id = ?1", [stale])
                 .map_err(|err| self.map_rusqlite(err))?;
         }
 
-        let before_ids: HashMap<&str, &Project> = before
-            .iter()
-            .map(|project| (project.id.as_str(), project))
-            .collect();
         // One statement serves both cases: `ON CONFLICT` rewrites a row that
         // is already there and inserts one that is not.
         let mut upsert = conn
@@ -455,16 +475,14 @@ impl SqliteStore {
             .map_err(|err| self.map_rusqlite(err))?;
 
         for project in after {
-            match before_ids.get(project.id.as_str()) {
-                Some(old) if *old == project => {}
-                Some(old) => {
-                    execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
-                    if old.notes != project.notes {
-                        write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
-                    }
+            match before.get(&project.id) {
+                Some(previous) if *previous == project_fingerprint(project) => {}
+                Some(_) => {
+                    execute_project(&mut upsert, project)?;
+                    write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
                 }
                 None => {
-                    execute_project(&mut upsert, project).map_err(|err| self.map_rusqlite(err))?;
+                    execute_project(&mut upsert, project)?;
                     write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
                 }
             }
@@ -496,8 +514,27 @@ impl SqliteStore {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
+        // The open is writable on purpose: a v1/v2 database upgrades here on
+        // first use, and SQLite's WAL needs write access beside the file even
+        // for reads (a read-only data directory fails reads too). Deliberate,
+        // not a bug — see `load_readonly` for the test-only probing path.
         let conn = self.open()?;
         self.load_projects(&conn)
+    }
+
+    /// Whether the index holds no projects, without decoding the whole table.
+    pub fn is_empty(&self) -> Result<bool> {
+        crate::paths::refuse_symlink(&self.path, "SQLite database")?;
+        if !self.path.exists() {
+            return Ok(true);
+        }
+        let conn = self.open()?;
+        let any: i64 = conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM projects)", [], |row| {
+                row.get(0)
+            })
+            .map_err(|err| self.map_rusqlite(err))?;
+        Ok(any == 0)
     }
 
     pub fn update<R>(&self, f: impl FnOnce(&mut Vec<Project>) -> Result<R>) -> Result<R> {
@@ -554,9 +591,10 @@ impl SqliteStore {
             )
             .map_err(|err| self.map_rusqlite(err))?;
         let rows = statement
-            .query_map(rusqlite::params![id, limit as i64], |row| {
-                parse_time(&row.get::<_, String>(0)?, 0)
-            })
+            .query_map(
+                rusqlite::params![id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| parse_time(&row.get::<_, String>(0)?, 0),
+            )
             .map_err(|err| self.map_rusqlite(err))?;
 
         let mut times = Vec::new();
@@ -628,29 +666,74 @@ pub struct ProjectProfile {
 }
 
 /// Binds one project to the named parameters every statement shares.
-fn execute_project(
-    statement: &mut rusqlite::Statement<'_>,
-    project: &Project,
-) -> rusqlite::Result<usize> {
-    statement.execute(rusqlite::named_params! {
-        ":id": &project.id,
-        ":name": &project.name,
-        ":path": project.path.to_string_lossy().into_owned(),
-        ":aliases": serde_json::to_string(&project.aliases).unwrap_or_else(|_| "[]".to_owned()),
-        ":tags": serde_json::to_string(&project.tags).unwrap_or_else(|_| "[]".to_owned()),
-        ":created_at": project.created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
-        ":last_used_at": project
-            .last_used_at
-            .map(|when| when.to_rfc3339_opts(SecondsFormat::Micros, true)),
-        ":use_count": i64::try_from(project.use_count).unwrap_or(i64::MAX),
-        ":pinned": i64::from(project.pinned),
-        ":git": i64::from(project.git.is_some()),
-        ":git_remote_name": project.git.as_ref().and_then(|git| git.remote_name.as_deref()),
-        ":git_remote_url": project.git.as_ref().and_then(|git| git.remote_url.as_deref()),
-        ":kind": project.kind.label(),
-        ":env": serde_json::to_string(&project.env).unwrap_or_else(|_| "{}".to_owned()),
-        ":enter_cmd": project.enter_cmd.as_deref(),
-    })
+/// One project's row, hashed: the change detection behind `update`'s diff.
+///
+/// Every column `execute_project` writes, plus the notes, feeds the hash. A
+/// 64-bit collision would skip one row's rewrite (never corrupt another row);
+/// the alternative was deep-cloning the whole index on every mutation.
+fn project_fingerprint(project: &Project) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    project.id.hash(&mut hasher);
+    project.name.hash(&mut hasher);
+    project.path.hash(&mut hasher);
+    project.aliases.hash(&mut hasher);
+    project.tags.hash(&mut hasher);
+    project.created_at.hash(&mut hasher);
+    project.last_used_at.hash(&mut hasher);
+    project.use_count.hash(&mut hasher);
+    project.pinned.hash(&mut hasher);
+    project
+        .git
+        .as_ref()
+        .and_then(|git| git.remote_name.as_deref())
+        .hash(&mut hasher);
+    project
+        .git
+        .as_ref()
+        .and_then(|git| git.remote_url.as_deref())
+        .hash(&mut hasher);
+    project.kind.label().hash(&mut hasher);
+    project.env.hash(&mut hasher);
+    project.enter_cmd.hash(&mut hasher);
+    project.notes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn execute_project(statement: &mut rusqlite::Statement<'_>, project: &Project) -> Result<usize> {
+    // The index stores UTF-8 paths; a lossy round-trip would point somewhere
+    // else, so a non-UTF-8 path is refused instead of silently mangled.
+    let path = project
+        .path
+        .to_str()
+        .ok_or_else(|| Error::NonUtf8Path(project.path.clone()))?;
+    let aliases = serde_json::to_string(&project.aliases)
+        .map_err(|err| Error::Storage(format!("could not serialize aliases: {err}")))?;
+    let tags = serde_json::to_string(&project.tags)
+        .map_err(|err| Error::Storage(format!("could not serialize tags: {err}")))?;
+    let env = serde_json::to_string(&project.env)
+        .map_err(|err| Error::Storage(format!("could not serialize the profile: {err}")))?;
+    let written = statement
+        .execute(rusqlite::named_params! {
+            ":id": &project.id,
+            ":name": &project.name,
+            ":path": path,
+            ":aliases": &aliases,
+            ":tags": &tags,
+            ":created_at": project.created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+            ":last_used_at": project
+                .last_used_at
+                .map(|when| when.to_rfc3339_opts(SecondsFormat::Micros, true)),
+            ":use_count": i64::try_from(project.use_count).unwrap_or(i64::MAX),
+            ":pinned": i64::from(project.pinned),
+            ":git": i64::from(project.git.is_some()),
+            ":git_remote_name": project.git.as_ref().and_then(|git| git.remote_name.as_deref()),
+            ":git_remote_url": project.git.as_ref().and_then(|git| git.remote_url.as_deref()),
+            ":kind": project.kind.label(),
+            ":env": &env,
+            ":enter_cmd": project.enter_cmd.as_deref(),
+        })
+        .map_err(|err| Error::Storage(format!("could not write the project row: {err}")))?;
+    Ok(written)
 }
 
 /// Replaces one project's note rows with the in-memory list.
@@ -788,6 +871,42 @@ mod tests {
     fn missing_file_reads_as_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(store(&dir).load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_row_fingerprint_covers_every_mutable_field() {
+        let base = project("alpha");
+        assert_eq!(
+            project_fingerprint(&base),
+            project_fingerprint(&base.clone())
+        );
+
+        let changed = |change: &dyn Fn(&mut Project)| {
+            let mut copy = base.clone();
+            change(&mut copy);
+            project_fingerprint(&copy) != project_fingerprint(&base)
+        };
+
+        assert!(changed(&|p| p.name = "beta".into()));
+        assert!(changed(&|p| p.path = PathBuf::from("/tmp/beta")));
+        assert!(changed(&|p| p.aliases.push("a".into())));
+        assert!(changed(&|p| p.tags.push("t".into())));
+        assert!(changed(&|p| p.created_at += chrono::Duration::seconds(1)));
+        assert!(changed(&|p| p.last_used_at = Some(Utc::now())));
+        assert!(changed(&|p| p.use_count += 1));
+        assert!(changed(&|p| p.pinned = true));
+        assert!(changed(&|p| {
+            p.git = Some(GitInfo {
+                remote_name: Some("origin".into()),
+                remote_url: None,
+            });
+        }));
+        assert!(changed(&|p| p.kind = Kind::Rust));
+        assert!(changed(&|p| {
+            p.env.insert("KEY".into(), "value".into());
+        }));
+        assert!(changed(&|p| p.enter_cmd = Some("echo hi".into())));
+        assert!(changed(&|p| p.notes.push("a note".into())));
     }
 
     #[test]

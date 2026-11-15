@@ -33,6 +33,10 @@ fn current_version() -> u32 {
     CURRENT_VERSION
 }
 
+/// Largest legacy index this tool will read; a bigger file is not a
+/// `projects.json` this version wrote, and must not be slurped unbounded.
+const MAX_LEGACY_BYTES: u64 = 64 << 20;
+
 /// Reads a legacy JSON index for the one-shot migration.
 ///
 /// A missing file reads as an empty index. An unparsable file is moved to
@@ -40,18 +44,40 @@ fn current_version() -> u32 {
 /// broken index is never silently discarded — `doctor` keeps reporting those
 /// quarantine files.
 pub fn read_legacy(path: &Path) -> Result<Vec<Project>> {
+    use std::io::Read;
+
     crate::paths::refuse_symlink(path, "legacy JSON index")?;
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
     };
+    let mut raw = String::new();
+    // The cap is enforced by the read itself: a file that grows after a
+    // stat check still cannot exceed it.
+    file.take(MAX_LEGACY_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|err| Error::Storage(format!("could not read {}: {err}", path.display())))?;
+    if raw.len() as u64 > MAX_LEGACY_BYTES {
+        return Err(Error::Storage(format!(
+            "{} is larger than the {MAX_LEGACY_BYTES} byte legacy index cap",
+            path.display()
+        )));
+    }
 
     let file: StoreFile = match serde_json::from_str(&raw) {
         Ok(file) => file,
         Err(err) => {
             let backup = crate::paths::sibling_backup(path, "corrupt");
-            fs::rename(path, &backup)?;
+            // Keep the parse error as the cause: if the quarantine rename also
+            // fails, the user still learns the file was unreadable.
+            if let Err(rename) = fs::rename(path, &backup) {
+                return Err(Error::Storage(format!(
+                    "could not parse {}: {err}; the unreadable file could not be moved to {}: {rename}",
+                    path.display(),
+                    backup.display()
+                )));
+            }
             return Err(Error::Storage(format!(
                 "could not parse {}: {err}\nthe unreadable file was moved to {}",
                 path.display(),

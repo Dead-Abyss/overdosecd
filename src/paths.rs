@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -135,12 +135,23 @@ pub(crate) fn write_private(path: &Path, body: &[u8]) -> Result<()> {
         ensure_dir(parent)?;
     }
 
-    // A pid-suffixed name plus `create_new`: a crashed write can leave a
-    // leftover behind, and a planted file or symlink (in a data directory
-    // someone else can write) must never be opened and truncated.
+    // A pid-suffixed name built from the full file name plus `create_new`: a
+    // crashed write can leave a leftover behind, and a planted file or symlink
+    // (in a data directory someone else can write) must never be opened and
+    // truncated. Building from the file name (not `with_extension`) keeps
+    // `projects.json` and `projects.db` from ever mapping to one temp name.
     // `remove_file` unlinks the name itself, it does not follow a symlink.
-    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

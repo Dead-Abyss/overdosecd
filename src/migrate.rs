@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::paths;
+use crate::project::Project;
 use crate::store::json::read_legacy;
 use crate::store::sqlite::SqliteStore;
 
@@ -24,6 +25,14 @@ pub enum Outcome {
 /// [`Outcome::AlreadyMigrated`]. A database that already holds projects is
 /// refused instead of overwritten; an empty one (schema only) is reused.
 pub fn run(data_dir: &Path) -> Result<Outcome> {
+    run_with(data_dir, &|db, projects| {
+        SqliteStore::new(db).save(projects)
+    })
+}
+
+/// [`run`] with an injectable save step, so a failed database write can be
+/// exercised without a read-only filesystem.
+fn run_with(data_dir: &Path, save: &dyn Fn(PathBuf, &[Project]) -> Result<()>) -> Result<Outcome> {
     let json_path = paths::store_file(data_dir);
     let db_path = paths::sqlite_file(data_dir);
 
@@ -31,7 +40,7 @@ pub fn run(data_dir: &Path) -> Result<Outcome> {
         if !json_path.exists() {
             return Ok(Outcome::AlreadyMigrated { db: db_path });
         }
-        if !SqliteStore::new(db_path.clone()).load()?.is_empty() {
+        if !SqliteStore::new(db_path.clone()).is_empty()? {
             return Err(Error::MigrationClash {
                 json: json_path,
                 db: db_path,
@@ -44,10 +53,26 @@ pub fn run(data_dir: &Path) -> Result<Outcome> {
     let projects = read_legacy(&json_path)?;
     let count = projects.len();
 
-    SqliteStore::new(db_path).save(&projects)?;
-
+    // Move the JSON aside *before* writing the database. The old order
+    // populated the database first, so a failed rename left "populated DB +
+    // live JSON" behind, which every later command reports as
+    // `MigrationClash` — permanently. Now a failed save simply puts the JSON
+    // back and the migration is retryable.
     let backup = paths::sibling_backup(&json_path, "migrated");
     fs::rename(&json_path, &backup)?;
+
+    if let Err(err) = save(db_path, &projects) {
+        // Best effort: restore the original name so the next run retries.
+        // A failed restore is reported alongside the save error.
+        if let Err(restore) = fs::rename(&backup, &json_path) {
+            return Err(Error::Storage(format!(
+                "{err}; the legacy index could not be moved back from {}: {restore}",
+                backup.display()
+            )));
+        }
+        return Err(err);
+    }
+
     Ok(Outcome::Migrated {
         projects: count,
         backup,
@@ -174,6 +199,30 @@ mod tests {
         let dir = directory();
         let err = run(dir.path()).unwrap_err();
         assert!(matches!(err, Error::NothingToMigrate(_)));
+    }
+
+    #[test]
+    fn a_failed_save_restores_the_json_and_stays_retryable() {
+        let dir = directory();
+        write_json(dir.path(), &[project("alpha")]);
+
+        let err = run_with(dir.path(), &|_db, _projects| {
+            Err(Error::Storage("simulated write failure".to_owned()))
+        })
+        .expect_err("the save fails");
+        assert!(err.to_string().contains("simulated"), "error was: {err}");
+        assert!(
+            paths::store_file(dir.path()).exists(),
+            "the legacy index must be back in place, not renamed aside"
+        );
+        assert!(
+            !paths::sqlite_file(dir.path()).exists(),
+            "the failed save must not leave a populated database"
+        );
+
+        // The next run (with a working save) goes through.
+        let outcome = run(dir.path()).expect("retry succeeds");
+        assert!(matches!(outcome, Outcome::Migrated { projects: 1, .. }));
     }
 
     #[test]

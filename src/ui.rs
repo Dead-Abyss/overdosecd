@@ -525,13 +525,11 @@ fn rename(store: &SqliteStore, picker: &mut Picker, id: String, name: String, fo
 
     match result {
         Ok(old_name) => {
-            // A failed reload already put the store error in the status; the
-            // success note must not overwrite it.
+            // The mutation is done; leaving the prompt open would re-send it
+            // on a second Enter. Close it before the reload, whose error
+            // status must then survive (and be the last word on failure).
+            picker.set_mode(picker::Mode::Search);
             if reload(store, picker, Some(&confirmed_id)) {
-                // The mutation is done; leaving the prompt open would re-send
-                // it on a second Enter. Set the mode before the status:
-                // changing mode clears it.
-                picker.set_mode(picker::Mode::Search);
                 picker.set_status(format!("renamed `{old_name}` -> `{name}`"), false);
             }
         }
@@ -566,11 +564,10 @@ fn set_term(
 
     match result {
         Ok(message) => {
+            // Close the prompt even when the reload fails: a second Enter
+            // must not re-send a mutation that already happened.
+            picker.set_mode(picker::Mode::Search);
             if reload(store, picker, None) {
-                // The mutation is done; leaving the prompt open would re-send
-                // it on a second Enter. Set the mode before the status:
-                // changing mode clears it.
-                picker.set_mode(picker::Mode::Search);
                 picker.set_status(message, false);
             }
         }

@@ -53,13 +53,7 @@ pub fn read_legacy(path: &Path) -> Result<Vec<Project>> {
             // Not a regular file, or over the cap: move it aside like the
             // corrupt branch does, so one bad file cannot block every later
             // command (`migrate::auto` runs at startup).
-            let backup = crate::paths::sibling_backup(path, "corrupt");
-            let moved = fs::rename(path, &backup).is_ok();
-            let destination = if moved {
-                format!("the unreadable file was moved to {}", backup.display())
-            } else {
-                "the unreadable file could not be moved aside".to_owned()
-            };
+            let destination = quarantine(path);
             return Err(Error::Storage(format!(
                 "{} is not a readable regular file within the {MAX_LEGACY_BYTES} byte legacy index cap; {destination}",
                 path.display()
@@ -82,31 +76,32 @@ pub fn read_legacy(path: &Path) -> Result<Vec<Project>> {
         .read_to_end(&mut raw)
         .map_err(|err| Error::Storage(format!("could not read {}: {err}", path.display())))?;
     if raw.len() as u64 > MAX_LEGACY_BYTES {
+        let destination = quarantine(path);
         return Err(Error::Storage(format!(
-            "{} is larger than the {MAX_LEGACY_BYTES} byte legacy index cap",
+            "{} is larger than the {MAX_LEGACY_BYTES} byte legacy index cap; {destination}",
             path.display()
         )));
     }
-    let raw = String::from_utf8(raw)
-        .map_err(|err| Error::Storage(format!("{} is not valid UTF-8: {err}", path.display())))?;
+    let raw = match String::from_utf8(raw) {
+        Ok(raw) => raw,
+        Err(err) => {
+            // Undecodable is as broken as unparsable: leaving it in place
+            // would fail every later command at startup.
+            let destination = quarantine(path);
+            return Err(Error::Storage(format!(
+                "{} is not valid UTF-8: {err}; {destination}",
+                path.display()
+            )));
+        }
+    };
 
     let file: StoreFile = match serde_json::from_str(&raw) {
         Ok(file) => file,
         Err(err) => {
-            let backup = crate::paths::sibling_backup(path, "corrupt");
-            // Keep the parse error as the cause: if the quarantine rename also
-            // fails, the user still learns the file was unreadable.
-            if let Err(rename) = fs::rename(path, &backup) {
-                return Err(Error::Storage(format!(
-                    "could not parse {}: {err}; the unreadable file could not be moved to {}: {rename}",
-                    path.display(),
-                    backup.display()
-                )));
-            }
+            let destination = quarantine(path);
             return Err(Error::Storage(format!(
-                "could not parse {}: {err}\nthe unreadable file was moved to {}",
-                path.display(),
-                backup.display()
+                "could not parse {}: {err}; {destination}",
+                path.display()
             )));
         }
     };
@@ -121,6 +116,20 @@ pub fn read_legacy(path: &Path) -> Result<Vec<Project>> {
     }
 
     Ok(file.projects)
+}
+
+/// Moves an unreadable legacy index to its quarantined sibling name and
+/// returns the diagnostic tail (including the rename failure reason when the
+/// move itself failed).
+fn quarantine(path: &Path) -> String {
+    let backup = crate::paths::sibling_backup(path, "corrupt");
+    match fs::rename(path, &backup) {
+        Ok(()) => format!("the unreadable file was moved to {}", backup.display()),
+        Err(err) => format!(
+            "the unreadable file could not be moved to {}: {err}",
+            backup.display()
+        ),
+    }
 }
 
 #[cfg(test)]

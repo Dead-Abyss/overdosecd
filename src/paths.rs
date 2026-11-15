@@ -324,6 +324,38 @@ mod tests {
             read_rebuildable_json::<serde_json::Value>(&path, 4).is_none(),
             "a file over the cap is absent"
         );
+
+        #[cfg(unix)]
+        {
+            // The relaxed variant (for `.git`/include files) follows a
+            // symlink to a small regular file but still refuses a FIFO and an
+            // over-cap target.
+            let target = dir.path().join("target.json");
+            std::fs::write(&target, b"ok").expect("target");
+            let link = dir.path().join("target-link");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink");
+            assert!(
+                open_follow_io(&link, 1024).expect("open").is_some(),
+                "a symlinked regular file is followed"
+            );
+            assert!(
+                open_follow_io(&target, 1).expect("open").is_none(),
+                "an over-cap target is refused"
+            );
+
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let fifo = dir.path().join("follow-fifo");
+            let raw = CString::new(fifo.as_os_str().as_bytes()).expect("path");
+            // SAFETY: plain `mkfifo(2)` on a fresh temp path.
+            assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0, "mkfifo");
+            let fifo_link = dir.path().join("follow-fifo-link");
+            std::os::unix::fs::symlink(&fifo, &fifo_link).expect("symlink");
+            assert!(
+                open_follow_io(&fifo_link, 1024).expect("open").is_none(),
+                "a symlink to a FIFO is not a regular file"
+            );
+        }
     }
 
     #[test]

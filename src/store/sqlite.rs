@@ -313,9 +313,12 @@ impl SqliteStore {
             if let Err(err) =
                 std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))
             {
-                let _ = std::fs::remove_file(&backup);
+                let cleanup = match std::fs::remove_file(&backup) {
+                    Ok(()) => "removed it".to_owned(),
+                    Err(remove) => format!("and removing it also failed: {remove}"),
+                };
                 return Err(self.storage_err(format!(
-                    "could not restrict the migration backup {} (removed it): {err}",
+                    "could not restrict the migration backup {} ({cleanup}): {err}",
                     backup.display()
                 )));
             }
@@ -385,8 +388,14 @@ impl SqliteStore {
             match conn.execute("VACUUM INTO ?1", [target]) {
                 Ok(_) => return Ok(backup),
                 Err(err) => {
-                    // A failed VACUUM (disk full, unsupported) may have left a
-                    // partial file; it is not a usable forensic copy.
+                    // Two first opens can pick the same suggested name; the
+                    // loser must retry, not remove the winner's copy (which
+                    // exists but was not created by this process).
+                    if err.to_string().contains("output file already exists") {
+                        continue;
+                    }
+                    // Otherwise the failure is real; a partial file this
+                    // process started is not a usable forensic copy.
                     let _ = std::fs::remove_file(&backup);
                     return Err(self.map_rusqlite(err));
                 }
@@ -497,9 +506,11 @@ impl SqliteStore {
             match before.get(&project.id) {
                 Some(previous) if *previous == state => {}
                 Some(previous) => {
-                    self.execute_project(&mut upsert, project)?;
-                    // A pin or rename must not rewrite the note rows; only a
-                    // changed note list does.
+                    // A note-only edit skips the row UPSERT (and its unique
+                    // index rewrite); a row-only edit skips the note table.
+                    if previous.row != state.row {
+                        self.execute_project(&mut upsert, project)?;
+                    }
                     if previous.notes != state.notes {
                         write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
                     }
@@ -920,6 +931,21 @@ mod tests {
     fn missing_file_reads_as_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(store(&dir).load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_note_only_update_writes_the_note_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store(&dir);
+        store.save(&[project("alpha")]).unwrap();
+
+        store
+            .update(|projects| {
+                projects[0].notes.push("a note".to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.load().unwrap()[0].notes, vec!["a note".to_owned()]);
     }
 
     #[test]

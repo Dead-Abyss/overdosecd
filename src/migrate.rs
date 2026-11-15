@@ -153,6 +153,18 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_migration_is_reported_instead_of_silently_empty() {
+        let dir = directory();
+        let backup = paths::sibling_backup(&paths::store_file(dir.path()), "migrated");
+        fs::write(&backup, "[]").expect("write backup");
+        let err = auto(dir.path()).expect_err("no index, but a backup exists");
+        assert!(
+            err.to_string().contains("migrated copy"),
+            "the message must name the recovery path: {err}"
+        );
+    }
+
+    #[test]
     fn auto_migrates_a_legacy_index_once() {
         let dir = directory();
         write_json(dir.path(), &[project("alpha"), project("beta")]);

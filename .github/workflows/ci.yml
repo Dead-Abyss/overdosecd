@@ -82,8 +82,8 @@ jobs:
           # `cargo metadata` is the same mechanism release.yml uses (no second
           # manifest parser tied to the runner's Python version).
           declared="$(cargo metadata --no-deps --format-version 1 |
-            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["rust-version"])')"
-          if [ -z "$declared" ] || [ "$declared" = "None" ]; then
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0].get("rust_version") or "")')"
+          if [ -z "$declared" ]; then
             echo "Cargo.toml has no package.rust-version" >&2
             exit 1
           fi

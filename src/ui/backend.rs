@@ -125,13 +125,28 @@ fn query_cursor_position(tty: &mut File) -> io::Result<Option<Position>> {
     drain_queued(tty);
 
     // A full output queue (Ctrl-S flow control) is backpressure, not a dead
-    // terminal: treat it like an unanswered query instead of aborting the
-    // picker's next draw.
-    match tty.write_all(b"\x1b[6n").and_then(|()| tty.flush()) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-        Err(err) => return Err(err),
+    // terminal: retry the remaining bytes under a deadline instead of
+    // abandoning a partial `ESC [ 6 n` in the terminal's parser.
+    let query = b"\x1b[6n";
+    let deadline = Instant::now() + CURSOR_QUERY_TIMEOUT;
+    let mut written = 0;
+    while written < query.len() {
+        match tty.write(&query[written..]) {
+            Ok(0) => return Ok(None),
+            Ok(count) => written += count,
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::Interrupted =>
+            {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(err) => return Err(err),
+        }
     }
+    tty.flush()?;
 
     let deadline = Instant::now() + CURSOR_QUERY_TIMEOUT;
     let mut reply = Vec::with_capacity(MAX_REPORT_BYTES);

@@ -336,7 +336,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The project plan lives in [plan.md](plan.md); release notes in [CHANGELOG.md](CHANGELOG.md).
+The project plan lives in [plan.md](https://github.com/Dead-Abyss/overdosecd/blob/main/plan.md) (not shipped in the crate); release notes in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

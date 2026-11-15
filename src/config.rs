@@ -241,14 +241,20 @@ pub fn platform_path() -> Option<PathBuf> {
     crate::dirs::config_dir().map(|dir| dir.join("config.toml"))
 }
 
-/// Reads the config file.
+/// Reads the config file and classifies what happened, in one pass.
 ///
-/// A missing file at the platform path is not an error; built-in defaults
-/// apply. A missing file that `$OVERDOSECD_CONFIG` pointed at is, because the
-/// user asked for that file explicitly.
-pub fn load(location: &Location) -> Result<Config> {
+/// `doctor` needs both the value (or the reason it is unusable) and a status
+/// that says whether a file was actually read. Deriving the status from a
+/// second `exists()` check after the load was both redundant and racy: a file
+/// created in between would report `Loaded` for defaults that were already
+/// applied.
+pub fn load_status(location: &Location) -> (Result<Config>, Status) {
     let Some(path) = &location.path else {
-        return Ok(Config::default());
+        return (Ok(Config::default()), Status::Defaults { path: None });
+    };
+    let invalid = |message: String| Status::Invalid {
+        path: path.clone(),
+        message,
     };
 
     // A relative path resolves against the current directory, so a planted
@@ -261,28 +267,47 @@ pub fn load(location: &Location) -> Result<Config> {
     } else {
         "the platform config path"
     };
-    crate::paths::absolute(kind, path)?;
+    if let Err(err) = crate::paths::absolute(kind, path) {
+        let status = invalid(err.to_string());
+        return (Err(err), status);
+    }
 
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             if location.explicit {
-                return Err(Error::ConfigNotFound(path.clone()));
+                let error = Error::ConfigNotFound(path.clone());
+                let status = invalid(format!("not found (from {ENV_CONFIG})"));
+                return (Err(error), status);
             }
-            return Ok(Config::default());
+            return (
+                Ok(Config::default()),
+                Status::Defaults {
+                    path: Some(path.clone()),
+                },
+            );
         }
         Err(err) => {
-            return Err(Error::Config {
+            let error = Error::Config {
                 origin: path.display().to_string(),
                 message: err.to_string(),
-            });
+            };
+            let status = invalid(error.to_string());
+            return (Err(error), status);
         }
     };
 
-    parse(&text).map_err(|message| Error::Config {
-        origin: path.display().to_string(),
-        message,
-    })
+    match parse(&text) {
+        Ok(config) => (Ok(config), Status::Loaded { path: path.clone() }),
+        Err(message) => {
+            let status = invalid(message.clone());
+            let error = Error::Config {
+                origin: path.display().to_string(),
+                message,
+            };
+            (Err(error), status)
+        }
+    }
 }
 
 /// What `doctor` reports about the config file, without failing on problems.
@@ -296,33 +321,6 @@ pub enum Status {
 
     /// The file (or `$OVERDOSECD_CONFIG`) is unusable.
     Invalid { path: PathBuf, message: String },
-}
-
-/// Classifies an already-loaded config, for the `doctor` report.
-pub fn status(location: &Location, loaded: Result<Config>) -> Status {
-    let Some(path) = &location.path else {
-        return Status::Defaults { path: None };
-    };
-
-    match loaded {
-        Ok(_) if path.exists() => Status::Loaded { path: path.clone() },
-        Ok(_) => Status::Defaults {
-            path: Some(path.clone()),
-        },
-        // The report already prints the path, so keep only the reason.
-        Err(Error::Config { message, .. }) => Status::Invalid {
-            path: path.clone(),
-            message,
-        },
-        Err(Error::ConfigNotFound(_)) => Status::Invalid {
-            path: path.clone(),
-            message: format!("not found (from {ENV_CONFIG})"),
-        },
-        Err(err) => Status::Invalid {
-            path: path.clone(),
-            message: err.to_string(),
-        },
-    }
 }
 
 /// Resolves the effective color mode: flag, then `$OVERDOSECD_COLOR`, then the
@@ -597,7 +595,8 @@ mod tests {
             explicit: true,
         };
         assert_eq!(
-            load(&location)
+            load_status(&location)
+                .0
                 .expect("config loads")
                 .matching
                 .ambiguity_margin,
@@ -612,7 +611,10 @@ mod tests {
             path: Some(path),
             explicit: false,
         };
-        assert_eq!(load(&location).expect("missing is fine"), Config::default());
+        assert_eq!(
+            load_status(&location).0.expect("missing is fine"),
+            Config::default()
+        );
     }
 
     #[test]
@@ -622,7 +624,7 @@ mod tests {
             path: Some(path.clone()),
             explicit: true,
         };
-        match load(&location) {
+        match load_status(&location).0 {
             Err(Error::ConfigNotFound(error_path)) => assert_eq!(error_path, path),
             other => panic!("expected ConfigNotFound, got {other:?}"),
         }
@@ -636,7 +638,7 @@ mod tests {
             path: Some(path.clone()),
             explicit: true,
         };
-        match load(&location) {
+        match load_status(&location).0 {
             Err(Error::Config { origin, .. }) => assert_eq!(origin, path.display().to_string()),
             other => panic!("expected a config error, got {other:?}"),
         }
@@ -648,15 +650,16 @@ mod tests {
             path: Some(PathBuf::from("config.toml")),
             explicit: true,
         };
-        let err = load(&location).expect_err("refused");
+        let err = load_status(&location).0.expect_err("refused");
         assert!(matches!(err, Error::RelativePath { .. }), "{err:?}");
 
         // No path at all still means built-in defaults.
         assert!(
-            load(&Location {
+            load_status(&Location {
                 path: None,
                 explicit: false
             })
+            .0
             .is_ok()
         );
     }
@@ -723,14 +726,14 @@ mod tests {
             path: Some(missing.clone()),
             explicit: false,
         };
-        let defaults = status(&location, load(&location));
+        let defaults = load_status(&location).1;
         assert!(matches!(defaults, Status::Defaults { .. }));
 
         let location = Location {
             path: Some(missing),
             explicit: true,
         };
-        let explicit_missing = status(&location, load(&location));
+        let explicit_missing = load_status(&location).1;
         match explicit_missing {
             Status::Invalid { message, .. } => {
                 assert!(message.contains("not found"), "message was: {message}");
@@ -745,7 +748,7 @@ mod tests {
             path: Some(path.clone()),
             explicit: true,
         };
-        let loaded = status(&location, load(&location));
+        let loaded = load_status(&location).1;
         assert_eq!(loaded, Status::Loaded { path });
 
         let (_dir, broken) = temp_path("config.toml");
@@ -754,7 +757,7 @@ mod tests {
             path: Some(broken.clone()),
             explicit: true,
         };
-        let invalid = status(&location, load(&location));
+        let invalid = load_status(&location).1;
         match invalid {
             Status::Invalid { path, message } => {
                 assert_eq!(path, broken);

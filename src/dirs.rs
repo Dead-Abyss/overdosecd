@@ -73,8 +73,19 @@ impl Layout {
 }
 
 /// The user's home directory: `$HOME`.
+///
+/// A relative `$HOME` is refused for the same reason a relative `XDG_*` value
+/// is ignored: every store path is built from it, and a relative home would
+/// silently resolve against whatever directory the shell happens to be in.
 pub fn home_dir() -> Option<PathBuf> {
-    os_env("HOME").map(PathBuf::from)
+    home_dir_with(os_env)
+}
+
+/// Testable [`home_dir`] with an injected lookup.
+fn home_dir_with(lookup: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    lookup("HOME")
+        .map(PathBuf::from)
+        .filter(|value| value.is_absolute())
 }
 
 /// `~/.local/share/overdosecd`.
@@ -134,6 +145,17 @@ mod tests {
             Some(PathBuf::from("/abs/dir"))
         );
         assert_eq!(absolute_env_with(|_| Some(String::new().into()), "X"), None);
+    }
+
+    #[test]
+    fn relative_home_is_refused() {
+        assert_eq!(home_dir_with(|_| Some("relative/home".into())), None);
+        assert_eq!(home_dir_with(|_| Some(String::new().into())), None);
+        assert_eq!(home_dir_with(|_| None), None);
+        assert_eq!(
+            home_dir_with(|_| Some("/home/user".into())),
+            Some(PathBuf::from("/home/user"))
+        );
     }
 
     #[test]

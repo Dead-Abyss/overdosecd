@@ -169,13 +169,17 @@ fn pick(
     // `Session::enter` enables anything: a signal during startup must take the
     // cancel path too.
     let interrupted = Arc::new(AtomicBool::new(false));
-    let terminate = [
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGHUP,
-    ];
+    let terminate = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
     for signal in terminate {
-        signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
+        let flag = Arc::clone(&interrupted);
+        // SAFETY: the handler only stores into an atomic, which is
+        // async-signal-safe; the registry keeps it registered for the
+        // process and both `signal-hook` majors in the tree share it.
+        unsafe {
+            signal_hook_registry::register(signal, move || {
+                flag.store(true, Ordering::Relaxed);
+            })?;
+        }
     }
 
     let mut session = Session::enter(options)?;

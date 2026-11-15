@@ -69,7 +69,7 @@ fn run(cli: Cli) -> Result<i32> {
     let data_dir = paths::resolve_data_dir(cli.data_dir.as_deref())?;
 
     let location = config::locate(config::env_path(), config::platform_path());
-    let config = config::load(&location);
+    let (config, config_status) = config::load_status(&location);
 
     // The one-shot migration of a 0.2.0 `projects.json` runs before anything
     // touches the index. `doctor` and the shell-integration commands keep
@@ -153,13 +153,7 @@ fn run(cli: Cli) -> Result<i32> {
                 .as_ref()
                 .ok()
                 .is_some_and(|config| config.storage.backend.is_some());
-            cmd_doctor(
-                &store,
-                &data_dir,
-                args,
-                config::status(&location, config),
-                retired_storage,
-            )
+            cmd_doctor(&store, &data_dir, args, config_status, retired_storage)
         }
         // Completion runs on every TAB press and uses no matcher knobs, so it
         // deliberately does not fail on a broken config.
@@ -424,9 +418,18 @@ fn cmd_hook(store: &SqliteStore, data_dir: &Path, hooks: output::HookSettings) {
         return;
     }
     let path = hook::file_path(data_dir);
+    // Two shells can cd at once; the lock covers the whole read-modify-write.
+    // A contended lock loses this one visit instead of blocking the cd.
+    let Some(_guard) = hook::lock(data_dir) else {
+        warn("cd hook skipped the visit counter: could not lock the visit store".to_owned());
+        return;
+    };
     let mut visits = hook::Visits::load(&path).unwrap_or_default();
     let now = Utc::now();
-    let count = visits.record_visit(&current, now);
+    let Some(count) = visits.record_visit(&current, now) else {
+        warn("cd hook skipped the visit counter: the path is not valid UTF-8".to_owned());
+        return;
+    };
     if visits.hint_due(&current, now) {
         visits.mark_hinted(&current, now);
         let name = project::default_name(&current)

@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::sanitize::contains_dangerous;
 
 /// Directories the walk never enters: caches, build outputs, and vendored
@@ -78,8 +78,16 @@ const WALK_OVERSHOOT: usize = 8;
 /// Whether `path` is skipped: a pattern without `/` matches the directory
 /// name, one with `/` matches the trailing path components, so
 /// `.local/share/Trash` actually skips (it never could as a bare name).
+///
+/// A leading or trailing separator is trimmed first: `"node_modules/"` and
+/// `"/home/me/cache"` are the shapes users write, and splitting them raw
+/// yields empty components that match nothing.
 fn is_skipped(skip: &[&str], name: &str, path: &Path) -> bool {
-    skip.iter().any(|pattern| {
+    skip.iter().any(|raw| {
+        let pattern = raw.trim_matches('/');
+        if pattern.is_empty() {
+            return false;
+        }
         if pattern.contains('/') {
             let mut wanted = pattern.rsplit('/');
             let mut components = path.components().rev();
@@ -89,7 +97,7 @@ fn is_skipped(skip: &[&str], name: &str, path: &Path) -> bool {
                     .is_some_and(|component| component.as_os_str() == part)
             })
         } else {
-            *pattern == name
+            pattern == name
         }
     })
 }
@@ -142,8 +150,13 @@ pub fn scan(root: &Path, options: &Options) -> Vec<Dir> {
             let name = entry.file_name().to_string_lossy().into_owned();
             if file_type.is_dir() {
                 // The cache is JSON: one non-UTF-8 path would fail the whole
-                // write, not just this row.
-                if path.to_str().is_none() || is_skipped(&skip, &name, &path) {
+                // write, not just this row. The display guard runs here, at
+                // queue time, so a hostile tree is never even walked.
+                if path.to_str().is_none()
+                    || contains_dangerous(&name)
+                    || contains_dangerous(&path.to_string_lossy())
+                    || is_skipped(&skip, &name, &path)
+                {
                     continue;
                 }
                 // The budget above is checked once per directory; a single
@@ -289,6 +302,15 @@ const MAX_CACHE_BYTES: u64 = 64 << 20;
 pub fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(cache)?;
     body.push(b'\n');
+    // `load_cache` refuses a file above this bound; writing one would leave a
+    // cache this program silently ignores. Fail loudly instead.
+    if body.len() as u64 > MAX_CACHE_BYTES {
+        return Err(Error::InvalidValue(format!(
+            "home cache would be {} bytes, over the {} byte cap; raise `[discovery] max_entries`?",
+            body.len(),
+            MAX_CACHE_BYTES
+        )));
+    }
     crate::paths::write_private(path, &body)
 }
 

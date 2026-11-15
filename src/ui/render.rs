@@ -417,7 +417,11 @@ fn draw_details(
     let capacity = area.height as usize;
     if lines.len() > capacity {
         lines.truncate(capacity);
-        if let Some(last) = lines.last_mut() {
+        // Only a multi-row pane can afford the marker row; a one-row pane
+        // must keep its first line (the path).
+        if capacity > 1
+            && let Some(last) = lines.last_mut()
+        {
             *last = Line::from(Span::styled("…", palette.dim()));
         }
     }

@@ -12,7 +12,7 @@ categories = ["command-line-utilities"]
 # `cargo install` needs the binary, its README, and the changes; the test
 # suite, scripts, and CI files are repository material only. `benches/` stays
 # because the manifest declares that target.
-exclude = ["/tests", "/scripts", "/.github", "/.opencodereview", "/deny.toml", "/AGENTS.md"]
+exclude = ["/tests", "/scripts", "/.github", "/.opencodereview", "/deny.toml", "/AGENTS.md", "/plan.md"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

@@ -440,10 +440,6 @@ impl Picker {
     /// the best row wins.
     pub fn refilter(&mut self, preserve: Option<&str>) {
         let query = self.query.trim().to_owned();
-        // Refresh the whole missing cache once, before either branch reads it:
-        // the renderer calls `is_missing` per row per frame, and a lazy cache
-        // made the default view stat the filesystem on every frame.
-        let missing = self.missing_flags().to_vec();
         let mut entries: Vec<usize> = if query.is_empty() {
             let mut entries: Vec<usize> = (0..self.projects.len()).collect();
             let sort = self.sort;
@@ -453,9 +449,14 @@ impl Picker {
             matcher::rank_indices(&query, &self.projects, &self.matching)
         };
         // `show missing` is a filter, not an ordering detail: honour it for
-        // ranked queries too, not just the empty-query listing.
+        // ranked queries too, not just the empty-query listing. The cache is
+        // refreshed here (so the renderer's per-row `is_missing` never falls
+        // back to a stat) and borrowed, not copied, on every keystroke.
         if !self.show_missing {
+            let missing = self.missing_flags();
             entries.retain(|&index| !missing[index]);
+        } else {
+            let _ = self.missing_flags();
         }
         self.entries = entries;
 
@@ -1044,18 +1045,37 @@ impl Picker {
         });
     }
 
-    /// The ids a mutation applies to: the marked rows when any are marked,
-    /// otherwise the highlighted project. A highlighted *home* row has no id.
+    /// The ids a mutation applies to, in display order: the marked rows when
+    /// any are marked, otherwise the highlighted project. A highlighted
+    /// *home* row has no id.
+    ///
+    /// Marks are an explicit selection and survive filtering: a mark whose
+    /// row the query currently hides still applies, after the visible ones
+    /// (marks are kept sorted by id, so the tail order is stable).
     pub(crate) fn targets(&self) -> Vec<String> {
-        // Marks are an explicit selection and survive filtering: a batch
-        // applies to every mark, even while the query hides some of them.
-        if !self.marks.is_empty() {
-            return self.marks.iter().cloned().collect();
+        if self.marks.is_empty() {
+            return self
+                .selected_project()
+                .map(|project| project.id.clone())
+                .into_iter()
+                .collect();
         }
-        self.selected_project()
+        let mut ids: Vec<String> = self
+            .entries
+            .iter()
+            .map(|&index| &self.projects[index])
+            .filter(|project| self.marks.contains(&project.id))
             .map(|project| project.id.clone())
-            .into_iter()
-            .collect()
+            .collect();
+        let seen: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let hidden: Vec<String> = self
+            .marks
+            .iter()
+            .filter(|id| !seen.contains(id.as_str()))
+            .cloned()
+            .collect();
+        ids.extend(hidden);
+        ids
     }
 
     /// The status for an action that needs an indexed project.
@@ -1697,6 +1717,24 @@ mod tests {
         run_palette(&mut picker, "missing");
         assert!(picker.show_missing());
         assert_eq!(picker.entries().len(), 2);
+    }
+
+    #[test]
+    fn hidden_marks_apply_after_the_visible_ones() {
+        let mut picker = fixture(&["alpha", "beta", "gamma"]);
+        picker.marks.insert("gamma".to_owned());
+        picker.marks.insert("alpha".to_owned());
+        assert_eq!(
+            picker.targets(),
+            vec!["alpha".to_owned(), "gamma".to_owned()],
+            "visible marks in display order"
+        );
+
+        picker.set_query("gam".into());
+        let targets = picker.targets();
+        assert_eq!(targets.len(), 2, "a hidden mark still applies");
+        assert_eq!(targets[0], "gamma", "the visible mark comes first");
+        assert!(targets.contains(&"alpha".to_owned()));
     }
 
     #[test]

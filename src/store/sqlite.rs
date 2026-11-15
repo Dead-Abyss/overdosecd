@@ -159,9 +159,17 @@ impl SqliteStore {
         // Fingerprints instead of a deep clone of the whole index: the clone
         // duplicated every string, vector, and note just to answer "did this
         // row change?" one statement later.
-        let baseline: HashMap<String, u64> = before
+        let baseline: HashMap<String, RowState> = before
             .iter()
-            .map(|project| (project.id.clone(), project_fingerprint(project)))
+            .map(|project| {
+                (
+                    project.id.clone(),
+                    RowState {
+                        row: project_fingerprint(project),
+                        notes: notes_fingerprint(project),
+                    },
+                )
+            })
             .collect();
         let mut after = before;
         let output = f(&mut after)?;
@@ -208,7 +216,7 @@ impl SqliteStore {
                 .prepare(UPSERT_PROJECT)
                 .map_err(|err| self.map_rusqlite(err))?;
             for project in projects {
-                execute_project(&mut upsert, project)?;
+                self.execute_project(&mut upsert, project)?;
             }
         }
         // `save` is a whole-index write: every project's notes are rewritten.
@@ -299,16 +307,18 @@ impl SqliteStore {
         {
             use std::os::unix::fs::PermissionsExt;
             // The copy is forensic material; a readable-by-others backup is
-            // not acceptable, and a failed chmod must abort the migration
-            // instead of silently leaving it exposed.
-            std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)).map_err(
-                |err| {
-                    self.storage_err(format!(
-                        "could not restrict the migration backup {}: {err}",
-                        backup.display()
-                    ))
-                },
-            )?;
+            // not acceptable. A filesystem that refuses chmod must not leave
+            // the copy behind while the migration aborts (it would be
+            // recreated on every later open): remove it, then report.
+            if let Err(err) =
+                std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))
+            {
+                let _ = std::fs::remove_file(&backup);
+                return Err(self.storage_err(format!(
+                    "could not restrict the migration backup {} (removed it): {err}",
+                    backup.display()
+                )));
+            }
         }
 
         match from {
@@ -360,6 +370,13 @@ impl SqliteStore {
     fn consistent_copy(&self, conn: &Connection, from: u32) -> Result<PathBuf> {
         for _ in 0..8 {
             let backup = crate::paths::sibling_backup(&self.path, &format!("v{from}"));
+            // `VACUUM INTO` refuses an existing target. If the suggested name
+            // is already taken, that is a lost naming race and the next
+            // suggestion is retried; a target that did *not* exist and still
+            // failed (disk full, unsupported) is the real error.
+            if backup.exists() {
+                continue;
+            }
             let Some(target) = backup.to_str() else {
                 return Err(
                     self.storage_err("cannot back up the database to a non-UTF-8 path".to_owned())
@@ -368,11 +385,9 @@ impl SqliteStore {
             match conn.execute("VACUUM INTO ?1", [target]) {
                 Ok(_) => return Ok(backup),
                 Err(err) => {
-                    // Only a lost naming race is retryable; a broken VACUUM
-                    // (unsupported, disk full) is the real error.
-                    if backup.exists() {
-                        continue;
-                    }
+                    // A failed VACUUM (disk full, unsupported) may have left a
+                    // partial file; it is not a usable forensic copy.
+                    let _ = std::fs::remove_file(&backup);
                     return Err(self.map_rusqlite(err));
                 }
             }
@@ -458,7 +473,7 @@ impl SqliteStore {
     fn apply_diff(
         &self,
         conn: &Connection,
-        before: &HashMap<String, u64>,
+        before: &HashMap<String, RowState>,
         after: &[Project],
     ) -> Result<()> {
         let after_ids: HashSet<&str> = after.iter().map(|project| project.id.as_str()).collect();
@@ -475,14 +490,22 @@ impl SqliteStore {
             .map_err(|err| self.map_rusqlite(err))?;
 
         for project in after {
+            let state = RowState {
+                row: project_fingerprint(project),
+                notes: notes_fingerprint(project),
+            };
             match before.get(&project.id) {
-                Some(previous) if *previous == project_fingerprint(project) => {}
-                Some(_) => {
-                    execute_project(&mut upsert, project)?;
-                    write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
+                Some(previous) if *previous == state => {}
+                Some(previous) => {
+                    self.execute_project(&mut upsert, project)?;
+                    // A pin or rename must not rewrite the note rows; only a
+                    // changed note list does.
+                    if previous.notes != state.notes {
+                        write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
+                    }
                 }
                 None => {
-                    execute_project(&mut upsert, project)?;
+                    self.execute_project(&mut upsert, project)?;
                     write_notes(conn, project).map_err(|err| self.map_rusqlite(err))?;
                 }
             }
@@ -668,9 +691,11 @@ pub struct ProjectProfile {
 /// Binds one project to the named parameters every statement shares.
 /// One project's row, hashed: the change detection behind `update`'s diff.
 ///
-/// Every column `execute_project` writes, plus the notes, feeds the hash. A
-/// 64-bit collision would skip one row's rewrite (never corrupt another row);
-/// the alternative was deep-cloning the whole index on every mutation.
+/// Every column `execute_project` writes feeds the hash — including
+/// `git.is_some()`, which the `:git` column persists separately from the two
+/// remote strings (a repository with no remote is `Some` with two `None`s).
+/// A 64-bit collision would skip one row's rewrite (never corrupt another
+/// row); the alternative was deep-cloning the whole index on every mutation.
 fn project_fingerprint(project: &Project) -> u64 {
     let mut hasher = DefaultHasher::new();
     project.id.hash(&mut hasher);
@@ -682,6 +707,7 @@ fn project_fingerprint(project: &Project) -> u64 {
     project.last_used_at.hash(&mut hasher);
     project.use_count.hash(&mut hasher);
     project.pinned.hash(&mut hasher);
+    project.git.is_some().hash(&mut hasher);
     project
         .git
         .as_ref()
@@ -695,45 +721,68 @@ fn project_fingerprint(project: &Project) -> u64 {
     project.kind.label().hash(&mut hasher);
     project.env.hash(&mut hasher);
     project.enter_cmd.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The note rows alone, so an unrelated mutation does not rewrite them.
+fn notes_fingerprint(project: &Project) -> u64 {
+    let mut hasher = DefaultHasher::new();
     project.notes.hash(&mut hasher);
     hasher.finish()
 }
 
-fn execute_project(statement: &mut rusqlite::Statement<'_>, project: &Project) -> Result<usize> {
-    // The index stores UTF-8 paths; a lossy round-trip would point somewhere
-    // else, so a non-UTF-8 path is refused instead of silently mangled.
-    let path = project
-        .path
-        .to_str()
-        .ok_or_else(|| Error::NonUtf8Path(project.path.clone()))?;
-    let aliases = serde_json::to_string(&project.aliases)
-        .map_err(|err| Error::Storage(format!("could not serialize aliases: {err}")))?;
-    let tags = serde_json::to_string(&project.tags)
-        .map_err(|err| Error::Storage(format!("could not serialize tags: {err}")))?;
-    let env = serde_json::to_string(&project.env)
-        .map_err(|err| Error::Storage(format!("could not serialize the profile: {err}")))?;
-    let written = statement
-        .execute(rusqlite::named_params! {
-            ":id": &project.id,
-            ":name": &project.name,
-            ":path": path,
-            ":aliases": &aliases,
-            ":tags": &tags,
-            ":created_at": project.created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
-            ":last_used_at": project
-                .last_used_at
-                .map(|when| when.to_rfc3339_opts(SecondsFormat::Micros, true)),
-            ":use_count": i64::try_from(project.use_count).unwrap_or(i64::MAX),
-            ":pinned": i64::from(project.pinned),
-            ":git": i64::from(project.git.is_some()),
-            ":git_remote_name": project.git.as_ref().and_then(|git| git.remote_name.as_deref()),
-            ":git_remote_url": project.git.as_ref().and_then(|git| git.remote_url.as_deref()),
-            ":kind": project.kind.label(),
-            ":env": &env,
-            ":enter_cmd": project.enter_cmd.as_deref(),
-        })
-        .map_err(|err| Error::Storage(format!("could not write the project row: {err}")))?;
-    Ok(written)
+/// The baseline of one stored project: the row columns and the note rows,
+/// hashed separately because they are rewritten separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowState {
+    row: u64,
+    notes: u64,
+}
+
+impl SqliteStore {
+    /// Writes one project row. Serialization failures and a non-UTF-8 path
+    /// are crate errors; database failures keep `map_rusqlite`'s
+    /// classification (a busy database still becomes `LockTimeout`).
+    fn execute_project(
+        &self,
+        statement: &mut rusqlite::Statement<'_>,
+        project: &Project,
+    ) -> Result<usize> {
+        // The index stores UTF-8 paths; a lossy round-trip would point somewhere
+        // else, so a non-UTF-8 path is refused instead of silently mangled.
+        let path = project
+            .path
+            .to_str()
+            .ok_or_else(|| Error::NonUtf8Path(project.path.clone()))?;
+        let aliases = serde_json::to_string(&project.aliases)
+            .map_err(|err| Error::Storage(format!("could not serialize aliases: {err}")))?;
+        let tags = serde_json::to_string(&project.tags)
+            .map_err(|err| Error::Storage(format!("could not serialize tags: {err}")))?;
+        let env = serde_json::to_string(&project.env)
+            .map_err(|err| Error::Storage(format!("could not serialize the profile: {err}")))?;
+        let written = statement
+            .execute(rusqlite::named_params! {
+                ":id": &project.id,
+                ":name": &project.name,
+                ":path": path,
+                ":aliases": &aliases,
+                ":tags": &tags,
+                ":created_at": project.created_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+                ":last_used_at": project
+                    .last_used_at
+                    .map(|when| when.to_rfc3339_opts(SecondsFormat::Micros, true)),
+                ":use_count": i64::try_from(project.use_count).unwrap_or(i64::MAX),
+                ":pinned": i64::from(project.pinned),
+                ":git": i64::from(project.git.is_some()),
+                ":git_remote_name": project.git.as_ref().and_then(|git| git.remote_name.as_deref()),
+                ":git_remote_url": project.git.as_ref().and_then(|git| git.remote_url.as_deref()),
+                ":kind": project.kind.label(),
+                ":env": &env,
+                ":enter_cmd": project.enter_cmd.as_deref(),
+            })
+            .map_err(|err| self.map_rusqlite(err))?;
+        Ok(written)
+    }
 }
 
 /// Replaces one project's note rows with the in-memory list.
@@ -906,7 +955,22 @@ mod tests {
             p.env.insert("KEY".into(), "value".into());
         }));
         assert!(changed(&|p| p.enter_cmd = Some("echo hi".into())));
-        assert!(changed(&|p| p.notes.push("a note".into())));
+        assert!(
+            changed(&|p| {
+                p.git = Some(GitInfo {
+                    remote_name: None,
+                    remote_url: None,
+                });
+            }),
+            "a repository without a remote is still Some, and the :git column stores that"
+        );
+
+        // Notes have their own fingerprint, so an unrelated mutation does not
+        // rewrite the note table.
+        let mut noted = base.clone();
+        noted.notes.push("a note".into());
+        assert_eq!(project_fingerprint(&noted), project_fingerprint(&base));
+        assert_ne!(notes_fingerprint(&noted), notes_fingerprint(&base));
     }
 
     #[test]

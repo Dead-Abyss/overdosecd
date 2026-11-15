@@ -225,6 +225,18 @@ fn checked(output: Output, what: &str) -> Output {
     output
 }
 
+/// Asserts the command exited with `code` (used by the deliberate error-path
+/// benchmark) and fails loudly with stderr when it did not.
+fn expect_code(output: Output, what: &str, code: i32) -> Output {
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "{what} exited with the wrong code: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
 /// Removes a stale database file, but only tolerates "already gone": a
 /// permission or mount error must fail the bench, not silently measure the
 /// idempotent "nothing new" path.
@@ -279,9 +291,12 @@ fn bench_cli(c: &mut Criterion) {
         });
         group.bench_function("goto-no-match-no-track", |b| {
             b.iter(|| {
-                checked(
+                // The full-scan error path: exit 1 is the expected result,
+                // not a bench failure.
+                expect_code(
                     fixture.run(&["goto", NO_MATCH_QUERY, "--no-track"]),
                     "goto no-match",
+                    1,
                 )
             });
         });

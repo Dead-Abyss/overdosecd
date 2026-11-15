@@ -84,11 +84,43 @@ fn run_with(data_dir: &Path, save: &dyn Fn(PathBuf, &[Project]) -> Result<()>) -
 ///
 /// A corrupt legacy file is quarantined by [`read_legacy`] and the error is
 /// returned; a clash with a populated database is [`Error::MigrationClash`].
+///
+/// A crash between "move the JSON aside" and "write the database" leaves no
+/// live JSON and no database — which used to read as an empty index, silently.
+/// A leftover `projects.json.migrated-*` backup with no index at all is
+/// reported instead, so the data is findable.
 pub fn auto(data_dir: &Path) -> Result<Option<Outcome>> {
     if !paths::store_file(data_dir).exists() {
+        if !paths::sqlite_file(data_dir).exists()
+            && let Some(backup) = interrupted_backup(data_dir)
+        {
+            return Err(Error::Storage(format!(
+                "no index found, but {} holds a migrated copy; rename it back to {} to recover (or remove it to start empty)",
+                backup.display(),
+                paths::store_file(data_dir).display()
+            )));
+        }
         return Ok(None);
     }
     run(data_dir).map(Some)
+}
+
+/// The newest `projects.json.migrated-*` sibling, if one exists.
+fn interrupted_backup(data_dir: &Path) -> Option<PathBuf> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(data_dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("projects.json.migrated-") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(when, _)| modified > *when) {
+            newest = Some((modified, entry.path()));
+        }
+    }
+    newest.map(|(_, path)| path)
 }
 
 #[cfg(test)]
@@ -215,8 +247,12 @@ mod tests {
             paths::store_file(dir.path()).exists(),
             "the legacy index must be back in place, not renamed aside"
         );
+        // A real `save` may have created the schema before its transaction
+        // fails; what matters is that no project data landed.
         assert!(
-            !paths::sqlite_file(dir.path()).exists(),
+            SqliteStore::new(paths::sqlite_file(dir.path()))
+                .is_empty()
+                .unwrap_or(true),
             "the failed save must not leave a populated database"
         );
 

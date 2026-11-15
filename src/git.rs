@@ -45,11 +45,12 @@ const MAX_WORKTREE_ENTRIES: usize = 256;
 /// that exceeds `cap`. `None` means "treat as absent", which is how every
 /// caller already handles a missing or unreadable `.git` file.
 fn read_small(path: &Path, cap: u64) -> Option<String> {
-    // `open_regular` opens with `O_NOFOLLOW | O_NONBLOCK` and checks the
-    // handle: opening a FIFO for reading would block until a writer appears,
-    // and a metadata check before a separate open could be raced by a
-    // repository that swaps the file in between.
-    let file = crate::paths::open_regular(path, cap)?;
+    // `open_follow_io` opens with `O_NONBLOCK` and checks the handle: opening
+    // a FIFO for reading would block until a writer appears, and a metadata
+    // check before a separate open could be raced. Symlinks are followed on
+    // purpose (dotfile-managed `.git`/`include.path` files), which the handle
+    // checks still bound.
+    let file = crate::paths::open_follow_io(path, cap).ok().flatten()?;
     let mut bytes = Vec::new();
     file.take(cap + 1).read_to_end(&mut bytes).ok()?;
     if bytes.len() as u64 > cap {

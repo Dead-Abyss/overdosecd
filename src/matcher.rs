@@ -331,6 +331,11 @@ pub(crate) fn rank_indices(
 /// alphabetically. Missing directories are skipped, matching `list` default.
 pub fn completion_candidates(projects: &[Project], prefix: &str) -> Vec<String> {
     let prefix = prefix.trim().to_lowercase();
+    // One predicate for both the pre-filter and the flat_map: a mismatch
+    // would silently drop candidates for projects the stat ran on.
+    fn is_candidate(value: &str, prefix: &str) -> bool {
+        !crate::sanitize::contains_dangerous(value) && value.to_lowercase().starts_with(prefix)
+    }
     let mut candidates: Vec<String> = projects
         .iter()
         // Cheap prefix/danger checks first: the stat for a stale project is
@@ -340,10 +345,7 @@ pub fn completion_candidates(projects: &[Project], prefix: &str) -> Vec<String> 
             let interesting = std::iter::once(&project.name)
                 .chain(project.aliases.iter())
                 .chain(project.tags.iter())
-                .any(|value| {
-                    !crate::sanitize::contains_dangerous(value)
-                        && value.to_lowercase().starts_with(&prefix)
-                });
+                .any(|value| is_candidate(value, &prefix));
             interesting && project.path.exists()
         })
         .flat_map(|project| {
@@ -354,8 +356,7 @@ pub fn completion_candidates(projects: &[Project], prefix: &str) -> Vec<String> 
         // Completion candidates are written straight into the shell's
         // COMPREPLY/COMPLIST on a TAB press; a value with control or
         // invisible characters must never make that trip.
-        .filter(|value| !crate::sanitize::contains_dangerous(value))
-        .filter(|value| value.to_lowercase().starts_with(&prefix))
+        .filter(|value| is_candidate(value, &prefix))
         .cloned()
         .collect();
 
@@ -1054,8 +1055,16 @@ mod tests {
             ..MatcherConfig::DEFAULT
         };
         let first = super::rank("over", &projects, &absurd);
-        let second = super::rank("over", &projects, &absurd);
         assert_eq!(first.len(), 2);
+        // The saturated scores are ordered, not wrapped: the pinned project
+        // still ranks first (before the fix this wrapped into an inversion).
+        assert!(
+            first[0].score >= first[1].score,
+            "saturated scores keep the order: {} vs {}",
+            first[0].score,
+            first[1].score
+        );
+        let second = super::rank("over", &projects, &absurd);
         let scores: Vec<i64> = first.iter().map(|m| m.score).collect();
         assert_eq!(scores, second.iter().map(|m| m.score).collect::<Vec<_>>());
     }

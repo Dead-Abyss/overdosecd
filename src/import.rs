@@ -62,6 +62,9 @@ pub(crate) struct Plan {
     /// A directory whose final component yields no usable project name; it
     /// cannot be added, so it is reported instead of failing under the lock.
     pub unnameable: usize,
+    /// Entries that passed planning but failed to insert for a reason other
+    /// than a race (reported instead of silently counted as imported).
+    pub failed: usize,
 }
 
 /// The store location for `source`, honouring the tool's own override.
@@ -341,10 +344,13 @@ pub fn plan(
             plan.excluded += 1;
             continue;
         }
-        // The name comes from the final component; derive it now so a
-        // directory like `/` is counted here instead of failing later under
-        // the store lock.
-        if project::default_name(&canonical).is_err() {
+        // The name comes from the final component; validate it exactly the
+        // way `insert` will (non-empty, trimmed, no control characters) so a
+        // directory like `/` or `" "` is counted here instead of failing
+        // later under the store lock.
+        let named = project::default_name(&canonical)
+            .and_then(|name| project::sanitize_value("project name", &name));
+        if named.is_err() {
             plan.unnameable += 1;
             continue;
         }
@@ -453,12 +459,12 @@ pub fn preview(plan: &Plan) -> Result<Vec<Project>> {
 /// Applies a plan under the store lock, re-checking every path; returns
 /// `(imported, raced)` where `raced` entries were added by someone else
 /// between planning and the lock.
-pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usize) {
+pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usize, usize) {
     let mut indexed: HashSet<PathBuf> = projects
         .iter()
         .map(|project| project.path.clone())
         .collect();
-    let (mut imported, mut raced) = (0, 0);
+    let (mut imported, mut raced, mut failed) = (0, 0, 0);
     for entry in to_add {
         // Membership is a set lookup, not a scan of every project per entry
         // while the store lock is held.
@@ -476,12 +482,14 @@ pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usiz
             (entry.git.clone(), entry.kind),
         ) {
             // Only a path that appeared between planning and the lock is a
-            // race; an insert that fails for another reason did not land.
+            // race; anything else did not land and must not be reported as
+            // imported.
             Err(Error::Duplicate { .. }) => {
                 raced += 1;
             }
             Err(_) => {
                 indexed.remove(&entry.path);
+                failed += 1;
             }
             Ok(_) => {
                 // `insert` pushed the new entry last.
@@ -493,7 +501,7 @@ pub fn apply(projects: &mut Vec<Project>, to_add: &[NewProject]) -> (usize, usiz
             }
         }
     }
-    (imported, raced)
+    (imported, raced, failed)
 }
 
 /// One line for stdout: what happened (or would), and the skip counters.
@@ -521,6 +529,9 @@ pub fn summary(plan: &Plan, dry_run: bool) -> String {
     }
     if plan.unnameable > 0 {
         skipped.push(format!("{} unnameable", plan.unnameable));
+    }
+    if plan.failed > 0 {
+        skipped.push(format!("{} failed", plan.failed));
     }
     if !skipped.is_empty() {
         line.push_str(&format!(" (skipped {})", skipped.join(", ")));
@@ -794,13 +805,16 @@ mod tests {
         };
 
         let mut projects = Vec::new();
-        assert_eq!(apply(&mut projects, std::slice::from_ref(&entry)), (1, 0));
+        assert_eq!(
+            apply(&mut projects, std::slice::from_ref(&entry)),
+            (1, 0, 0)
+        );
         assert_eq!(projects[0].use_count, 7);
         assert_eq!(projects[0].last_used_at, None);
 
         assert_eq!(
             apply(&mut projects, &[entry]),
-            (0, 1),
+            (0, 1, 0),
             "re-verified under the lock"
         );
         assert_eq!(projects.len(), 1);
@@ -821,6 +835,7 @@ mod tests {
             excluded: 0,
             malformed: 3,
             unnameable: 4,
+            failed: 0,
         };
         assert_eq!(
             summary(&plan, false),

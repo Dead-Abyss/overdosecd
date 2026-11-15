@@ -141,7 +141,7 @@ pub fn run(
     // like `goto`, the line is captured by `cd "$(…)`": a dangerous path is
     // refused, never escaped, and a lossy rendering is not a path.
     let Some(rendered) = path.to_str() else {
-        return Err(Error::UnsafePath(sanitize::path(&path)));
+        return Err(Error::NonUtf8Path(path.clone()));
     };
     if sanitize::contains_dangerous(rendered) {
         return Err(Error::UnsafePath(sanitize::text(rendered)));
@@ -525,12 +525,15 @@ fn rename(store: &SqliteStore, picker: &mut Picker, id: String, name: String, fo
 
     match result {
         Ok(old_name) => {
-            reload(store, picker, Some(&confirmed_id));
-            // The mutation is done; leaving the prompt open would re-send it
-            // on a second Enter. Set the mode before the status: changing
-            // mode clears it.
-            picker.set_mode(picker::Mode::Search);
-            picker.set_status(format!("renamed `{old_name}` -> `{name}`"), false);
+            // A failed reload already put the store error in the status; the
+            // success note must not overwrite it.
+            if reload(store, picker, Some(&confirmed_id)) {
+                // The mutation is done; leaving the prompt open would re-send
+                // it on a second Enter. Set the mode before the status:
+                // changing mode clears it.
+                picker.set_mode(picker::Mode::Search);
+                picker.set_status(format!("renamed `{old_name}` -> `{name}`"), false);
+            }
         }
         Err(Error::NameTaken { name, .. }) => picker.ask_rename_force(confirmed_id, name),
         Err(err) => picker.set_status(error_status(&err), true),
@@ -563,12 +566,13 @@ fn set_term(
 
     match result {
         Ok(message) => {
-            reload(store, picker, None);
-            // The mutation is done; leaving the prompt open would re-send it
-            // on a second Enter. Set the mode before the status: changing
-            // mode clears it.
-            picker.set_mode(picker::Mode::Search);
-            picker.set_status(message, false);
+            if reload(store, picker, None) {
+                // The mutation is done; leaving the prompt open would re-send
+                // it on a second Enter. Set the mode before the status:
+                // changing mode clears it.
+                picker.set_mode(picker::Mode::Search);
+                picker.set_status(message, false);
+            }
         }
         Err(err) => picker.set_status(error_status(&err), true),
     }

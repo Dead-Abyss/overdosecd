@@ -110,6 +110,27 @@ pub(crate) fn open_regular(path: &Path, cap: u64) -> Option<std::fs::File> {
     open_regular_io(path, cap).ok().flatten()
 }
 
+/// Opens a regular file for reading, *following* a final-component symlink.
+///
+/// The store files must never follow a link, but a repository's `.git` files
+/// and git's `include.path` targets are legitimately symlinked by dotfile
+/// managers. The open is still `O_NONBLOCK` and the type/size are still
+/// checked on the handle, so a FIFO or a giant file stays bounded; only the
+/// `O_NOFOLLOW` refusal is dropped.
+pub(crate) fn open_follow_io(path: &Path, cap: u64) -> io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > cap {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
 /// Reads a rebuildable JSON file through the hostile-file gate: a small
 /// regular file, not a symlink, the size cap enforced by the read itself,
 /// valid UTF-8 and JSON. `None` on any failure: the caller rebuilds.
@@ -279,7 +300,30 @@ mod tests {
                 read_rebuildable_json::<serde_json::Value>(&link, 1024).is_none(),
                 "a symlink is absent"
             );
+
+            // The whole point of `O_NONBLOCK | O_NOFOLLOW`: a FIFO must be
+            // refused without blocking this thread forever.
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let fifo = dir.path().join("cache-fifo.json");
+            let raw = CString::new(fifo.as_os_str().as_bytes()).expect("path");
+            // SAFETY: plain `mkfifo(2)` on a fresh temp path.
+            assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0, "mkfifo");
+            assert!(
+                read_rebuildable_json::<serde_json::Value>(&fifo, 1024).is_none(),
+                "a FIFO is absent, not a blocking read"
+            );
+            assert!(
+                open_regular_io(&fifo, 1024).expect("open").is_none(),
+                "a FIFO is not a regular file"
+            );
         }
+
+        std::fs::write(&path, "{\"dirs\":[]}").expect("grow past the cap");
+        assert!(
+            read_rebuildable_json::<serde_json::Value>(&path, 4).is_none(),
+            "a file over the cap is absent"
+        );
     }
 
     #[test]

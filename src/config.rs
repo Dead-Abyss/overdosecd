@@ -288,11 +288,14 @@ pub fn load_status(location: &Location) -> (Result<Config>, Status) {
             );
         }
         Err(err) => {
+            let message = err.to_string();
             let error = Error::Config {
                 origin: path.display().to_string(),
-                message: err.to_string(),
+                message,
             };
-            let status = invalid(error.to_string());
+            // `Doctor` already prints the path; keep only the reason (the
+            // parse branch below does the same).
+            let status = invalid(err.to_string());
             return (Err(error), status);
         }
     };

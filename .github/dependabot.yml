@@ -7,8 +7,21 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      # Major bumps get their own PR: one breaking bump must not drag a week
-      # of patch updates into a branch that then cannot merge cleanly.
+      # Breaking bumps get their own PR: one breaking bump must not drag a
+      # week of patch updates into a branch that then cannot merge cleanly.
+      # Pre-1.0 crates count as breaking on a *minor* bump (0.30 -> 0.31 is
+      # ratatui's breaking release), so the direct 0.x dependencies are listed
+      # explicitly; the generic major group catches true 0.x -> 1.0+ bumps.
+      cargo-breaking-direct:
+        patterns:
+          - "clap*"
+          - "colored"
+          - "criterion"
+          - "fuzzy-matcher"
+          - "ratatui*"
+          - "rusqlite"
+          - "toml"
+        update-types: ["minor", "major"]
       cargo-major:
         patterns: ["*"]
         update-types: ["major"]

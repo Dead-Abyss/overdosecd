@@ -79,8 +79,11 @@ jobs:
           # Parse the manifest instead of grepping it: a `rust-version.workspace`
           # or single-quoted value would make `grep` yield empty, and an empty
           # declared version must fail loudly, never pass the case below.
-          declared="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')"
-          if [ -z "$declared" ]; then
+          # `cargo metadata` is the same mechanism release.yml uses (no second
+          # manifest parser tied to the runner's Python version).
+          declared="$(cargo metadata --no-deps --format-version 1 |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["rust-version"])')"
+          if [ -z "$declared" ] || [ "$declared" = "None" ]; then
             echo "Cargo.toml has no package.rust-version" >&2
             exit 1
           fi

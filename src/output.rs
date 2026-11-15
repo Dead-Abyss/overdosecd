@@ -805,7 +805,15 @@ pub fn format_projects_with_missing(
     }
 
     if missing.iter().any(|&flag| flag) {
-        out.push_str("\n! = directory missing\n");
+        let legend = "! = directory missing";
+        out.push('\n');
+        // The legend is a line too: keep the "nothing wider than the
+        // terminal" promise for it as well.
+        out.push_str(&match width {
+            Some(budget) => truncate_to(legend, budget),
+            None => legend.to_owned(),
+        });
+        out.push('\n');
     }
 
     out
@@ -858,8 +866,8 @@ pub(crate) fn join_or_dash(values: &[String]) -> String {
 /// The column where `info` values start (`last used:` is the longest label).
 const INFO_LABEL_WIDTH: usize = 10;
 
-/// A dimmed, fixed-width label followed by a plain value, for `info` lines.
-/// Formats one `info` row: a dim label column and the value.
+/// Renders one `info` row: a dim, fixed-width label column followed by a
+/// plain value.
 ///
 /// Both halves are interpolated raw, so callers escape live values with
 /// [`sanitize::text`]/[`sanitize::path`] first (pre-painted values keep their
@@ -1606,6 +1614,19 @@ mod tests {
                 assert!(
                     display_width(line) <= budget,
                     "budget {budget} overflowed: {line:?}"
+                );
+            }
+        }
+
+        // The `! = directory missing` legend is a line too and must respect
+        // the same budget (the no-missing case above cannot catch it).
+        let missing = vec![false, true];
+        for budget in 1..12 {
+            let rendered = format_projects_with_missing(&projects, &missing, None, Some(budget));
+            for line in rendered.lines() {
+                assert!(
+                    display_width(line) <= budget,
+                    "budget {budget} overflowed with the legend: {line:?}"
                 );
             }
         }

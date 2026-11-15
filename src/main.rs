@@ -53,8 +53,9 @@ fn main() {
             // The error's Display already escapes every value; the funnel is a
             // second net for a renderer that slipped. Several variants are
             // multi-line by design (the ambiguity candidate list, the
-            // `--force` hint), so this sink is the raw one.
-            if output::print_stderr(&format!("error: {err}")).is_err() {
+            // `--force` hint), so this sink is the raw one — and it adds no
+            // trailing newline, which the payload carries.
+            if output::print_stderr(&format!("error: {err}\n")).is_err() {
                 let _ = output::print_stderr_line("error: refusing to print an unsafe message");
             }
             std::process::exit(code);
@@ -552,7 +553,7 @@ fn print_path(path: &Path) -> Result<()> {
     // `goto` is machine output: an escaped or lossy path is a wrong path, so
     // a dangerous or non-UTF-8 one is refused rather than rendered.
     let Some(rendered) = path.to_str() else {
-        return Err(Error::UnsafePath(sanitize::path(path)));
+        return Err(Error::NonUtf8Path(path.to_path_buf()));
     };
     if sanitize::contains_dangerous(rendered) {
         return Err(Error::UnsafePath(sanitize::text(rendered)));
@@ -1047,9 +1048,15 @@ fn cmd_import(store: &SqliteStore, args: ImportArgs) -> Result<()> {
         return output::print_line(&import::summary(&plan, true));
     }
 
-    let (imported, raced) = store.update(|projects| Ok(import::apply(projects, &plan.to_add)))?;
+    let (imported, raced, failed) =
+        store.update(|projects| Ok(import::apply(projects, &plan.to_add)))?;
     if raced > 0 {
         plan.existing += raced;
+    }
+    if failed > 0 {
+        plan.failed += failed;
+    }
+    if raced > 0 || failed > 0 {
         plan.to_add.truncate(imported);
     }
     output::print_line(&import::summary(&plan, false))

@@ -124,8 +124,14 @@ impl Backend for TtyBackend {
 fn query_cursor_position(tty: &mut File) -> io::Result<Option<Position>> {
     drain_queued(tty);
 
-    tty.write_all(b"\x1b[6n")?;
-    tty.flush()?;
+    // A full output queue (Ctrl-S flow control) is backpressure, not a dead
+    // terminal: treat it like an unanswered query instead of aborting the
+    // picker's next draw.
+    match tty.write_all(b"\x1b[6n").and_then(|()| tty.flush()) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(err) => return Err(err),
+    }
 
     let deadline = Instant::now() + CURSOR_QUERY_TIMEOUT;
     let mut reply = Vec::with_capacity(MAX_REPORT_BYTES);
@@ -160,14 +166,16 @@ fn query_cursor_position(tty: &mut File) -> io::Result<Option<Position>> {
     })
 }
 
-/// Reads and discards everything currently queued on the tty.
+/// Reads and discards up to one report's worth of bytes already queued on the
+/// tty.
 ///
-/// Only the bytes that are already there are touched, so the drain cannot eat
-/// input typed after the query; typed input that preceded it was already
-/// consumed by the old read loop (it tolerated junk in front of the report).
+/// Only bytes that are already there are touched, so the drain cannot eat
+/// input typed after the query; input queued *before* it may be discarded
+/// (the read loop always tolerated junk in front of the report), and the
+/// byte bound keeps a terminal spewing output from stalling the query.
 fn drain_queued(tty: &mut File) {
     let mut byte = [0u8; 1];
-    loop {
+    for _ in 0..MAX_REPORT_BYTES {
         match tty.read(&mut byte) {
             Ok(0) => break,
             Ok(_) => {}

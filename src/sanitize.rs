@@ -358,6 +358,20 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn quoted_path_shows_raw_bytes_instead_of_replacing_them() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let hostile = Path::new(OsStr::from_bytes(b"/tmp/\xff\"quote\\"));
+        let rendered = quoted_path(hostile);
+        assert!(rendered.contains("\\xff"), "raw byte survives: {rendered}");
+        assert!(!rendered.contains('\u{fffd}'), "no lossy replacement");
+        assert!(rendered.contains("\\\""), "quote is escaped: {rendered}");
+        assert_eq!(rendered.lines().count(), 1);
+    }
+
     #[test]
     fn path_escaping_handles_control_paths() {
         assert_eq!(path(Path::new("/tmp/plain")), "/tmp/plain");

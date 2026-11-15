@@ -183,11 +183,8 @@ pub fn scan(root: &Path, options: &Options) -> Vec<Dir> {
             continue;
         }
         let project_like = has_marker || path.join(".git").exists();
-        // A directory name a terminal would interpret is never offered: the
-        // walk (and therefore the cache) only carries displayable paths.
-        if contains_dangerous(&name) || contains_dangerous(&path.to_string_lossy()) {
-            continue;
-        }
+        // The display guard already ran when this path was queued (and the
+        // root is never offered), so the cache only carries displayable paths.
         dirs.push(Dir {
             path,
             name,
@@ -306,7 +303,7 @@ pub fn save_cache(path: &Path, cache: &Cache) -> Result<()> {
     // cache this program silently ignores. Fail loudly instead.
     if body.len() as u64 > MAX_CACHE_BYTES {
         return Err(Error::InvalidValue(format!(
-            "home cache would be {} bytes, over the {} byte cap; raise `[discovery] max_entries`?",
+            "home cache would be {} bytes, over the {} byte cap; lower `[discovery] max_entries` or narrow the walk",
             body.len(),
             MAX_CACHE_BYTES
         )));
@@ -426,6 +423,23 @@ mod tests {
             Path::new("/home/user/other/Trash")
         ));
         assert!(!is_skipped(&skip, "share", Path::new("/home/user/share")));
+
+        // The shapes users actually write: a trailing or leading separator
+        // used to leave an empty component that matched nothing.
+        assert!(is_skipped(
+            &["node_modules/"],
+            "node_modules",
+            Path::new("/home/user/node_modules")
+        ));
+        assert!(is_skipped(
+            &["/home/me/cache/"],
+            "cache",
+            Path::new("/home/me/cache")
+        ));
+        assert!(
+            !is_skipped(&["/"], "anything", Path::new("/home/user/anything")),
+            "an all-separator pattern matches nothing"
+        );
     }
 
     #[test]

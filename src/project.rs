@@ -292,13 +292,20 @@ pub fn insert(
         if let Some(name) = name {
             let name = sanitize_value("project name", &name)?;
             // `--force` targets the *path*; renaming on top of another
-            // project's name would silently steal it (`rename` refuses this).
-            if projects
+            // project's name would silently steal it. Name the colliding
+            // project, not this one, and do not suggest `--force` (it is
+            // already on).
+            if let Some(other) = projects
                 .iter()
                 .enumerate()
-                .any(|(index, other)| index != position && other.name.eq_ignore_ascii_case(&name))
+                .find(|(index, other)| *index != position && other.name.eq_ignore_ascii_case(&name))
+                .map(|(_, other)| other)
             {
-                return Err(Error::NameTaken { name, path });
+                return Err(Error::InvalidValue(format!(
+                    "another project is already named `{}`: {}; rename it first",
+                    crate::sanitize::text(&name),
+                    crate::sanitize::path(&other.path)
+                )));
             }
             projects[position].name = name;
         }
@@ -327,12 +334,22 @@ pub fn insert(
         None => default_name(&path)?,
     };
     let name = sanitize_value("project name", &name)?;
+    // Store aliases/tags in the same trimmed, case-insensitively deduplicated
+    // shape the `add` command produces, whatever the caller supplied.
+    let mut normalized_aliases = Vec::with_capacity(aliases.len());
+    for alias in &aliases {
+        push_unique(&mut normalized_aliases, alias);
+    }
+    let mut normalized_tags = Vec::with_capacity(tags.len());
+    for tag in &tags {
+        push_unique(&mut normalized_tags, tag);
+    }
     let project = Project {
         id: new_id(projects),
         name,
         path: path.clone(),
-        aliases,
-        tags,
+        aliases: normalized_aliases,
+        tags: normalized_tags,
         created_at: Utc::now(),
         last_used_at: None,
         use_count: 0,
@@ -690,7 +707,14 @@ mod tests {
             (None, Kind::Unknown),
         )
         .expect_err("a taken name is refused");
-        assert!(matches!(err, Error::NameTaken { .. }), "error: {err:?}");
+        assert!(
+            matches!(&err, Error::InvalidValue(_)),
+            "the error must name the colliding project, not this one: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("/x/beta"),
+            "the diagnostic points at the project that owns the name: {err}"
+        );
     }
 
     #[test]

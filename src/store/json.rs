@@ -50,8 +50,18 @@ pub fn read_legacy(path: &Path) -> Result<Vec<Project>> {
     let file = match crate::paths::open_regular_io(path, MAX_LEGACY_BYTES) {
         Ok(Some(file)) => file,
         Ok(None) => {
+            // Not a regular file, or over the cap: move it aside like the
+            // corrupt branch does, so one bad file cannot block every later
+            // command (`migrate::auto` runs at startup).
+            let backup = crate::paths::sibling_backup(path, "corrupt");
+            let moved = fs::rename(path, &backup).is_ok();
+            let destination = if moved {
+                format!("the unreadable file was moved to {}", backup.display())
+            } else {
+                "the unreadable file could not be moved aside".to_owned()
+            };
             return Err(Error::Storage(format!(
-                "{} is not a readable regular file within the {MAX_LEGACY_BYTES} byte cap",
+                "{} is not a readable regular file within the {MAX_LEGACY_BYTES} byte legacy index cap; {destination}",
                 path.display()
             )));
         }
@@ -63,11 +73,13 @@ pub fn read_legacy(path: &Path) -> Result<Vec<Project>> {
             )));
         }
     };
-    let mut raw = String::new();
+    let mut raw = Vec::new();
     // The cap is enforced by the read itself: a file that grows after the
-    // handle check still cannot exceed it.
+    // handle check still cannot exceed it. Bytes first, then the size check:
+    // a cut through a multi-byte character inside `read_to_string` would
+    // report "invalid UTF-8" for what is really an oversized file.
     file.take(MAX_LEGACY_BYTES + 1)
-        .read_to_string(&mut raw)
+        .read_to_end(&mut raw)
         .map_err(|err| Error::Storage(format!("could not read {}: {err}", path.display())))?;
     if raw.len() as u64 > MAX_LEGACY_BYTES {
         return Err(Error::Storage(format!(
@@ -75,6 +87,8 @@ pub fn read_legacy(path: &Path) -> Result<Vec<Project>> {
             path.display()
         )));
     }
+    let raw = String::from_utf8(raw)
+        .map_err(|err| Error::Storage(format!("{} is not valid UTF-8: {err}", path.display())))?;
 
     let file: StoreFile = match serde_json::from_str(&raw) {
         Ok(file) => file,

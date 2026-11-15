@@ -68,12 +68,19 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           # A cancelled run (or a later step failing) must be retryable from
           # the same tag; `cargo publish` always fails for an uploaded version.
-          if curl -fsS -A "overdosecd-release-ci (https://github.com/Dead-Abyss/overdosecd)" \
-              "https://crates.io/api/v1/crates/overdosecd/$version" >/dev/null; then
-            echo "overdosecd $version is already on crates.io; skipping the publish"
-          else
-            cargo publish --locked
-          fi
+          # Only a 404 means "not published": a 429/5xx or a network blip must
+          # fail loudly instead of pretending the version is missing.
+          status="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 --retry-delay 2 --max-time 30 \
+            -A "overdosecd-release-ci (https://github.com/Dead-Abyss/overdosecd)" \
+            "https://crates.io/api/v1/crates/overdosecd/$version")"
+          case "$status" in
+            200) echo "overdosecd $version is already on crates.io; skipping the publish" ;;
+            404) cargo publish --locked ;;
+            *)
+              echo "crates.io returned HTTP $status for overdosecd $version; refusing to guess" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Create the GitHub release
         env:
